@@ -82,9 +82,18 @@ export function syncTagInterceptors(
 ): void {
   const desired = new Map<string, CompiledScript>();
   for (const s of compiled) {
-    if (s.isPlaceholder) continue;
+    if (s.kind !== 'pairedTag') continue;
     const tagName = extractTagName(s.findRe.source);
-    if (!tagName) continue;
+    if (!tagName) {
+      // Should be unreachable if classify-trigger and extractTagName stay
+      // in sync — both share the same "tolerant of \s* decoration" rule.
+      // Logging anyway in case they drift.
+      console.debug(
+        `[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` +
+        `extractTagName failed — skipping. findRegex source: ${s.findRe.source}`,
+      );
+      continue;
+    }
     desired.set(tagName.toLowerCase(), s);
   }
 
@@ -154,11 +163,19 @@ function onCapture(payload: InterceptorPayload, script: CompiledScript): void {
 }
 
 /**
- * Pull the tag name out of a paired-tag findRegex source. Expects the
- * source to start with a literal `<TAGNAME>`. Returns null on malformed
- * input — caller should skip such scripts.
+ * Pull the tag name out of a paired-tag findRegex source.
+ *
+ * Tolerates whitespace-allowance decorations between `<` and the tag name —
+ * card authors sometimes pad with `\s*` for paranoia (Pacifica:
+ * `<\s*PACIFICA_UI\s*>...`). The optional `(?:\\s\*|\s)*` group accepts
+ * either the literal 3-char sequence `\s*` or actual whitespace. Returns
+ * null only when there's no recognizable tag name at the start.
+ *
+ * Stays in sync with `isPairedTag` in `classify-trigger.ts` — both must
+ * accept the same shapes, otherwise classification routes to pairedTag but
+ * registration silently fails.
  */
 function extractTagName(reSource: string): string | null {
-  const m = reSource.match(/^<([a-zA-Z_][a-zA-Z0-9_-]*)>/);
+  const m = reSource.match(/^<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/);
   return m ? m[1] : null;
 }

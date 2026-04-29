@@ -56,6 +56,26 @@ function isPlaceholder(re) {
   }
   return true;
 }
+function isPairedTag(re) {
+  const src = re.source;
+  const stripped = src.replace(/\\s\*/g, "").replace(/\s+/g, "").replace(/\\\//g, "/");
+  const open = stripped.match(/^<([a-zA-Z_][a-zA-Z0-9_-]*)/);
+  if (!open)
+    return false;
+  const tagName = open[1];
+  const closeRe = new RegExp(`</${escapeRegex(tagName)}\\b`);
+  return closeRe.test(stripped);
+}
+function classifyTrigger(re) {
+  if (isPairedTag(re))
+    return "pairedTag";
+  if (isPlaceholder(re))
+    return "placeholder";
+  return "unknown";
+}
+function escapeRegex(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 // src/core/parse-regex-script.ts
 var FENCE_RE = /^\s*```[A-Za-z]*[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```\s*$/;
@@ -84,12 +104,16 @@ function compileScripts(rawScripts) {
       console.debug(`[vishrun] script "${s.scriptName ?? "(unnamed)"}" findRegex failed to compile:`, err);
       continue;
     }
+    const kind = classifyTrigger(re);
+    if (kind === "unknown") {
+      console.debug(`[vishrun] script "${s.scriptName ?? "(unnamed)"}" has unrecognized trigger shape ` + `(neither placeholder nor paired-tag) — will not render. findRegex: ${src}`);
+    }
     out.push({
       id: s.id ?? `idx-${i}`,
       scriptName: s.scriptName ?? "(unnamed)",
       findRe: re,
       replaceString: replace,
-      isPlaceholder: isPlaceholder(re),
+      kind,
       sourceIndex: i
     });
   }
@@ -434,11 +458,13 @@ var activeTagNames = new Set;
 function syncTagInterceptors(ctx, compiled) {
   const desired = new Map;
   for (const s of compiled) {
-    if (s.isPlaceholder)
+    if (s.kind !== "pairedTag")
       continue;
     const tagName = extractTagName(s.findRe.source);
-    if (!tagName)
+    if (!tagName) {
+      console.debug(`[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` + `extractTagName failed — skipping. findRegex source: ${s.findRe.source}`);
       continue;
+    }
     desired.set(tagName.toLowerCase(), s);
   }
   if (desired.size === activeTagNames.size && [...desired.keys()].every((t) => activeTagNames.has(t))) {
@@ -485,7 +511,7 @@ function onCapture(payload, script) {
   console.debug(`[vishrun][step3] captured <${payload.tagName}> for message ${payload.messageId} (inner=${payload.content.length} chars)`);
 }
 function extractTagName(reSource) {
-  const m = reSource.match(/^<([a-zA-Z_][a-zA-Z0-9_-]*)>/);
+  const m = reSource.match(/^<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/);
   return m ? m[1] : null;
 }
 
@@ -493,7 +519,7 @@ function extractTagName(reSource) {
 function processNode(root, scripts, ctx) {
   let total = 0;
   for (const script of scripts) {
-    if (!script.isPlaceholder)
+    if (script.kind !== "placeholder")
       continue;
     total += replacePlaceholderMatches(root, script, ctx);
   }

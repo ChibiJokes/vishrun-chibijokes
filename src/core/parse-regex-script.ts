@@ -1,12 +1,18 @@
 import type { RawRegexScript } from '../lumiverse/fetch-character';
-import { isPlaceholder } from './classify-trigger';
+import { classifyTrigger, type TriggerKind } from './classify-trigger';
 
 export interface CompiledScript {
   id: string;
   scriptName: string;
   findRe: RegExp;
   replaceString: string;
-  isPlaceholder: boolean;
+  /**
+   * Trigger classification — drives pipeline routing in inject-into-message
+   * and tag-interceptor. See `classify-trigger.ts` for what each kind means
+   * and why the old `isPlaceholder: boolean` was insufficient (Pacifica
+   * surfaced the bug: paired-tag shape with no capture groups).
+   */
+  kind: TriggerKind;
   sourceIndex: number;
 }
 
@@ -63,12 +69,20 @@ export function compileScripts(rawScripts: RawRegexScript[]): CompiledScript[] {
       continue;
     }
 
+    const kind = classifyTrigger(re);
+    if (kind === 'unknown') {
+      console.debug(
+        `[vishrun] script "${s.scriptName ?? '(unnamed)'}" has unrecognized trigger shape ` +
+        `(neither placeholder nor paired-tag) — will not render. findRegex: ${src}`,
+      );
+    }
+
     out.push({
       id: s.id ?? `idx-${i}`,
       scriptName: s.scriptName ?? '(unnamed)',
       findRe: re,
       replaceString: replace,
-      isPlaceholder: isPlaceholder(re),
+      kind,
       sourceIndex: i,
     });
   }

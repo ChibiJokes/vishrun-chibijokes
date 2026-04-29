@@ -32,7 +32,11 @@ export function processNode(
 ): number {
   let total = 0;
   for (const script of scripts) {
-    if (!script.isPlaceholder) continue;
+    // Only placeholder triggers run through the post-DOMPurify text scan.
+    // pairedTag scripts go through registerTagInterceptor (pre-sanitizer)
+    // and surface here as captures via getCapturesForMessage. unknown
+    // scripts are skipped (logged once at compile time).
+    if (script.kind !== 'placeholder') continue;
     total += replacePlaceholderMatches(root, script, ctx);
   }
   const messageId = root.getAttribute('data-message-id') || undefined;
