@@ -1,0 +1,12 @@
+{
+  "version": "0.1.0",
+  "name": "Vishrun",
+  "identifier": "vishrun",
+  "author": "Vishous",
+  "github": "https://github.com/Vishousdev/vishrun",
+  "homepage": "https://github.com/Vishousdev/vishrun",
+  "description": "Renders SillyTavern character-card regex_scripts widgets inside Lumiverse (MVP).",
+  "permissions": [],
+  "entry_frontend": "dist/frontend.js",
+  "minimum_lumiverse_version": "0.1.0"
+}

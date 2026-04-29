@@ -1,0 +1,12 @@
+{
+  "name": "vishrun",
+  "version": "0.0.1",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/frontend.ts --target browser --outfile dist/frontend.js"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0"
+  }
+}

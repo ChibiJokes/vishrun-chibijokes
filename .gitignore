@@ -1,0 +1,6 @@
+node_modules/
+
+# Internal docs (project notes, not for the public repo)
+CONTEXT.md
+STEP_LOG.md
+FINDINGS.md
