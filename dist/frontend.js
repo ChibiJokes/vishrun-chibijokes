@@ -179,7 +179,7 @@ function substitute(template, fullMatch, groups) {
 var iframeNonces = new WeakMap;
 function buildWidgetIframe(html, scriptName, scriptId, ctx) {
   const nonce = makeNonce();
-  const srcdoc = injectSizeReporter(html, nonce);
+  const srcdoc = injectShimsAndSizeReporter(html, nonce);
   const iframe = ctx.dom.createElement("iframe", {
     sandbox: "allow-scripts",
     srcdoc,
@@ -192,7 +192,7 @@ function buildWidgetIframe(html, scriptName, scriptId, ctx) {
   iframe.style.height = "1px";
   iframe.style.border = "none";
   iframe.style.display = "block";
-  iframe.style.margin = "8px 0";
+  iframe.style.margin = "12px 0";
   iframe.style.maxHeight = "none";
   iframe.style.maxWidth = "none";
   return iframe;
@@ -200,16 +200,33 @@ function buildWidgetIframe(html, scriptName, scriptId, ctx) {
 function containsScriptTag(html) {
   return /<script\b[^>]*>/i.test(html);
 }
-function injectSizeReporter(html, nonce) {
-  const meta = '<meta name="color-scheme" content="dark light">';
-  const closeHead = html.lastIndexOf("</head>");
-  const withMeta = closeHead >= 0 ? html.slice(0, closeHead) + meta + html.slice(closeHead) : html;
+function containsInlineEventHandler(html) {
+  return /\bon(?:click|load|mouseover|mouseout|mousedown|mouseup|mousemove|change|input|submit|focus|blur|keydown|keyup|keypress|error|abort|cancel|toggle|wheel|contextmenu)\s*=/i.test(html);
+}
+function widgetNeedsIsolation(html) {
+  return containsScriptTag(html) || containsInlineEventHandler(html);
+}
+function injectShimsAndSizeReporter(html, nonce) {
+  const head = buildHeadInjection(nonce);
+  const withHead = injectIntoHead(html, head);
   const shell = sizeReporterShell(nonce);
-  const closeBody = withMeta.lastIndexOf("</body>");
+  const closeBody = withHead.lastIndexOf("</body>");
   if (closeBody >= 0) {
-    return withMeta.slice(0, closeBody) + shell + withMeta.slice(closeBody);
+    return withHead.slice(0, closeBody) + shell + withHead.slice(closeBody);
   }
-  return withMeta + shell;
+  return withHead + shell;
+}
+function buildHeadInjection(nonce) {
+  const nonceLit = JSON.stringify(nonce);
+  return `<meta name="color-scheme" content="dark light">` + `<script>(function(){` + `window.setChatMessages = function(chat_messages){` + `try{window.parent.postMessage({__vishrun:'set-chat-messages',nonce:${nonceLit},payload:chat_messages},'*');}` + `catch(e){}` + `};` + `})();</script>`;
+}
+function injectIntoHead(html, blob) {
+  const openHead = html.match(/<head\b[^>]*>/i);
+  if (openHead && openHead.index !== undefined) {
+    const idx = openHead.index + openHead[0].length;
+    return html.slice(0, idx) + blob + html.slice(idx);
+  }
+  return blob + html;
 }
 function sizeReporterShell(nonce) {
   const nonceLit = JSON.stringify(nonce);
@@ -271,13 +288,15 @@ function sizeReporterShell(nonce) {
       } else {
         h = document.body.scrollHeight;
       }
-      // 12px pragmatic buffer: after three measurement-strategy iterations
+      // 48px pragmatic buffer: after three measurement-strategy iterations
       // (scrollHeight, padding-top margin-collapse trick, getBoundingClientRect)
       // a sub-pixel residual still slips past for some widgets. JS-Slash-Runner
       // uses the same trick for the same reason — measuring CSS-occupied
-      // space exhaustively isn't tractable. Visually imperceptible, kills
-      // the scrollbar.
-      h += 12;
+      // space exhaustively isn't tractable. Successive bumps (12 → 32 → 48)
+      // after user reports that dense widgets (Vavesta Court Ledger expanded,
+      // Pacifica Pulse) still clipped at the bottom. Visually imperceptible
+      // padding, kills the residual scroll across the cards in scope.
+      h += 48;
       window.parent.postMessage({ __vishrun: 'resize', nonce: NONCE, height: h }, '*');
     } catch (e) {}
   }
@@ -307,27 +326,90 @@ function makeNonce() {
   }
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`;
 }
-function installIframeBridge() {
+function installIframeBridge(ctx) {
   const handler = (e) => {
     const data = e.data;
     if (!data || typeof data !== "object")
       return;
     const d = data;
-    if (d.__vishrun !== "resize")
-      return;
     if (typeof d.nonce !== "string" || !d.nonce)
       return;
     const iframe = findIframeByNonce(d.nonce);
     if (!iframe)
       return;
-    const raw = Number(d.height);
-    if (!Number.isFinite(raw))
+    if (d.__vishrun === "resize") {
+      const raw = Number(d.height);
+      if (!Number.isFinite(raw))
+        return;
+      const h = Math.max(40, Math.min(4000, Math.round(raw)));
+      iframe.style.height = `${h}px`;
       return;
-    const h = Math.max(40, Math.min(4000, Math.round(raw)));
-    iframe.style.height = `${h}px`;
+    }
+    if (d.__vishrun === "set-chat-messages") {
+      handleSetChatMessages(iframe, d.payload, ctx);
+      return;
+    }
   };
   window.addEventListener("message", handler);
   return () => window.removeEventListener("message", handler);
+}
+async function handleSetChatMessages(iframe, payload, ctx) {
+  if (!Array.isArray(payload)) {
+    console.warn("[vishrun] setChatMessages: payload is not an array, ignoring");
+    return;
+  }
+  const messageEl = iframe.closest("[data-message-id]");
+  const messageId = messageEl?.getAttribute("data-message-id");
+  if (!messageId) {
+    console.warn("[vishrun] setChatMessages: cannot resolve messageId from iframe ancestry, ignoring");
+    return;
+  }
+  const active = ctx.getActiveChat();
+  const chatId = active.chatId;
+  if (!chatId) {
+    console.warn("[vishrun] setChatMessages: no active chat, ignoring");
+    return;
+  }
+  const card = getActiveCard();
+  if (!card) {
+    console.warn("[vishrun] setChatMessages: no active card cached, ignoring");
+    return;
+  }
+  for (const entry of payload) {
+    if (!entry || typeof entry !== "object")
+      continue;
+    const e = entry;
+    if (typeof e.message_id !== "number" || e.message_id !== 0) {
+      console.debug("[vishrun] setChatMessages: skipping entry with message_id !== 0", e);
+      continue;
+    }
+    const swipeId = typeof e.swipe_id === "number" ? e.swipe_id : 0;
+    let targetContent;
+    if (swipeId === 0) {
+      targetContent = card.firstMes ?? undefined;
+    } else if (swipeId >= 1) {
+      targetContent = card.alternateGreetings[swipeId - 1];
+    }
+    if (typeof targetContent !== "string" || !targetContent) {
+      console.warn(`[vishrun] setChatMessages: out-of-range swipe_id=${swipeId} ` + `(have first_mes=${card.firstMes ? "yes" : "no"}, ` + `alternate_greetings.length=${card.alternateGreetings.length}), aborting entry`);
+      continue;
+    }
+    try {
+      const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages/${encodeURIComponent(messageId)}`, {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ content: targetContent })
+      });
+      if (!r.ok) {
+        console.warn(`[vishrun] setChatMessages: PUT failed (HTTP ${r.status}) for swipe_id=${swipeId}`);
+        continue;
+      }
+    } catch (err) {
+      console.warn("[vishrun] setChatMessages: PUT threw", err);
+      continue;
+    }
+  }
 }
 function findIframeByNonce(nonce) {
   const escaped = cssEscape(nonce);
@@ -500,13 +582,14 @@ function findContentRoot(messageNode) {
   return inner ?? messageNode;
 }
 function buildWidget(html, scriptName, scriptId, ctx) {
-  if (containsScriptTag(html)) {
+  if (widgetNeedsIsolation(html)) {
     return buildWidgetIframe(html, scriptName, scriptId, ctx);
   }
   const wrapper = ctx.dom.createElement("div", {
     "data-vishrun-widget": scriptName,
     "data-vishrun-script-id": scriptId
   });
+  wrapper.style.margin = "12px 0";
   wrapper.innerHTML = html;
   return wrapper;
 }
@@ -775,7 +858,7 @@ function setup(ctx) {
     banner.classList.add("show");
   };
   const hooks = installMessageHooks(ctx);
-  const teardownIframeBridge = installIframeBridge();
+  const teardownIframeBridge = installIframeBridge(ctx);
   let inflightCharacterId = null;
   let lastLoadedCharacterId = null;
   async function loadFor(characterId) {
@@ -806,7 +889,9 @@ function setup(ctx) {
         console.debug(`[vishrun][step3] character ${characterId} has no regex_scripts — silent no-op`);
         return;
       }
-      setActiveCard({ characterId, characterName: name, scripts });
+      const firstMes = typeof char.first_mes === "string" ? char.first_mes : null;
+      const alternateGreetings = Array.isArray(char.alternate_greetings) ? char.alternate_greetings.filter((g) => typeof g === "string") : [];
+      setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
       const enabled = scripts.filter((s) => !s.disabled).length;
       console.log(`[vishrun][step3] loaded ${scripts.length} regex_scripts (${enabled} enabled) for character "${name}" (${characterId})`, scripts.map((s) => ({

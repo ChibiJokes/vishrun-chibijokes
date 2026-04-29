@@ -76,9 +76,12 @@ export function setup(ctx: SpindleFrontendContext) {
   // the cache is populated.
   const hooks = installMessageHooks(ctx);
 
-  // Single document-wide listener that resizes paired-tag and placeholder
-  // iframes to their reported content height. Independent of card state.
-  const teardownIframeBridge = installIframeBridge();
+  // Single document-wide listener for iframe → host postMessage traffic.
+  // Routes by message type:
+  //   __vishrun: 'resize'             → resize paired-tag/placeholder iframes
+  //   __vishrun: 'set-chat-messages'  → greeting navigation shim (Step 6)
+  // Needs ctx for ctx.getActiveChat() inside the set-chat-messages branch.
+  const teardownIframeBridge = installIframeBridge(ctx);
 
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
@@ -116,7 +119,11 @@ export function setup(ctx: SpindleFrontendContext) {
         return;
       }
 
-      setActiveCard({ characterId, characterName: name, scripts });
+      const firstMes = typeof char.first_mes === 'string' ? char.first_mes : null;
+      const alternateGreetings = Array.isArray(char.alternate_greetings)
+        ? char.alternate_greetings.filter((g): g is string => typeof g === 'string')
+        : [];
+      setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
       const enabled = scripts.filter((s) => !s.disabled).length;
       console.log(

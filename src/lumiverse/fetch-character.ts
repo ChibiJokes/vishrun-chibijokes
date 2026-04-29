@@ -26,6 +26,8 @@ export interface RawRegexScript {
 export interface LumiverseCharacter {
   id: string;
   name?: string;
+  first_mes?: string;
+  alternate_greetings?: string[];
   extensions?: {
     regex_scripts?: RawRegexScript[];
     [k: string]: unknown;

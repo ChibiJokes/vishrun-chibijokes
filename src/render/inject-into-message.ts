@@ -1,7 +1,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
 import { substitute } from '../core/substitute';
-import { buildWidgetIframe, containsScriptTag } from './widget-iframe';
+import { buildWidgetIframe, widgetNeedsIsolation } from './widget-iframe';
 import { getCapturesForMessage } from '../hooks/tag-interceptor';
 
 /**
@@ -169,13 +169,17 @@ function buildWidget(
   scriptId: string,
   ctx: SpindleFrontendContext,
 ): HTMLElement {
-  if (containsScriptTag(html)) {
+  if (widgetNeedsIsolation(html)) {
     return buildWidgetIframe(html, scriptName, scriptId, ctx);
   }
   const wrapper = ctx.dom.createElement('div', {
     'data-vishrun-widget': scriptName,
     'data-vishrun-script-id': scriptId,
   }) as HTMLElement;
+  // Match the iframe path's vertical breathing room (12px in widget-iframe.ts).
+  // Without this, no-isolation widgets (innerHTML+div path) render flush
+  // against adjacent message text and feel cramped.
+  wrapper.style.margin = '12px 0';
   wrapper.innerHTML = html;
   return wrapper;
 }
