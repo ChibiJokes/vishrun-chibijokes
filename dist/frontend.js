@@ -480,7 +480,6 @@ function syncTagInterceptors(ctx, compiled) {
   for (const [tagName, script] of desired) {
     const unsub = ctx.messages.registerTagInterceptor({ tagName, removeFromMessage: true }, (payload) => onCapture(payload, script));
     activeUnsubs.push(unsub);
-    console.debug(`[vishrun][step3] registered tag interceptor for <${tagName}> (script: "${script.scriptName}")`);
   }
 }
 function teardownTagInterceptors() {
@@ -495,10 +494,8 @@ function teardownTagInterceptors() {
 function onCapture(payload, script) {
   if (!payload.messageId)
     return;
-  const list = capturesByMessage.get(payload.messageId) || [];
-  if (list.some((c) => c.scriptId === script.id && c.fullMatch === payload.fullMatch)) {
-    return;
-  }
+  const existing = capturesByMessage.get(payload.messageId) || [];
+  const list = existing.filter((c) => c.scriptId !== script.id);
   list.push({
     scriptId: script.id,
     scriptName: script.scriptName,
@@ -508,7 +505,6 @@ function onCapture(payload, script) {
     attrs: payload.attrs
   });
   capturesByMessage.set(payload.messageId, list);
-  console.debug(`[vishrun][step3] captured <${payload.tagName}> for message ${payload.messageId} (inner=${payload.content.length} chars)`);
 }
 function extractTagName(reSource) {
   const m = reSource.match(/^<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/);
@@ -571,10 +567,19 @@ function replacePlaceholderMatches(root, script, ctx) {
 }
 function renderPairedTagCaptures(root, messageId, ctx) {
   const captures = getCapturesForMessage(messageId);
-  if (captures.length === 0)
-    return 0;
   const target = findContentRoot(root);
-  let count = 0;
+  let added = 0;
+  let removed = 0;
+  const existingPaired = target.querySelectorAll("[data-vishrun-widget][data-vishrun-paired-fullmatch]");
+  existingPaired.forEach((el) => {
+    const sid = el.getAttribute("data-vishrun-script-id");
+    const fmHash = el.getAttribute("data-vishrun-paired-fullmatch");
+    const stillValid = captures.some((c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash);
+    if (!stillValid) {
+      el.remove();
+      removed++;
+    }
+  });
   for (const cap of captures) {
     const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape2(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape2(hashKey(cap.fullMatch))}"]`;
     if (target.querySelector(sel))
@@ -591,7 +596,7 @@ function renderPairedTagCaptures(root, messageId, ctx) {
       failed.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
       failed.textContent = cap.fullMatch;
       target.appendChild(failed);
-      count++;
+      added++;
       continue;
     }
     const groups = m.slice(1).map((g) => g ?? "");
@@ -599,9 +604,9 @@ function renderPairedTagCaptures(root, messageId, ctx) {
     const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
     target.appendChild(iframe);
-    count++;
+    added++;
   }
-  return count;
+  return added;
 }
 function findContentRoot(messageNode) {
   const inner = messageNode.querySelector('[data-component="MessageContent"]');
@@ -679,27 +684,18 @@ function installMessageHooks(ctx) {
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel);
     if (node) {
-      const n = processNode(node, compiled, ctx);
-      if (n > 0) {
-        console.debug(`[vishrun][step3] rendered ${n} widget(s) into message ${messageId}`);
-      }
+      processNode(node, compiled, ctx);
       return;
     }
     if (retriesLeft > 0) {
       requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
-    } else {
-      console.debug(`[vishrun][step3] message ${messageId} not found in DOM after ${MAX_RAF_RETRIES} frames`);
     }
   }
   function scanAllNow(compiled) {
     const nodes = document.querySelectorAll("[data-message-id]");
-    let total = 0;
     nodes.forEach((n) => {
-      total += processNode(n, compiled, ctx);
+      processNode(n, compiled, ctx);
     });
-    if (total > 0) {
-      console.debug(`[vishrun][step3] scan rendered ${total} widget(s) across ${nodes.length} message(s)`);
-    }
   }
   function handleMutations() {
     if (pendingFrame)
@@ -734,7 +730,6 @@ function installMessageHooks(ctx) {
     observer = new MutationObserver(handleMutations);
     observer.observe(target, { childList: true, subtree: true, characterData: true });
     observedTarget = target;
-    console.debug("[vishrun][step3] MutationObserver attached to", MESSAGE_LIST_SELECTOR);
   }
   function ensureBodyWatcher() {
     if (bodyWatcher)
@@ -770,7 +765,6 @@ function installMessageHooks(ctx) {
       scanAllNow(compiled);
     });
     bodyWatcher.observe(document.body, { childList: true, subtree: true });
-    console.debug("[vishrun][step3] MessageList not yet mounted — body watcher armed");
   }
   function detachObserver() {
     if (pendingFrame) {
@@ -785,7 +779,6 @@ function installMessageHooks(ctx) {
       observer.disconnect();
       observer = null;
       observedTarget = null;
-      console.debug("[vishrun][step3] MutationObserver detached");
     }
   }
   function rescanAll() {
@@ -834,55 +827,7 @@ function buildMessageSelector(messageId) {
 }
 
 // src/frontend.ts
-var STEP_LABEL = "Vishrun · Step 3";
 function setup(ctx) {
-  console.log("[vishrun][step3] setup() invoked");
-  const removeStyle = ctx.dom.addStyle(`
-    .vishrun-banner {
-      position: fixed;
-      top: 12px;
-      right: 12px;
-      max-width: 460px;
-      padding: 10px 14px;
-      background: var(--lumiverse-fill-subtle, #1f1f1f);
-      border: 1px solid var(--lumiverse-border, #444);
-      border-radius: 6px;
-      color: var(--lumiverse-text, #eee);
-      font: 12px/1.45 ui-monospace, SFMono-Regular, Menlo, monospace;
-      z-index: 99999;
-      box-shadow: 0 4px 16px rgba(0,0,0,0.35);
-      display: none;
-    }
-    .vishrun-banner.show { display: block; }
-    .vishrun-banner b { color: var(--lumiverse-text, #fff); }
-    .vishrun-banner .ok { color: #5fd97e; }
-    .vishrun-banner .fail { color: #ff7a7a; }
-    .vishrun-banner .muted { color: var(--lumiverse-text-muted, #999); }
-    .vishrun-banner ul { margin: 4px 0 0 0; padding-left: 18px; }
-    .vishrun-banner li { line-height: 1.35; }
-  `);
-  ctx.dom.inject("body", '<div class="vishrun-banner"></div>');
-  const banner = ctx.dom.query(".vishrun-banner");
-  const escape = (s) => s.replace(/[<>&"]/g, (ch) => ({ "<": "&lt;", ">": "&gt;", "&": "&amp;", '"': "&quot;" })[ch]);
-  const renderHidden = () => {
-    if (banner) {
-      banner.classList.remove("show");
-      banner.innerHTML = "";
-    }
-  };
-  const renderLoaded = (count, characterName, scriptNames) => {
-    if (!banner)
-      return;
-    const items = scriptNames.map((n) => `<li>${escape(n || "(unnamed)")}</li>`).join("");
-    banner.innerHTML = `<b>${STEP_LABEL}</b><br>` + `<span class="ok">✓ loaded ${count} regex_scripts</span><br>` + `<span class="muted">card: ${escape(characterName ?? "(unnamed)")}</span>` + (items ? `<ul>${items}</ul>` : "");
-    banner.classList.add("show");
-  };
-  const renderError = (msg) => {
-    if (!banner)
-      return;
-    banner.innerHTML = `<b>${STEP_LABEL}</b><br><span class="fail">✗ ${escape(msg)}</span>`;
-    banner.classList.add("show");
-  };
   const hooks = installMessageHooks(ctx);
   const teardownIframeBridge = installIframeBridge(ctx);
   let inflightCharacterId = null;
@@ -891,9 +836,7 @@ function setup(ctx) {
     if (!characterId) {
       clearActiveCard();
       lastLoadedCharacterId = null;
-      renderHidden();
       hooks.rescanAll();
-      console.debug("[vishrun][step3] no active character — silent no-op");
       return;
     }
     if (inflightCharacterId === characterId)
@@ -910,29 +853,16 @@ function setup(ctx) {
       if (scripts.length === 0) {
         clearActiveCard();
         lastLoadedCharacterId = characterId;
-        renderHidden();
         hooks.rescanAll();
-        console.debug(`[vishrun][step3] character ${characterId} has no regex_scripts — silent no-op`);
         return;
       }
       const firstMes = typeof char.first_mes === "string" ? char.first_mes : null;
       const alternateGreetings = Array.isArray(char.alternate_greetings) ? char.alternate_greetings.filter((g) => typeof g === "string") : [];
       setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
-      const enabled = scripts.filter((s) => !s.disabled).length;
-      console.log(`[vishrun][step3] loaded ${scripts.length} regex_scripts (${enabled} enabled) for character "${name}" (${characterId})`, scripts.map((s) => ({
-        scriptName: s.scriptName,
-        findRegex: s.findRegex,
-        disabled: s.disabled,
-        placement: s.placement,
-        replaceLen: s.replaceString?.length
-      })));
-      renderLoaded(scripts.length, name, scripts.map((s) => s.scriptName ?? ""));
       hooks.rescanAll();
     } catch (err) {
-      const msg = err instanceof Error ? err.message : String(err);
-      console.error("[vishrun][step3] fetchCharacter failed:", err);
-      renderError(`fetchCharacter failed: ${msg}`);
+      console.debug("[vishrun] fetchCharacter failed:", err);
     } finally {
       if (inflightCharacterId === characterId)
         inflightCharacterId = null;
@@ -940,7 +870,6 @@ function setup(ctx) {
   }
   const unsubChatChanged = ctx.events.on("CHAT_CHANGED", (payload) => {
     const p = payload || {};
-    console.log("[vishrun][step3] CHAT_CHANGED:", p);
     loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
   });
   const unsubSettingsUpdated = ctx.events.on("SETTINGS_UPDATED", (payload) => {
@@ -950,18 +879,14 @@ function setup(ctx) {
     loadFor(ctx.getActiveChat().characterId ?? null);
   });
   const active = ctx.getActiveChat();
-  console.log("[vishrun][step3] initial getActiveChat():", active);
   if (active.characterId) {
     loadFor(active.characterId);
-  } else {
-    console.debug("[vishrun][step3] setup ran before chat hydration — waiting for SETTINGS_UPDATED");
   }
   return () => {
     unsubChatChanged();
     unsubSettingsUpdated();
     hooks.dispose();
     teardownIframeBridge();
-    removeStyle();
     ctx.dom.cleanup();
     clearActiveCard();
   };

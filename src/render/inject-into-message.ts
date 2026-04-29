@@ -105,15 +105,38 @@ function renderPairedTagCaptures(
   ctx: SpindleFrontendContext,
 ): number {
   const captures = getCapturesForMessage(messageId);
-  if (captures.length === 0) return 0;
-
   const target = findContentRoot(root);
-  let count = 0;
+  let added = 0;
+  let removed = 0;
 
+  // Phase 1 (cleanup): drop paired-tag widgets in this message that no
+  // longer match any current capture. Greeting switch / edit / regen
+  // depend on this — `onCapture` evicts the prior capture for a
+  // (messageId, scriptId) when a new fullMatch arrives, and this loop
+  // removes the matching stale widget. Filter on data-vishrun-paired-
+  // fullmatch presence so we don't touch placeholder widgets — those
+  // live inside the React-owned markdown subtree and React handles
+  // unmount on content change.
+  const existingPaired = target.querySelectorAll<HTMLElement>(
+    '[data-vishrun-widget][data-vishrun-paired-fullmatch]',
+  );
+  existingPaired.forEach((el) => {
+    const sid = el.getAttribute('data-vishrun-script-id');
+    const fmHash = el.getAttribute('data-vishrun-paired-fullmatch');
+    const stillValid = captures.some(
+      (c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash,
+    );
+    if (!stillValid) {
+      el.remove();
+      removed++;
+    }
+  });
+
+  // Phase 2 (inject): for each capture without a matching widget in the
+  // DOM, build and insert. The querySelector at the top of the loop is
+  // the within-scan idempotency check (a capture iterated twice in one
+  // scan doesn't double-insert).
   for (const cap of captures) {
-    // Idempotency: if this exact (scriptId, messageId) is already
-    // rendered, skip. Selector scoped to `target` so a same-id widget
-    // in another message in the same scan doesn't false-positive.
     const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
     if (target.querySelector(sel)) continue;
 
@@ -141,7 +164,7 @@ function renderPairedTagCaptures(
       failed.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
       failed.textContent = cap.fullMatch;
       target.appendChild(failed);
-      count++;
+      added++;
       continue;
     }
     const groups = m.slice(1).map((g) => g ?? '');
@@ -152,10 +175,10 @@ function renderPairedTagCaptures(
     const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     target.appendChild(iframe);
-    count++;
+    added++;
   }
 
-  return count;
+  return added;
 }
 
 function findContentRoot(messageNode: HTMLElement): HTMLElement {
@@ -182,7 +205,7 @@ function buildWidget(
   }) as HTMLElement;
   // Match the iframe path's vertical breathing room (12px in widget-iframe.ts).
   // Without this, no-isolation widgets (innerHTML+div path) render flush
-  // against adjacent message text and feel cramped.
+  // against adjacent message text and feel cramped — Step 6 user feedback.
   wrapper.style.margin = '12px 0';
   wrapper.innerHTML = html;
   return wrapper;

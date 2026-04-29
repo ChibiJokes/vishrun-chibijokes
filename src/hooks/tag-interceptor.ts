@@ -119,7 +119,6 @@ export function syncTagInterceptors(
       (payload: InterceptorPayload) => onCapture(payload, script),
     );
     activeUnsubs.push(unsub);
-    console.debug(`[vishrun][step3] registered tag interceptor for <${tagName}> (script: "${script.scriptName}")`);
   }
 }
 
@@ -141,14 +140,17 @@ function onCapture(payload: InterceptorPayload, script: CompiledScript): void {
 
   if (!payload.messageId) return;
 
-  const list = capturesByMessage.get(payload.messageId) || [];
-
-  // Defend against the same fullMatch being reported twice (shouldn't
-  // happen given Lumiverse's dedup, but cheap insurance against future
-  // upstream changes).
-  if (list.some((c) => c.scriptId === script.id && c.fullMatch === payload.fullMatch)) {
-    return;
-  }
+  // Drop any prior capture for this scriptId in this message — only the
+  // latest fullMatch is canonical. This is what makes greeting switch /
+  // message edit / regen converge correctly: a new fullMatch for the
+  // same (messageId, scriptId) ejects the stale capture, and
+  // renderPairedTagCaptures' phase-1 cleanup removes the corresponding
+  // stale widget. Trade-off: the same paired tag emitted multiple times
+  // in a single message renders only the last instance — no card in
+  // scope hits this; documented in CONTEXT.md "Known issues" with the
+  // migration path (REST-fetch-and-rematch on content-hash change).
+  const existing = capturesByMessage.get(payload.messageId) || [];
+  const list = existing.filter((c) => c.scriptId !== script.id);
 
   list.push({
     scriptId: script.id,
@@ -159,7 +161,6 @@ function onCapture(payload: InterceptorPayload, script: CompiledScript): void {
     attrs: payload.attrs,
   });
   capturesByMessage.set(payload.messageId, list);
-  console.debug(`[vishrun][step3] captured <${payload.tagName}> for message ${payload.messageId} (inner=${payload.content.length} chars)`);
 }
 
 /**

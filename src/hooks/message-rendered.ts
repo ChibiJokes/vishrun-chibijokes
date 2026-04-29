@@ -74,26 +74,17 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel) as HTMLElement | null;
     if (node) {
-      const n = processNode(node, compiled, ctx);
-      if (n > 0) {
-        console.debug(`[vishrun][step3] rendered ${n} widget(s) into message ${messageId}`);
-      }
+      processNode(node, compiled, ctx);
       return;
     }
     if (retriesLeft > 0) {
       requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
-    } else {
-      console.debug(`[vishrun][step3] message ${messageId} not found in DOM after ${MAX_RAF_RETRIES} frames`);
     }
   }
 
   function scanAllNow(compiled: CompiledScript[]): void {
     const nodes = document.querySelectorAll('[data-message-id]');
-    let total = 0;
-    nodes.forEach((n) => { total += processNode(n as HTMLElement, compiled, ctx); });
-    if (total > 0) {
-      console.debug(`[vishrun][step3] scan rendered ${total} widget(s) across ${nodes.length} message(s)`);
-    }
+    nodes.forEach((n) => { processNode(n as HTMLElement, compiled, ctx); });
   }
 
   function handleMutations(): void {
@@ -139,7 +130,6 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     // rely on the childList/subtree mutations React fires at end-of-stream.
     observer.observe(target, { childList: true, subtree: true, characterData: true });
     observedTarget = target;
-    console.debug('[vishrun][step3] MutationObserver attached to', MESSAGE_LIST_SELECTOR);
   }
 
   function ensureBodyWatcher(): void {
@@ -176,7 +166,6 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       scanAllNow(compiled);
     });
     bodyWatcher.observe(document.body, { childList: true, subtree: true });
-    console.debug('[vishrun][step3] MessageList not yet mounted — body watcher armed');
   }
 
   function detachObserver(): void {
@@ -192,7 +181,6 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       observer.disconnect();
       observer = null;
       observedTarget = null;
-      console.debug('[vishrun][step3] MutationObserver detached');
     }
   }
 
