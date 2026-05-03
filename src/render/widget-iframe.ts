@@ -1,31 +1,40 @@
-import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
+import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import { getActiveCard } from '../state/active-card';
 
 /**
- * Per-iframe nonce → iframe lookup. WeakMap so cleared iframes are
- * GC'd automatically without leaking entries.
- *
- * Used as a defensive double-check in the postMessage bridge: even after
- * matching the iframe by `data-vishrun-iframe-nonce` attribute, we verify
- * the WeakMap entry agrees. Prevents attribute spoofing by other code on
- * the page and lets us distinguish widget iframes from any nested
- * iframes a card might create in the future.
+ * Per-iframe destroy function. WeakMap so removing the iframe from the
+ * DOM lets the entry GC away once no other code holds the element. Used
+ * by destroyWidgetIframe(iframe) to release the host-side sandbox frame
+ * record (sandbox-frame.ts keeps a string-keyed Map that doesn't clear
+ * on element removal alone).
  */
-const iframeNonces = new WeakMap<HTMLIFrameElement, string>();
+const widgetFrameDestroyers = new WeakMap<HTMLIFrameElement, () => void>();
 
 /**
  * Build a sandboxed iframe widget from a fence-stripped, substituted HTML
- * string. The iframe gets `sandbox="allow-scripts"` (no `allow-same-origin`
- * — null-origin iframes can still postMessage to the parent fine; that
- * was Step 0's verdict).
+ * string, using ctx.dom.createSandboxFrame (the only sanctioned path for
+ * scriptable iframes since Lumiverse staging d157784).
  *
- * Carries `data-vishrun-widget` so:
- *  - processNode's idempotency check can see it (skip text inside).
- *  - ctx.dom.cleanup() removes it on extension teardown via the
- *    `data-spindle-ext` attribute that ctx.dom.createElement adds.
+ * autoResize is disabled because the host's built-in size reporter
+ * under-measures dense widgets — Vavesta Court Ledger and Pacifica Pulse
+ * both clipped at the bottom under it. We keep the lastChild
+ * getBoundingClientRect strategy plus the 48px buffer iterated through
+ * three Step-6 pivots (12 → 32 → 48) and post heights via the
+ * window.spindleSandbox.requestResize hook the host exposes inside the
+ * child.
  *
- * Carries `data-vishrun-iframe-nonce` (per-iframe random UUID) so the
- * resize bridge can route messages back to the correct iframe.
+ * Carries:
+ *  - data-vishrun-widget — processNode idempotency check + paired-tag
+ *    selector matching.
+ *  - data-vishrun-script-id — paired-widget cleanup keying.
+ *  - data-spindle-ext (added automatically by createSandboxFrame) —
+ *    ctx.dom.cleanup() removes it on extension teardown.
+ *
+ * Per-frame frame.onMessage handler is registered before the caller
+ * appends the iframe so messages emitted during initial child load
+ * (DOMContentLoaded → first postSize) don't slip past. The frame.onMessage
+ * channel is naturally scoped to this iframe's contentWindow by the host
+ * bridge (sandbox-frame.ts:38), so no nonce / per-iframe id is needed.
  */
 export function buildWidgetIframe(
   html: string,
@@ -33,40 +42,65 @@ export function buildWidgetIframe(
   scriptId: string,
   ctx: SpindleFrontendContext,
 ): HTMLIFrameElement {
-  const nonce = makeNonce();
-  const srcdoc = injectShimsAndSizeReporter(html, nonce);
-  const iframe = ctx.dom.createElement('iframe', {
-    sandbox: 'allow-scripts',
-    srcdoc,
-    'data-vishrun-widget': scriptName,
-    'data-vishrun-script-id': scriptId,
-    'data-vishrun-iframe-nonce': nonce,
-  }) as HTMLIFrameElement;
-  iframeNonces.set(iframe, nonce);
-  // Initial sizing — overwritten by the resize bridge once the iframe
-  // reports its content height. 1px keeps the pre-resize flash invisible
-  // for small widgets and prevents oversized initial values from making
-  // body.scrollHeight overestimate (it returns max(viewport, content)
-  // when content fits the viewport).
-  iframe.style.width = '100%';
-  iframe.style.height = '1px';
-  iframe.style.border = 'none';
-  iframe.style.display = 'block';
-  // 12px vertical margin gives the widget breathing room above/below within
-  // the message bubble. Step 6 bumped from 8px after the size-reporter buffer
-  // increase still felt visually tight on dense widgets (Vavesta Court Ledger,
-  // Xiao Gu).
+  const srcdoc = injectShimsAndSizeReporter(html);
+  const frame = ctx.dom.createSandboxFrame({
+    html: srcdoc,
+    autoResize: false,
+    minHeight: 1,
+    maxHeight: 4000,
+    initialHeight: 1,
+  });
+
+  // Register before any caller appendChild — the child's first postSize
+  // fires from DOMContentLoaded, which lands once the iframe is connected.
+  // Subscribing first guarantees we receive it.
+  frame.onMessage((payload) => {
+    routeChildMessage(frame, payload, ctx);
+  });
+
+  const iframe = frame.element;
+  iframe.setAttribute('data-vishrun-widget', scriptName);
+  iframe.setAttribute('data-vishrun-script-id', scriptId);
+  // 12px vertical margin matches the no-isolation div path in
+  // inject-into-message.ts:209. Keeps spacing consistent across both
+  // paths regardless of which one each card lands on.
   iframe.style.margin = '12px 0';
   // Override Lumiverse's `.prose iframe { max-height: 400px; max-width: 100% }`
-  // (MessageContent.module.css:423-429). Without this, the bridge sets
-  // height to the real content height (e.g. 1170px), but the browser
-  // clamps it via min(height, max-height) → 400px, with an internal
-  // scrollbar. Inline beats class-selector specificity, so no !important
-  // needed. Watch-item: if Lumiverse adds !important to that rule in the
-  // future, switch to setProperty(..., 'important').
+  // (MessageContent.module.css:423-429). Without this, the host bridge
+  // sets height to the real content height (e.g. 1170px), but the
+  // browser clamps it via min(height, max-height) → 400px, with an
+  // internal scrollbar. Inline beats class-selector specificity so no
+  // !important needed.
   iframe.style.maxHeight = 'none';
   iframe.style.maxWidth = 'none';
+
+  widgetFrameDestroyers.set(iframe, () => frame.destroy());
   return iframe;
+}
+
+/**
+ * Tear down a vishrun widget iframe: calls the host's destroy() to
+ * release the sandbox frame record, then removes the element. Use this
+ * instead of plain element.remove() anywhere vishrun explicitly evicts
+ * one of its widgets — paired-tag stale cleanup in inject-into-message
+ * is the call site today.
+ *
+ * No-op for elements not tracked here (e.g. placeholder widgets that
+ * React unmounts via diffing — those leak the host record until
+ * extension teardown clears via ctx.dom.cleanup, which is acceptable).
+ */
+export function destroyWidgetIframe(iframe: HTMLIFrameElement): void {
+  const destroy = widgetFrameDestroyers.get(iframe);
+  if (destroy) {
+    widgetFrameDestroyers.delete(iframe);
+    try {
+      destroy();
+    } catch (e) {
+      console.debug('[vishrun] sandbox frame destroy threw:', e);
+    }
+    return;
+  }
+  iframe.remove();
 }
 
 /**
@@ -90,14 +124,7 @@ export function containsScriptTag(html: string): boolean {
  *
  * `widgetNeedsIsolation` (below) treats this as equivalent to having a
  * `<script>` tag and forces the widget through the iframe path so the
- * shim is reachable. The cost is a heavier element (iframe vs. div), but
- * (a) it's a small static widget so DOM weight is irrelevant in practice,
- * and (b) consistency wins — every interactive widget runs in a uniform
- * isolated context with shim availability guaranteed.
- *
- * The attribute list is the common subset of HTML event handlers that
- * widgets in scope use. If a future card uses an unlisted handler (e.g.
- * `oninvalid`, `ontoggle`), extend here.
+ * shim is reachable.
  */
 export function containsInlineEventHandler(html: string): boolean {
   return /\bon(?:click|load|mouseover|mouseout|mousedown|mouseup|mousemove|change|input|submit|focus|blur|keydown|keyup|keypress|error|abort|cancel|toggle|wheel|contextmenu)\s*=/i.test(html);
@@ -106,33 +133,27 @@ export function containsInlineEventHandler(html: string): boolean {
 /**
  * A widget needs iframe isolation if it has either a `<script>` tag (true
  * JS execution context) or an inline event handler (which would otherwise
- * execute in the host window where shims aren't defined). Used by
- * inject-into-message to decide between the iframe path and the inline
- * `<div>+innerHTML` path.
+ * execute in the host window where shims aren't defined).
  */
 export function widgetNeedsIsolation(html: string): boolean {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
 
 /**
- * Combine head injection (color-scheme meta + JSR shims) + size-reporter
- * shell into the srcdoc HTML.
+ * Combine head injection (setChatMessages shim) + size-reporter shell
+ * into the srcdoc HTML. The host's createSandboxFrame already injects
+ * its own meta charset/viewport/CSP, color-scheme, html/body reset, and
+ * defines window.spindleSandbox — we only add the JSR shim translation
+ * and our own measurement reporter on top.
  *
- * Head injection goes as early as possible so the shims are defined BEFORE
- * any widget script runs. Vavesta's current widgets only call setChatMessages
- * from event handlers (onclick → vavGoSwipe), which means deferred-execution
- * timing makes the order moot in practice — but a future widget that calls
- * the shim at script-execute time would need it ready, so we don't take the
- * shortcut.
- *
- * Size-reporter goes at the end (before </body> if present) — it's a passive
- * observer that doesn't depend on order.
+ * Head injection goes as early as possible so the shims are defined
+ * BEFORE any widget script runs.
  */
-function injectShimsAndSizeReporter(html: string, nonce: string): string {
-  const head = buildHeadInjection(nonce);
+function injectShimsAndSizeReporter(html: string): string {
+  const head = buildHeadInjection();
   const withHead = injectIntoHead(html, head);
 
-  const shell = sizeReporterShell(nonce);
+  const shell = sizeReporterShell();
   const closeBody = withHead.lastIndexOf('</body>');
   if (closeBody >= 0) {
     return withHead.slice(0, closeBody) + shell + withHead.slice(closeBody);
@@ -141,24 +162,27 @@ function injectShimsAndSizeReporter(html: string, nonce: string): string {
 }
 
 /**
- * Build the head-injection blob: color-scheme meta + JSR shims.
+ * setChatMessages JSR shim translated to window.spindleSandbox.postMessage.
+ * The host bridge validates each message by event.source ===
+ * record.iframe.contentWindow (sandbox-frame.ts:38), which makes the
+ * pre-d157784 nonce keying redundant — drop it.
  *
- * The color-scheme meta keeps a sandboxed null-origin iframe's canvas in
- * the right palette so the host theme shows through (Step 4 finding).
- *
- * The shim defines `window.setChatMessages` as a postMessage thin wrapper.
- * The second `options` argument of JSR's setChatMessages (refresh mode) is
- * ignored silently — Vishrun depends on the MutationObserver on
- * [data-component="MessageList"] to catch the React re-render after the
+ * The shim's second argument (refresh mode) is silently ignored; vishrun
+ * relies on Lumiverse's React re-render of MessageContent after the
  * content rewrite, so manual refresh isn't needed.
  */
-function buildHeadInjection(nonce: string): string {
-  const nonceLit = JSON.stringify(nonce);
-  return `<meta name="color-scheme" content="dark light">` +
-    `<script>(function(){` +
+function buildHeadInjection(): string {
+  return setChatMessagesShim();
+}
+
+function setChatMessagesShim(): string {
+  return `<script>(function(){` +
     `window.setChatMessages = function(chat_messages){` +
-    `try{window.parent.postMessage({__vishrun:'set-chat-messages',nonce:${nonceLit},payload:chat_messages},'*');}` +
-    `catch(e){}` +
+    `try{` +
+    `if(window.spindleSandbox && typeof window.spindleSandbox.postMessage==='function'){` +
+    `window.spindleSandbox.postMessage({kind:'set-chat-messages',payload:chat_messages});` +
+    `}` +
+    `}catch(e){}` +
     `};` +
     `})();</script>`;
 }
@@ -180,41 +204,10 @@ function injectIntoHead(html: string, blob: string): string {
   return blob + html;
 }
 
-function sizeReporterShell(nonce: string): string {
-  // JSON.stringify ensures the nonce is properly quoted and escaped if a
-  // future fallback ever produces non-ASCII or quote-bearing values.
-  const nonceLit = JSON.stringify(nonce);
+function sizeReporterShell(): string {
   return `
-<style>
-  /* Vishrun: normalize iframe body so the user-agent default 8px margin
-     doesn't push content into the iframe edge. The size-reporter uses
-     getBoundingClientRect to measure content so it doesn't depend on
-     body.scrollHeight excluding margin-collapsed offsets. */
-  html, body { margin: 0; padding: 0; }
-  body { box-sizing: border-box; }
-  /* Vishrun: transparent canvas so the host chat theme shows through for
-     widgets that don't paint their own background (e.g. Xiao Gu). Widgets
-     that DO want a background paint it on a container element (e.g.
-     Vavesta's .vav-home-wrap), not on body — those keep their look
-     because the rule below only zeroes html/body. !important defends
-     against UA canvas-default and any host-stylesheet leakage into the
-     iframe document. */
-  html, body { background: transparent !important; }
-  /* Vishrun: declare color-scheme so the UA canvas-default (the color the
-     browser paints under transparent html/body) matches whichever theme
-     the host is in. Sandboxed null-origin iframes (sandbox=allow-scripts
-     without allow-same-origin) do NOT inherit color-scheme from the
-     parent, so the canvas defaults to light then white even when the host
-     is dark. Declaring 'dark light' lets the browser pick whichever the
-     iframe element color-scheme prefers, which propagates from the parent
-     :root color-scheme during initial paint. Companion to the meta tag
-     injected into head below — meta is parsed earlier (pre-CSSOM), this
-     CSS rule wins ties and covers cards without a head. */
-  :root { color-scheme: dark light; }
-</style>
 <script>
 (function() {
-  var NONCE = ${nonceLit};
   function postSize() {
     try {
       if (!document.body) return;
@@ -248,10 +241,11 @@ function sizeReporterShell(nonce: string): string {
       // uses the same trick for the same reason — measuring CSS-occupied
       // space exhaustively isn't tractable. Successive bumps (12 → 32 → 48)
       // after user reports that dense widgets (Vavesta Court Ledger expanded,
-      // Pacifica Pulse) still clipped at the bottom. Visually imperceptible
-      // padding, kills the residual scroll across the cards in scope.
+      // Pacifica Pulse) still clipped at the bottom.
       h += 48;
-      window.parent.postMessage({ __vishrun: 'resize', nonce: NONCE, height: h }, '*');
+      if (window.spindleSandbox && typeof window.spindleSandbox.requestResize === 'function') {
+        window.spindleSandbox.requestResize(h);
+      }
     } catch (e) {}
   }
   function init() {
@@ -275,95 +269,48 @@ function sizeReporterShell(nonce: string): string {
 </script>`;
 }
 
-function makeNonce(): string {
-  // crypto.randomUUID is available in all modern browsers; fall back to a
-  // timestamp+random for older targets just in case.
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`;
-}
-
 /**
- * Install a single document-wide listener for postMessage traffic from
- * widget iframes. Routes by `__vishrun` message type:
+ * Route a payload from a single widget child to the appropriate handler.
+ * The host bridge already filters by iframe contentWindow, so payloads
+ * arriving here are guaranteed to come from THIS frame — no nonce
+ * validation needed.
  *
- *   - 'resize'              → adjust iframe height to reported content size
- *   - 'set-chat-messages'   → greeting navigation shim (translates JSR's
- *                             setChatMessages call into a Lumiverse content
- *                             rewrite, see handleSetChatMessages below)
- *
- * Always validates by per-iframe nonce: looks up the iframe by attribute
- * selector, then verifies the WeakMap entry matches before acting.
+ * Today the only kind we handle is 'set-chat-messages' (greeting nav
+ * shim). Unknown kinds are ignored silently to leave room for future
+ * card-introduced shims without forcing a vishrun release.
  */
-export function installIframeBridge(ctx: SpindleFrontendContext): () => void {
-  const handler = (e: MessageEvent) => {
-    const data = e.data;
-    if (!data || typeof data !== 'object') return;
-    const d = data as {
-      __vishrun?: string;
-      nonce?: unknown;
-      height?: unknown;
-      payload?: unknown;
-    };
-    if (typeof d.nonce !== 'string' || !d.nonce) return;
-    const iframe = findIframeByNonce(d.nonce);
-    if (!iframe) return;
-
-    if (d.__vishrun === 'resize') {
-      const raw = Number(d.height);
-      if (!Number.isFinite(raw)) return;
-      // Bounded to [40, 4000] px to defend against widget bugs reporting
-      // absurd heights (e.g. content with `height: 100vh` would otherwise
-      // expand indefinitely).
-      const h = Math.max(40, Math.min(4000, Math.round(raw)));
-      iframe.style.height = `${h}px`;
-      return;
-    }
-
-    if (d.__vishrun === 'set-chat-messages') {
-      void handleSetChatMessages(iframe, d.payload, ctx);
-      return;
-    }
-  };
-  window.addEventListener('message', handler);
-  return () => window.removeEventListener('message', handler);
+function routeChildMessage(
+  frame: SpindleSandboxFrameHandle,
+  payload: unknown,
+  ctx: SpindleFrontendContext,
+): void {
+  if (!payload || typeof payload !== 'object') return;
+  const p = payload as { kind?: unknown; payload?: unknown };
+  if (p.kind === 'set-chat-messages') {
+    void handleSetChatMessages(frame.element, p.payload, ctx);
+  }
 }
 
 /**
  * Translate a JSR `setChatMessages([{message_id, swipe_id}])` call from a
- * widget into the Lumiverse equivalent: rewrite message 0's content to the
- * greeting at the requested index.
+ * widget into the Lumiverse equivalent: rewrite message 0's content to
+ * the greeting at the requested index.
  *
  * Why this is necessary: Lumiverse stores message 0 with a single swipe
  * (the chosen greeting only), unlike SillyTavern which pre-populates the
  * swipes[] array with first_mes + all alternate_greetings. JSR's
  * setChatMessages contract therefore can't be honored swipe-for-swipe — it
- * has to be translated to a content rewrite via PUT /chats/:id/messages/:id,
- * which is the same path Lumiverse's native GreetingNav uses
- * (GreetingNav.tsx:57).
+ * has to be translated to a content rewrite via PUT
+ * /chats/:id/messages/:id, which is the same path Lumiverse's native
+ * GreetingNav uses (GreetingNav.tsx:57).
  *
- * Why we don't pre-check `extra.greeting === true`: an earlier draft did a
- * GET before the PUT to verify the message was still a greeting. That GET
- * targeted `/api/v1/chats/:chatId/messages/:msgId`, which doesn't exist as
- * a single-message route in Lumiverse — only the list endpoint does (see
- * STEP_LOG §"Step 1.5"). The 404 response was the SPA fallback HTML, which
- * threw a JSON parse error.
- *
- * The greeting check turned out to be unnecessary anyway. The widgets that
- * call setChatMessages (Vavesta intro / Return Home) live in the card's
- * regex_scripts replaceStrings, which only run against placeholders the AI
- * emits — and those placeholders are part of the greeting content itself.
- * So an iframe carrying this shim only exists rendered inside a greeting,
- * by construction of the placeholder pipeline. The "message is a greeting"
- * invariant holds without an explicit check.
- *
- * The MutationObserver on [data-component="MessageList"] (Step 2) catches
- * React's re-render of the message subtree once the content updates and
- * re-injects the appropriate widgets idempotently. No manual refresh needed.
- * Note: MESSAGE_EDITED WS event empirically does NOT fire on this path
- * (Step 2 pivot 2), but the observer is event-agnostic so this doesn't
- * matter for us.
+ * Why the direct fetch instead of ctx.chats.updateMessage: the frontend
+ * module runs in the host document, has BetterAuth cookies, and the
+ * MutationObserver in hooks/message-rendered.ts catches the React
+ * re-render after the content rewrite. ctx.chats.updateMessage would
+ * also work and would additionally sync the local store, but that
+ * change is structural (Path B) and out of scope for the d157784
+ * mechanical refactor.
  */
 async function handleSetChatMessages(
   iframe: HTMLIFrameElement,
@@ -396,10 +343,10 @@ async function handleSetChatMessages(
     if (!entry || typeof entry !== 'object') continue;
     const e = entry as { message_id?: unknown; swipe_id?: unknown };
 
-    // Vavesta only navigates greetings (message 0). Other message_ids would
-    // mean editing chat history, which is feature-creep and risky — skip
-    // silently with a debug log so a future card author isn't surprised at
-    // the no-op without a hint in DevTools.
+    // Vavesta only navigates greetings (message 0). Other message_ids
+    // would mean editing chat history, which is feature-creep and risky
+    // — skip silently with a debug log so a future card author isn't
+    // surprised at the no-op without a hint in DevTools.
     if (typeof e.message_id !== 'number' || e.message_id !== 0) {
       console.debug('[vishrun] setChatMessages: skipping entry with message_id !== 0', e);
       continue;
@@ -442,22 +389,4 @@ async function handleSetChatMessages(
       continue;
     }
   }
-}
-
-function findIframeByNonce(nonce: string): HTMLIFrameElement | null {
-  const escaped = cssEscape(nonce);
-  const iframe = document.querySelector(
-    `iframe[data-vishrun-iframe-nonce="${escaped}"]`,
-  ) as HTMLIFrameElement | null;
-  if (!iframe) return null;
-  // Defensive: WeakMap lookup confirms this iframe was created by us
-  // and the nonce wasn't spoofed via attribute manipulation.
-  if (iframeNonces.get(iframe) !== nonce) return null;
-  return iframe;
-}
-
-function cssEscape(s: string): string {
-  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
-    ? CSS.escape(s)
-    : s.replace(/["\\]/g, '\\$&');
 }

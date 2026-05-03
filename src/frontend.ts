@@ -2,7 +2,6 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { fetchCharacter, extractRegexScripts } from './lumiverse/fetch-character';
 import { setActiveCard, clearActiveCard, getActiveCard } from './state/active-card';
 import { installMessageHooks } from './hooks/message-rendered';
-import { installIframeBridge } from './render/widget-iframe';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -11,12 +10,11 @@ interface ChatChangedPayload {
 
 export function setup(ctx: SpindleFrontendContext) {
   const hooks = installMessageHooks(ctx);
-  // Single document-wide listener for iframe → host postMessage traffic.
-  // Routes by message type:
-  //   __vishrun: 'resize'             → resize paired-tag/placeholder iframes
-  //   __vishrun: 'set-chat-messages'  → greeting navigation shim
-  // Needs ctx for ctx.getActiveChat() inside the set-chat-messages branch.
-  const teardownIframeBridge = installIframeBridge(ctx);
+  // Iframe → host postMessage routing is per-frame now: each call to
+  // buildWidgetIframe registers a frame.onMessage handler scoped to its
+  // own contentWindow. The single-listener installIframeBridge that
+  // pre-d157784 vishrun used is gone — host bridge keying on contentWindow
+  // makes it unnecessary.
 
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
@@ -96,7 +94,6 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubChatChanged();
     unsubSettingsUpdated();
     hooks.dispose();
-    teardownIframeBridge();
     ctx.dom.cleanup();
     clearActiveCard();
   };

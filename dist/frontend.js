@@ -200,26 +200,40 @@ function substitute(template, fullMatch, groups) {
 }
 
 // src/render/widget-iframe.ts
-var iframeNonces = new WeakMap;
+var widgetFrameDestroyers = new WeakMap;
 function buildWidgetIframe(html, scriptName, scriptId, ctx) {
-  const nonce = makeNonce();
-  const srcdoc = injectShimsAndSizeReporter(html, nonce);
-  const iframe = ctx.dom.createElement("iframe", {
-    sandbox: "allow-scripts",
-    srcdoc,
-    "data-vishrun-widget": scriptName,
-    "data-vishrun-script-id": scriptId,
-    "data-vishrun-iframe-nonce": nonce
+  const srcdoc = injectShimsAndSizeReporter(html);
+  const frame = ctx.dom.createSandboxFrame({
+    html: srcdoc,
+    autoResize: false,
+    minHeight: 1,
+    maxHeight: 4000,
+    initialHeight: 1
   });
-  iframeNonces.set(iframe, nonce);
-  iframe.style.width = "100%";
-  iframe.style.height = "1px";
-  iframe.style.border = "none";
-  iframe.style.display = "block";
+  frame.onMessage((payload) => {
+    routeChildMessage(frame, payload, ctx);
+  });
+  const iframe = frame.element;
+  iframe.setAttribute("data-vishrun-widget", scriptName);
+  iframe.setAttribute("data-vishrun-script-id", scriptId);
   iframe.style.margin = "12px 0";
   iframe.style.maxHeight = "none";
   iframe.style.maxWidth = "none";
+  widgetFrameDestroyers.set(iframe, () => frame.destroy());
   return iframe;
+}
+function destroyWidgetIframe(iframe) {
+  const destroy = widgetFrameDestroyers.get(iframe);
+  if (destroy) {
+    widgetFrameDestroyers.delete(iframe);
+    try {
+      destroy();
+    } catch (e) {
+      console.debug("[vishrun] sandbox frame destroy threw:", e);
+    }
+    return;
+  }
+  iframe.remove();
 }
 function containsScriptTag(html) {
   return /<script\b[^>]*>/i.test(html);
@@ -230,19 +244,21 @@ function containsInlineEventHandler(html) {
 function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
-function injectShimsAndSizeReporter(html, nonce) {
-  const head = buildHeadInjection(nonce);
+function injectShimsAndSizeReporter(html) {
+  const head = buildHeadInjection();
   const withHead = injectIntoHead(html, head);
-  const shell = sizeReporterShell(nonce);
+  const shell = sizeReporterShell();
   const closeBody = withHead.lastIndexOf("</body>");
   if (closeBody >= 0) {
     return withHead.slice(0, closeBody) + shell + withHead.slice(closeBody);
   }
   return withHead + shell;
 }
-function buildHeadInjection(nonce) {
-  const nonceLit = JSON.stringify(nonce);
-  return `<meta name="color-scheme" content="dark light">` + `<script>(function(){` + `window.setChatMessages = function(chat_messages){` + `try{window.parent.postMessage({__vishrun:'set-chat-messages',nonce:${nonceLit},payload:chat_messages},'*');}` + `catch(e){}` + `};` + `})();</script>`;
+function buildHeadInjection() {
+  return setChatMessagesShim();
+}
+function setChatMessagesShim() {
+  return `<script>(function(){` + `window.setChatMessages = function(chat_messages){` + `try{` + `if(window.spindleSandbox && typeof window.spindleSandbox.postMessage==='function'){` + `window.spindleSandbox.postMessage({kind:'set-chat-messages',payload:chat_messages});` + `}` + `}catch(e){}` + `};` + `})();</script>`;
 }
 function injectIntoHead(html, blob) {
   const openHead = html.match(/<head\b[^>]*>/i);
@@ -252,39 +268,10 @@ function injectIntoHead(html, blob) {
   }
   return blob + html;
 }
-function sizeReporterShell(nonce) {
-  const nonceLit = JSON.stringify(nonce);
+function sizeReporterShell() {
   return `
-<style>
-  /* Vishrun: normalize iframe body so the user-agent default 8px margin
-     doesn't push content into the iframe edge. The size-reporter uses
-     getBoundingClientRect to measure content so it doesn't depend on
-     body.scrollHeight excluding margin-collapsed offsets. */
-  html, body { margin: 0; padding: 0; }
-  body { box-sizing: border-box; }
-  /* Vishrun: transparent canvas so the host chat theme shows through for
-     widgets that don't paint their own background (e.g. Xiao Gu). Widgets
-     that DO want a background paint it on a container element (e.g.
-     Vavesta's .vav-home-wrap), not on body — those keep their look
-     because the rule below only zeroes html/body. !important defends
-     against UA canvas-default and any host-stylesheet leakage into the
-     iframe document. */
-  html, body { background: transparent !important; }
-  /* Vishrun: declare color-scheme so the UA canvas-default (the color the
-     browser paints under transparent html/body) matches whichever theme
-     the host is in. Sandboxed null-origin iframes (sandbox=allow-scripts
-     without allow-same-origin) do NOT inherit color-scheme from the
-     parent, so the canvas defaults to light then white even when the host
-     is dark. Declaring 'dark light' lets the browser pick whichever the
-     iframe element color-scheme prefers, which propagates from the parent
-     :root color-scheme during initial paint. Companion to the meta tag
-     injected into head below — meta is parsed earlier (pre-CSSOM), this
-     CSS rule wins ties and covers cards without a head. */
-  :root { color-scheme: dark light; }
-</style>
 <script>
 (function() {
-  var NONCE = ${nonceLit};
   function postSize() {
     try {
       if (!document.body) return;
@@ -318,10 +305,11 @@ function sizeReporterShell(nonce) {
       // uses the same trick for the same reason — measuring CSS-occupied
       // space exhaustively isn't tractable. Successive bumps (12 → 32 → 48)
       // after user reports that dense widgets (Vavesta Court Ledger expanded,
-      // Pacifica Pulse) still clipped at the bottom. Visually imperceptible
-      // padding, kills the residual scroll across the cards in scope.
+      // Pacifica Pulse) still clipped at the bottom.
       h += 48;
-      window.parent.postMessage({ __vishrun: 'resize', nonce: NONCE, height: h }, '*');
+      if (window.spindleSandbox && typeof window.spindleSandbox.requestResize === 'function') {
+        window.spindleSandbox.requestResize(h);
+      }
     } catch (e) {}
   }
   function init() {
@@ -344,38 +332,13 @@ function sizeReporterShell(nonce) {
 })();
 </script>`;
 }
-function makeNonce() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
+function routeChildMessage(frame, payload, ctx) {
+  if (!payload || typeof payload !== "object")
+    return;
+  const p = payload;
+  if (p.kind === "set-chat-messages") {
+    handleSetChatMessages(frame.element, p.payload, ctx);
   }
-  return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 11)}`;
-}
-function installIframeBridge(ctx) {
-  const handler = (e) => {
-    const data = e.data;
-    if (!data || typeof data !== "object")
-      return;
-    const d = data;
-    if (typeof d.nonce !== "string" || !d.nonce)
-      return;
-    const iframe = findIframeByNonce(d.nonce);
-    if (!iframe)
-      return;
-    if (d.__vishrun === "resize") {
-      const raw = Number(d.height);
-      if (!Number.isFinite(raw))
-        return;
-      const h = Math.max(40, Math.min(4000, Math.round(raw)));
-      iframe.style.height = `${h}px`;
-      return;
-    }
-    if (d.__vishrun === "set-chat-messages") {
-      handleSetChatMessages(iframe, d.payload, ctx);
-      return;
-    }
-  };
-  window.addEventListener("message", handler);
-  return () => window.removeEventListener("message", handler);
 }
 async function handleSetChatMessages(iframe, payload, ctx) {
   if (!Array.isArray(payload)) {
@@ -434,18 +397,6 @@ async function handleSetChatMessages(iframe, payload, ctx) {
       continue;
     }
   }
-}
-function findIframeByNonce(nonce) {
-  const escaped = cssEscape(nonce);
-  const iframe = document.querySelector(`iframe[data-vishrun-iframe-nonce="${escaped}"]`);
-  if (!iframe)
-    return null;
-  if (iframeNonces.get(iframe) !== nonce)
-    return null;
-  return iframe;
-}
-function cssEscape(s) {
-  return typeof CSS !== "undefined" && typeof CSS.escape === "function" ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
 }
 
 // src/hooks/tag-interceptor.ts
@@ -576,12 +527,16 @@ function renderPairedTagCaptures(root, messageId, ctx) {
     const fmHash = el.getAttribute("data-vishrun-paired-fullmatch");
     const stillValid = captures.some((c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash);
     if (!stillValid) {
-      el.remove();
+      if (el.tagName === "IFRAME") {
+        destroyWidgetIframe(el);
+      } else {
+        el.remove();
+      }
       removed++;
     }
   });
   for (const cap of captures) {
-    const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape2(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape2(hashKey(cap.fullMatch))}"]`;
+    const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
     if (target.querySelector(sel))
       continue;
     cap.findRe.lastIndex = 0;
@@ -643,7 +598,7 @@ function collectTextNodes(root) {
   }
   return out;
 }
-function cssEscape2(s) {
+function cssEscape(s) {
   return typeof CSS !== "undefined" && typeof CSS.escape === "function" ? CSS.escape(s) : s.replace(/["\\]/g, "\\$&");
 }
 function hashKey(s) {
@@ -829,7 +784,6 @@ function buildMessageSelector(messageId) {
 // src/frontend.ts
 function setup(ctx) {
   const hooks = installMessageHooks(ctx);
-  const teardownIframeBridge = installIframeBridge(ctx);
   let inflightCharacterId = null;
   let lastLoadedCharacterId = null;
   async function loadFor(characterId) {
@@ -886,7 +840,6 @@ function setup(ctx) {
     unsubChatChanged();
     unsubSettingsUpdated();
     hooks.dispose();
-    teardownIframeBridge();
     ctx.dom.cleanup();
     clearActiveCard();
   };

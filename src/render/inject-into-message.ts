@@ -1,7 +1,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
 import { substitute } from '../core/substitute';
-import { buildWidgetIframe, widgetNeedsIsolation } from './widget-iframe';
+import { buildWidgetIframe, destroyWidgetIframe, widgetNeedsIsolation } from './widget-iframe';
 import { getCapturesForMessage } from '../hooks/tag-interceptor';
 
 /**
@@ -127,7 +127,14 @@ function renderPairedTagCaptures(
       (c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash,
     );
     if (!stillValid) {
-      el.remove();
+      // destroyWidgetIframe releases the host's sandboxFrames record AND
+      // removes the element. Plain el.remove() would leak the record
+      // until extension teardown.
+      if (el.tagName === 'IFRAME') {
+        destroyWidgetIframe(el as HTMLIFrameElement);
+      } else {
+        el.remove();
+      }
       removed++;
     }
   });
