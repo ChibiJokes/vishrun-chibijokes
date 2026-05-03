@@ -4,7 +4,7 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "build": "bun build src/frontend.ts --target browser --outfile dist/frontend.js"
+    "build": "bun build src/frontend.ts --target browser --outfile dist/frontend.js && bun build src/backend.ts --target bun --outfile dist/backend.js"
   },
   "devDependencies": {
     "typescript": "^5.4.0"

@@ -6,7 +6,8 @@
   "github": "https://github.com/Vishousdev/vishrun",
   "homepage": "https://github.com/Vishousdev/vishrun",
   "description": "Renders SillyTavern character-card regex_scripts widgets inside Lumiverse (MVP).",
-  "permissions": [],
+  "permissions": ["cors_proxy"],
   "entry_frontend": "dist/frontend.js",
+  "entry_backend": "dist/backend.js",
   "minimum_lumiverse_version": "0.1.0"
 }

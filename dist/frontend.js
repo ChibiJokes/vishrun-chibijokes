@@ -245,8 +245,9 @@ function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
 function injectShimsAndSizeReporter(html) {
+  const stripped = stripExternalImageSrc(html);
   const head = buildHeadInjection();
-  const withHead = injectIntoHead(html, head);
+  const withHead = injectIntoHead(stripped, head);
   const shell = sizeReporterShell();
   const closeBody = withHead.lastIndexOf("</body>");
   if (closeBody >= 0) {
@@ -254,11 +255,218 @@ function injectShimsAndSizeReporter(html) {
   }
   return withHead + shell;
 }
+function stripExternalImageSrc(html) {
+  return html.replace(/<img\b[^>]*>/gi, (tag) => tag.replace(/(\s)src\s*=\s*(['"])(https?:\/\/[^'"]+)\2/i, "$1data-vishrun-extimg=$2$3$2"));
+}
 function buildHeadInjection() {
-  return setChatMessagesShim();
+  return setChatMessagesShim() + externalImageProxyHelper();
 }
 function setChatMessagesShim() {
   return `<script>(function(){` + `window.setChatMessages = function(chat_messages){` + `try{` + `if(window.spindleSandbox && typeof window.spindleSandbox.postMessage==='function'){` + `window.spindleSandbox.postMessage({kind:'set-chat-messages',payload:chat_messages});` + `}` + `}catch(e){}` + `};` + `})();</script>`;
+}
+function externalImageProxyHelper() {
+  return `<script>
+(function(){
+  var KEY = 'data-vishrun-extimg';
+
+  // Mirror of widget-iframe.ts:stripExternalImageSrc, applied here to
+  // any runtime-passed HTML so the parser never sees a raw https src.
+  // Short-circuits when the input has no "<img" substring — non-image
+  // innerHTML assignments pay only an indexOf, no regex.
+  function rewriteImgs(html) {
+    if (typeof html !== 'string' || html.indexOf('<img') === -1) return html;
+    return html.replace(/<img\\b[^>]*>/gi, function(tag) {
+      return tag.replace(
+        /(\\s)src\\s*=\\s*(['"])(https?:\\/\\/[^'"]+)\\2/i,
+        '$1data-vishrun-extimg=$2$3$2'
+      );
+    });
+  }
+
+  // Patch HTMLImageElement.prototype.src setter — runtime-set https URLs
+  // (img.src = "https://…") get diverted into the data attribute BEFORE
+  // the browser starts fetching. Static src="https://..." has already
+  // been stripped at host injection time; this catches the dynamic case.
+  try {
+    var desc = Object.getOwnPropertyDescriptor(HTMLImageElement.prototype, 'src');
+    if (desc && desc.set && desc.get) {
+      Object.defineProperty(HTMLImageElement.prototype, 'src', {
+        configurable: true,
+        enumerable: desc.enumerable,
+        get: desc.get,
+        set: function(val) {
+          if (typeof val === 'string' && /^https?:\\/\\//i.test(val)) {
+            this.setAttribute(KEY, val);
+            return;
+          }
+          return desc.set.call(this, val);
+        },
+      });
+    }
+  } catch (e) { /* ignore — fallback path is the post-load scan */ }
+
+  // Patch Element.prototype.innerHTML setter — \`el.innerHTML = html\`
+  // routes through the HTML parser which fetches each <img src="…">
+  // synchronously. Pre-rewriting before the setter delegates means the
+  // parser never sees a raw https src.
+  try {
+    var innerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML');
+    if (innerDesc && innerDesc.set && innerDesc.get) {
+      Object.defineProperty(Element.prototype, 'innerHTML', {
+        configurable: true,
+        enumerable: innerDesc.enumerable,
+        get: innerDesc.get,
+        set: function(val) {
+          return innerDesc.set.call(this, rewriteImgs(val));
+        },
+      });
+    }
+  } catch (e) {}
+
+  // Patch Element.prototype.outerHTML setter — same reasoning as
+  // innerHTML; less common but cards do use it.
+  try {
+    var outerDesc = Object.getOwnPropertyDescriptor(Element.prototype, 'outerHTML');
+    if (outerDesc && outerDesc.set && outerDesc.get) {
+      Object.defineProperty(Element.prototype, 'outerHTML', {
+        configurable: true,
+        enumerable: outerDesc.enumerable,
+        get: outerDesc.get,
+        set: function(val) {
+          return outerDesc.set.call(this, rewriteImgs(val));
+        },
+      });
+    }
+  } catch (e) {}
+
+  // Patch Element.prototype.insertAdjacentHTML — same story; the parser
+  // is invoked on the second argument.
+  try {
+    var origIAH = Element.prototype.insertAdjacentHTML;
+    if (typeof origIAH === 'function') {
+      Element.prototype.insertAdjacentHTML = function(position, html) {
+        return origIAH.call(this, position, rewriteImgs(html));
+      };
+    }
+  } catch (e) {}
+
+  // Patch Element.prototype.setAttribute — \`img.setAttribute('src', url)\`
+  // doesn't go through HTMLImageElement.prototype.src's IDL setter, so
+  // the existing patch above misses it. Catch the IMG/src/https case and
+  // redirect to the data attribute. All other setAttribute calls fall
+  // through to the original — the wrapper short-circuits in one
+  // string-compare for the overwhelming majority of calls.
+  try {
+    var origSetAttr = Element.prototype.setAttribute;
+    if (typeof origSetAttr === 'function') {
+      Element.prototype.setAttribute = function(name, value) {
+        if (
+          this.tagName === 'IMG' &&
+          typeof name === 'string' &&
+          name.toLowerCase() === 'src' &&
+          typeof value === 'string' &&
+          /^https?:\\/\\//i.test(value)
+        ) {
+          return origSetAttr.call(this, KEY, value);
+        }
+        return origSetAttr.call(this, name, value);
+      };
+    }
+  } catch (e) {}
+
+  function setBlobSrc(img, blobUrl) {
+    // Bypass the patched setter via the native descriptor — assigning
+    // \`img.src = blobUrl\` would route through our wrapper again. Using
+    // setAttribute avoids the IDL setter entirely.
+    img.removeAttribute(KEY);
+    img.setAttribute('src', blobUrl);
+  }
+
+  function processImg(img) {
+    var url = img.getAttribute(KEY);
+    if (!url) return;
+    if (!window.spindleSandbox || typeof window.spindleSandbox.corsProxy !== 'function') {
+      console.warn('[vishrun] corsProxy unavailable, leaving image unfetched:', url);
+      return;
+    }
+    // Mark in-flight so a MutationObserver re-fire doesn't double-fetch.
+    img.removeAttribute(KEY);
+    img.setAttribute('data-vishrun-extimg-loading', '1');
+    window.spindleSandbox.corsProxy(url, { responseType: 'arraybuffer' }).then(
+      function(res) {
+        try {
+          // loader.ts:196-202 already converted base64 → Uint8Array on
+          // the host side. Treat the body as bytes; constructing a
+          // Blob from a Uint8Array preserves binary fidelity.
+          if (!res || !res.body) {
+            console.warn('[vishrun] corsProxy returned no body for', url);
+            return;
+          }
+          var ct = '';
+          if (res.headers) {
+            ct = res.headers['content-type'] || res.headers['Content-Type'] || '';
+          }
+          ct = String(ct).split(';')[0].trim() || 'application/octet-stream';
+          var blob = new Blob([res.body], { type: ct });
+          var blobUrl = URL.createObjectURL(blob);
+          setBlobSrc(img, blobUrl);
+        } catch (e) {
+          console.warn('[vishrun] corsProxy decode failed for', url, e);
+        } finally {
+          img.removeAttribute('data-vishrun-extimg-loading');
+        }
+      },
+      function(err) {
+        img.removeAttribute('data-vishrun-extimg-loading');
+        console.warn('[vishrun] corsProxy fetch failed for', url, err);
+      }
+    );
+  }
+
+  function scan(root) {
+    if (!root || typeof root.querySelectorAll !== 'function') return;
+    var imgs = root.querySelectorAll('img[' + KEY + ']');
+    for (var i = 0; i < imgs.length; i++) processImg(imgs[i]);
+  }
+
+  function init() {
+    scan(document);
+    try {
+      var mo = new MutationObserver(function(mutations) {
+        for (var i = 0; i < mutations.length; i++) {
+          var mut = mutations[i];
+          if (mut.type === 'attributes' && mut.attributeName === KEY) {
+            if (mut.target && mut.target.nodeType === 1 && mut.target.tagName === 'IMG') {
+              processImg(mut.target);
+            }
+            continue;
+          }
+          var added = mut.addedNodes;
+          if (!added) continue;
+          for (var j = 0; j < added.length; j++) {
+            var n = added[j];
+            if (n.nodeType !== 1) continue;
+            if (n.tagName === 'IMG' && n.hasAttribute(KEY)) processImg(n);
+            else scan(n);
+          }
+        }
+      });
+      mo.observe(document.documentElement, {
+        childList: true,
+        subtree: true,
+        attributes: true,
+        attributeFilter: [KEY],
+      });
+    } catch (e) { /* ignore */ }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();
+</script>`;
 }
 function injectIntoHead(html, blob) {
   const openHead = html.match(/<head\b[^>]*>/i);
