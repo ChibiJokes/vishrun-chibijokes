@@ -201,7 +201,64 @@ function substitute(template, fullMatch, groups) {
 
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
-function buildWidgetIframe(html, scriptName, scriptId, ctx) {
+var iframeRegistry = new Map;
+var REGISTRY_SEP = " ";
+function registryKey(messageId, scriptId) {
+  return messageId + REGISTRY_SEP + scriptId;
+}
+function registerWidget(messageId, scriptId, iframe) {
+  const k = registryKey(messageId, scriptId);
+  let set = iframeRegistry.get(k);
+  if (!set) {
+    set = new Set;
+    iframeRegistry.set(k, set);
+  }
+  set.add(iframe);
+}
+function unregisterWidget(iframe) {
+  const messageId = iframe.getAttribute("data-vishrun-message-id");
+  const scriptId = iframe.getAttribute("data-vishrun-script-id");
+  if (!messageId || !scriptId)
+    return;
+  const k = registryKey(messageId, scriptId);
+  const set = iframeRegistry.get(k);
+  if (!set)
+    return;
+  set.delete(iframe);
+  if (set.size === 0)
+    iframeRegistry.delete(k);
+}
+function cleanupOrphansForMessage(messageId, target) {
+  const prefix = messageId + REGISTRY_SEP;
+  const matchingKeys = [];
+  for (const k of iframeRegistry.keys()) {
+    if (k.startsWith(prefix))
+      matchingKeys.push(k);
+  }
+  for (const k of matchingKeys) {
+    const set = iframeRegistry.get(k);
+    if (!set)
+      continue;
+    for (const iframe of [...set]) {
+      if (target && target.contains(iframe))
+        continue;
+      destroyWidgetIframe(iframe);
+    }
+  }
+}
+function hasRegisteredWidgetsFor(messageId, scriptId) {
+  const set = iframeRegistry.get(registryKey(messageId, scriptId));
+  return !!set && set.size > 0;
+}
+function destroyRegisteredWidgetsFor(messageId, scriptId) {
+  const set = iframeRegistry.get(registryKey(messageId, scriptId));
+  if (!set)
+    return;
+  for (const iframe of [...set]) {
+    destroyWidgetIframe(iframe);
+  }
+}
+function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   const srcdoc = injectShimsAndSizeReporter(html);
   const frame = ctx.dom.createSandboxFrame({
     html: srcdoc,
@@ -216,13 +273,16 @@ function buildWidgetIframe(html, scriptName, scriptId, ctx) {
   const iframe = frame.element;
   iframe.setAttribute("data-vishrun-widget", scriptName);
   iframe.setAttribute("data-vishrun-script-id", scriptId);
+  iframe.setAttribute("data-vishrun-message-id", messageId);
   iframe.style.margin = "12px 0";
   iframe.style.maxHeight = "none";
   iframe.style.maxWidth = "none";
   widgetFrameDestroyers.set(iframe, () => frame.destroy());
+  registerWidget(messageId, scriptId, iframe);
   return iframe;
 }
 function destroyWidgetIframe(iframe) {
+  unregisterWidget(iframe);
   const destroy = widgetFrameDestroyers.get(iframe);
   if (destroy) {
     widgetFrameDestroyers.delete(iframe);
@@ -650,6 +710,50 @@ function teardownTagInterceptors() {
   activeUnsubs = [];
   activeTagNames = new Set;
 }
+function rebuildCapturesFromContent(messageId, content, compiled) {
+  const newList = [];
+  for (const script of compiled) {
+    if (script.kind !== "pairedTag")
+      continue;
+    script.findRe.lastIndex = 0;
+    let lastMatch = null;
+    let m;
+    while ((m = script.findRe.exec(content)) !== null) {
+      lastMatch = m;
+      if (m[0].length === 0)
+        script.findRe.lastIndex++;
+    }
+    if (!lastMatch)
+      continue;
+    newList.push({
+      scriptId: script.id,
+      scriptName: script.scriptName,
+      replaceString: script.replaceString,
+      findRe: script.findRe,
+      fullMatch: lastMatch[0],
+      attrs: {}
+    });
+  }
+  const existing = capturesByMessage.get(messageId) || [];
+  let changed = existing.length !== newList.length;
+  if (!changed) {
+    for (const next of newList) {
+      const prev = existing.find((c) => c.scriptId === next.scriptId);
+      if (!prev || prev.fullMatch !== next.fullMatch) {
+        changed = true;
+        break;
+      }
+    }
+  }
+  if (changed) {
+    if (newList.length === 0) {
+      capturesByMessage.delete(messageId);
+    } else {
+      capturesByMessage.set(messageId, newList);
+    }
+  }
+  return changed;
+}
 function onCapture(payload, script) {
   if (!payload.messageId)
     return;
@@ -672,21 +776,38 @@ function extractTagName(reSource) {
 
 // src/render/inject-into-message.ts
 function processNode(root, scripts, ctx) {
+  const messageId = root.getAttribute("data-message-id") || undefined;
+  if (!messageId) {
+    return 0;
+  }
+  const target = findContentRoot(root);
+  cleanupOrphansForMessage(messageId, target);
   let total = 0;
   for (const script of scripts) {
     if (script.kind !== "placeholder")
       continue;
-    total += replacePlaceholderMatches(root, script, ctx);
+    total += replacePlaceholderMatches(root, script, messageId, ctx);
   }
-  const messageId = root.getAttribute("data-message-id") || undefined;
-  if (messageId) {
-    total += renderPairedTagCaptures(root, messageId, ctx);
-  }
+  total += renderPairedTagCaptures(root, messageId, ctx);
   return total;
 }
-function replacePlaceholderMatches(root, script, ctx) {
+function replacePlaceholderMatches(root, script, messageId, ctx) {
   const textNodes = collectTextNodes(root);
   let count = 0;
+  let hasFreshMatch = false;
+  for (const tn of textNodes) {
+    const text = tn.nodeValue ?? "";
+    if (!text)
+      continue;
+    script.findRe.lastIndex = 0;
+    if (script.findRe.test(text)) {
+      hasFreshMatch = true;
+      break;
+    }
+  }
+  if (hasFreshMatch && hasRegisteredWidgetsFor(messageId, script.id)) {
+    destroyRegisteredWidgetsFor(messageId, script.id);
+  }
   for (const tn of textNodes) {
     const text = tn.nodeValue ?? "";
     if (!text)
@@ -712,7 +833,7 @@ function replacePlaceholderMatches(root, script, ctx) {
       }
       const groups = match.slice(1).map((g) => g ?? "");
       const html = substitute(script.replaceString, match[0], groups);
-      const widget = buildWidget(html, script.scriptName, script.id, ctx);
+      const widget = buildWidget(html, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -764,7 +885,7 @@ function renderPairedTagCaptures(root, messageId, ctx) {
     }
     const groups = m.slice(1).map((g) => g ?? "");
     const html = substitute(cap.replaceString, m[0], groups);
-    const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, ctx);
+    const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
     target.appendChild(iframe);
     added++;
@@ -775,9 +896,9 @@ function findContentRoot(messageNode) {
   const inner = messageNode.querySelector('[data-component="MessageContent"]');
   return inner ?? messageNode;
 }
-function buildWidget(html, scriptName, scriptId, ctx) {
+function buildWidget(html, scriptName, scriptId, messageId, ctx) {
   if (widgetNeedsIsolation(html)) {
-    return buildWidgetIframe(html, scriptName, scriptId, ctx);
+    return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
   }
   const wrapper = ctx.dom.createElement("div", {
     "data-vishrun-widget": scriptName,
@@ -840,7 +961,7 @@ function installMessageHooks(ctx) {
       return true;
     return active === chatId;
   }
-  function processMessageById(messageId, retriesLeft) {
+  function processMessageById(messageId, retriesLeft = MAX_RAF_RETRIES) {
     const compiled = compiledForActiveCard();
     if (!compiled)
       return;
@@ -976,6 +1097,8 @@ function installMessageHooks(ctx) {
   });
   return {
     rescanAll,
+    processMessageById,
+    compiledForActiveCard,
     dispose: () => {
       detachObserver();
       teardownTagInterceptors();
@@ -1034,6 +1157,24 @@ function setup(ctx) {
     const p = payload || {};
     loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
   });
+  function handleMessageMutation(payload) {
+    const p = payload || {};
+    const msg = p.message;
+    if (!msg || typeof msg.id !== "string" || typeof msg.content !== "string")
+      return;
+    const active2 = ctx.getActiveChat();
+    if (active2.chatId && p.chatId && active2.chatId !== p.chatId)
+      return;
+    const compiled = hooks.compiledForActiveCard();
+    if (!compiled)
+      return;
+    const changed = rebuildCapturesFromContent(msg.id, msg.content, compiled);
+    if (changed) {
+      hooks.processMessageById(msg.id);
+    }
+  }
+  const unsubMessageSwiped = ctx.events.on("MESSAGE_SWIPED", handleMessageMutation);
+  const unsubMessageEdited = ctx.events.on("MESSAGE_EDITED", handleMessageMutation);
   const unsubSettingsUpdated = ctx.events.on("SETTINGS_UPDATED", (payload) => {
     const p = payload || {};
     if (p.key !== "activeChatId" && p.key !== "activeCharacterId")
@@ -1047,6 +1188,8 @@ function setup(ctx) {
   return () => {
     unsubChatChanged();
     unsubSettingsUpdated();
+    unsubMessageSwiped();
+    unsubMessageEdited();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

@@ -130,6 +130,83 @@ export function teardownTagInterceptors(): void {
   activeTagNames = new Set();
 }
 
+/**
+ * Recompute capturesByMessage[messageId] from a raw message content
+ * string, without going through Lumiverse's tag interceptor pipeline.
+ *
+ * Workaround for upstream issue: the host's `delivered` Set in
+ * `Lumiverse/frontend/src/lib/spindle/message-interceptors.ts:21` dedupes
+ * tag intercept dispatches by `(extensionId, messageId, isStreaming,
+ * tagName, fullMatch)` and never clears. Swiping back to a previously-
+ * seen swipe (or undoing an edit) doesn't re-fire the interceptor, so
+ * onCapture never updates capturesByMessage and the widget keeps showing
+ * stale content from the last swipe whose handler did fire.
+ *
+ * Frontend's MESSAGE_SWIPED / MESSAGE_EDITED handlers call this with the
+ * fresh content from the WS event payload, bypassing the host pipeline
+ * entirely. For each registered paired-tag script: run findRe against
+ * the raw content (last match wins, mirroring onCapture's "latest
+ * fullMatch is canonical" rule). Scripts that don't match drop their
+ * capture for this messageId — that's how widgets disappear when a
+ * swipe doesn't carry the tag.
+ *
+ * Returns true if capturesByMessage[messageId] changed, signalling the
+ * caller to trigger processMessageById so phase 1 / phase 2 run with
+ * the fresh captures.
+ */
+export function rebuildCapturesFromContent(
+  messageId: string,
+  content: string,
+  compiled: CompiledScript[],
+): boolean {
+  const newList: CapturedTag[] = [];
+
+  for (const script of compiled) {
+    if (script.kind !== 'pairedTag') continue;
+    script.findRe.lastIndex = 0;
+    let lastMatch: RegExpExecArray | null = null;
+    let m: RegExpExecArray | null;
+    while ((m = script.findRe.exec(content)) !== null) {
+      lastMatch = m;
+      if (m[0].length === 0) script.findRe.lastIndex++;
+    }
+    if (!lastMatch) continue;
+    newList.push({
+      scriptId: script.id,
+      scriptName: script.scriptName,
+      replaceString: script.replaceString,
+      findRe: script.findRe,
+      fullMatch: lastMatch[0],
+      // attrs aren't needed downstream (renderPairedTagCaptures re-runs
+      // findRe on fullMatch to recover capture groups), but the field
+      // exists on CapturedTag — populate empty rather than parse the
+      // tag's attrs from raw HTML.
+      attrs: {},
+    });
+  }
+
+  const existing = capturesByMessage.get(messageId) || [];
+  let changed = existing.length !== newList.length;
+  if (!changed) {
+    for (const next of newList) {
+      const prev = existing.find((c) => c.scriptId === next.scriptId);
+      if (!prev || prev.fullMatch !== next.fullMatch) {
+        changed = true;
+        break;
+      }
+    }
+  }
+
+  if (changed) {
+    if (newList.length === 0) {
+      capturesByMessage.delete(messageId);
+    } else {
+      capturesByMessage.set(messageId, newList);
+    }
+  }
+  return changed;
+}
+
 function onCapture(payload: InterceptorPayload, script: CompiledScript): void {
   // No streaming guard: Lumiverse's `delivered` Set dedupes by fullMatch,
   // and a paired tag's regex doesn't match until the close tag streams in

@@ -11,6 +11,119 @@ import { getActiveCard } from '../state/active-card';
 const widgetFrameDestroyers = new WeakMap<HTMLIFrameElement, () => void>();
 
 /**
+ * Global registry of every vishrun widget iframe currently alive, keyed
+ * by (messageId, scriptId). Lets cleanup pre-passes find iframes that
+ * React detached or moved out of the expected MessageContent — the
+ * per-message phase-1 query (which scopes to MessageContent) can't see
+ * those, and they showed up as "huérfano fuera del bubble" duplicates
+ * after swipe.
+ *
+ * Population: every successful buildWidgetIframe registers.
+ * Eviction:   destroyWidgetIframe unregisters.
+ *
+ * Key uses NUL as separator since UUIDs and script ids never contain it.
+ */
+const iframeRegistry = new Map<string, Set<HTMLIFrameElement>>();
+const REGISTRY_SEP = ' ';
+
+function registryKey(messageId: string, scriptId: string): string {
+  return messageId + REGISTRY_SEP + scriptId;
+}
+
+function registerWidget(
+  messageId: string,
+  scriptId: string,
+  iframe: HTMLIFrameElement,
+): void {
+  const k = registryKey(messageId, scriptId);
+  let set = iframeRegistry.get(k);
+  if (!set) {
+    set = new Set();
+    iframeRegistry.set(k, set);
+  }
+  set.add(iframe);
+}
+
+function unregisterWidget(iframe: HTMLIFrameElement): void {
+  const messageId = iframe.getAttribute('data-vishrun-message-id');
+  const scriptId = iframe.getAttribute('data-vishrun-script-id');
+  if (!messageId || !scriptId) return;
+  const k = registryKey(messageId, scriptId);
+  const set = iframeRegistry.get(k);
+  if (!set) return;
+  set.delete(iframe);
+  if (set.size === 0) iframeRegistry.delete(k);
+}
+
+/**
+ * Destroy every registered iframe under (messageId, *) that isn't
+ * inside `target`. Called at the top of processNode before the per-
+ * pipeline phase 1 / phase 2 logic — this is the global counterpart
+ * to those scoped cleanups, catching iframes that React orphaned
+ * outside MessageContent during a subtree rebuild (swipe, edit, regen).
+ *
+ * `target` is `findContentRoot(messageNode)` — the MessageContent of
+ * the message currently being scanned. If `target` is null (caller has
+ * no anchor), every registered iframe under this messageId is treated
+ * as orphaned.
+ *
+ * Walks all keys with a `messageId ` prefix. The registry is
+ * bounded by (messages × scripts in scope), so the linear scan stays
+ * tiny (single-digit count for the cards in scope today).
+ */
+export function cleanupOrphansForMessage(
+  messageId: string,
+  target: HTMLElement | null,
+): void {
+  const prefix = messageId + REGISTRY_SEP;
+  const matchingKeys: string[] = [];
+  for (const k of iframeRegistry.keys()) {
+    if (k.startsWith(prefix)) matchingKeys.push(k);
+  }
+  for (const k of matchingKeys) {
+    const set = iframeRegistry.get(k);
+    if (!set) continue;
+    for (const iframe of [...set]) {
+      if (target && target.contains(iframe)) continue;
+      destroyWidgetIframe(iframe);
+    }
+  }
+}
+
+/**
+ * True if any iframe is currently registered under (messageId, scriptId).
+ * Used by the placeholder pipeline to gate phase-1 destruction on the
+ * existence of a duplication risk — destroying registered widgets
+ * unconditionally on every observer fire would churn during streaming.
+ */
+export function hasRegisteredWidgetsFor(
+  messageId: string,
+  scriptId: string,
+): boolean {
+  const set = iframeRegistry.get(registryKey(messageId, scriptId));
+  return !!set && set.size > 0;
+}
+
+/**
+ * Destroy every registered iframe under (messageId, scriptId), regardless
+ * of DOM position. The placeholder pipeline calls this in phase 1 when
+ * it detects a fresh placeholder match alongside existing registered
+ * widgets — that combination only happens on a React subtree rebuild
+ * that re-emitted the placeholder text, so the existing widgets are
+ * stale and phase 2 will recreate them from the fresh matches.
+ */
+export function destroyRegisteredWidgetsFor(
+  messageId: string,
+  scriptId: string,
+): void {
+  const set = iframeRegistry.get(registryKey(messageId, scriptId));
+  if (!set) return;
+  for (const iframe of [...set]) {
+    destroyWidgetIframe(iframe);
+  }
+}
+
+/**
  * Build a sandboxed iframe widget from a fence-stripped, substituted HTML
  * string, using ctx.dom.createSandboxFrame (the only sanctioned path for
  * scriptable iframes since Lumiverse staging d157784).
@@ -40,6 +153,7 @@ export function buildWidgetIframe(
   html: string,
   scriptName: string,
   scriptId: string,
+  messageId: string,
   ctx: SpindleFrontendContext,
 ): HTMLIFrameElement {
   const srcdoc = injectShimsAndSizeReporter(html);
@@ -61,6 +175,7 @@ export function buildWidgetIframe(
   const iframe = frame.element;
   iframe.setAttribute('data-vishrun-widget', scriptName);
   iframe.setAttribute('data-vishrun-script-id', scriptId);
+  iframe.setAttribute('data-vishrun-message-id', messageId);
   // 12px vertical margin matches the no-isolation div path in
   // inject-into-message.ts:209. Keeps spacing consistent across both
   // paths regardless of which one each card lands on.
@@ -75,6 +190,7 @@ export function buildWidgetIframe(
   iframe.style.maxWidth = 'none';
 
   widgetFrameDestroyers.set(iframe, () => frame.destroy());
+  registerWidget(messageId, scriptId, iframe);
   return iframe;
 }
 
@@ -90,6 +206,7 @@ export function buildWidgetIframe(
  * extension teardown clears via ctx.dom.cleanup, which is acceptable).
  */
 export function destroyWidgetIframe(iframe: HTMLIFrameElement): void {
+  unregisterWidget(iframe);
   const destroy = widgetFrameDestroyers.get(iframe);
   if (destroy) {
     widgetFrameDestroyers.delete(iframe);

@@ -1,7 +1,14 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
 import { substitute } from '../core/substitute';
-import { buildWidgetIframe, destroyWidgetIframe, widgetNeedsIsolation } from './widget-iframe';
+import {
+  buildWidgetIframe,
+  cleanupOrphansForMessage,
+  destroyRegisteredWidgetsFor,
+  destroyWidgetIframe,
+  hasRegisteredWidgetsFor,
+  widgetNeedsIsolation,
+} from './widget-iframe';
 import { getCapturesForMessage } from '../hooks/tag-interceptor';
 
 /**
@@ -30,6 +37,22 @@ export function processNode(
   scripts: CompiledScript[],
   ctx: SpindleFrontendContext,
 ): number {
+  const messageId = root.getAttribute('data-message-id') || undefined;
+  if (!messageId) {
+    // Without a stable messageId, the global widget registry can't track
+    // ownership and the pre-pipeline orphan cleanup would have nothing
+    // to scope against. Silently skip — scanAllNow only ever calls
+    // processNode for `[data-message-id]` nodes anyway.
+    return 0;
+  }
+
+  // Global pre-pipeline cleanup: destroy any registered iframes for this
+  // messageId that aren't currently inside the expected MessageContent.
+  // Catches React subtree rebuilds (swipe / edit / regen) that detached
+  // an iframe but didn't unmount the host's sandboxFrames record.
+  const target = findContentRoot(root);
+  cleanupOrphansForMessage(messageId, target);
+
   let total = 0;
   for (const script of scripts) {
     // Only placeholder triggers run through the post-DOMPurify text scan.
@@ -37,12 +60,9 @@ export function processNode(
     // and surface here as captures via getCapturesForMessage. unknown
     // scripts are skipped (logged once at compile time).
     if (script.kind !== 'placeholder') continue;
-    total += replacePlaceholderMatches(root, script, ctx);
+    total += replacePlaceholderMatches(root, script, messageId, ctx);
   }
-  const messageId = root.getAttribute('data-message-id') || undefined;
-  if (messageId) {
-    total += renderPairedTagCaptures(root, messageId, ctx);
-  }
+  total += renderPairedTagCaptures(root, messageId, ctx);
   return total;
 }
 
@@ -51,10 +71,38 @@ export function processNode(
 function replacePlaceholderMatches(
   root: HTMLElement,
   script: CompiledScript,
+  messageId: string,
   ctx: SpindleFrontendContext,
 ): number {
   const textNodes = collectTextNodes(root);
   let count = 0;
+
+  // Phase 1 (placeholder): if there's at least one fresh placeholder
+  // match in the current text AND we have iframes already registered
+  // for (messageId, scriptId), the pair is a duplication smell. The
+  // existing registered widgets came from a prior render, and the
+  // fresh-text scan that follows would create new widgets next to them
+  // — that's exactly the swipe-duplication bug.
+  //
+  // Two-stage check (not unconditional destroy) keeps streaming cheap:
+  // every observer fire during streaming runs collectTextNodes excluding
+  // text inside [data-vishrun-widget], so an already-mounted widget's
+  // placeholder text isn't re-detected — no fresh match, no destroy,
+  // no churn. The destroy path only triggers when React actually re-
+  // emits the placeholder text, which is the swipe / edit case.
+  let hasFreshMatch = false;
+  for (const tn of textNodes) {
+    const text = tn.nodeValue ?? '';
+    if (!text) continue;
+    script.findRe.lastIndex = 0;
+    if (script.findRe.test(text)) {
+      hasFreshMatch = true;
+      break;
+    }
+  }
+  if (hasFreshMatch && hasRegisteredWidgetsFor(messageId, script.id)) {
+    destroyRegisteredWidgetsFor(messageId, script.id);
+  }
 
   for (const tn of textNodes) {
     const text = tn.nodeValue ?? '';
@@ -83,7 +131,7 @@ function replacePlaceholderMatches(
       // substitute() handles the no-groups case fine.
       const groups = match.slice(1).map((g) => g ?? '');
       const html = substitute(script.replaceString, match[0], groups);
-      const widget = buildWidget(html, script.scriptName, script.id, ctx);
+      const widget = buildWidget(html, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -179,7 +227,7 @@ function renderPairedTagCaptures(
     // Paired-tag widgets always go through the iframe path. Vavesta
     // Court Ledger contains <script>, and even for hypothetical
     // script-free paired widgets the isolation is cheap insurance.
-    const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, ctx);
+    const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     target.appendChild(iframe);
     added++;
@@ -201,10 +249,11 @@ function buildWidget(
   html: string,
   scriptName: string,
   scriptId: string,
+  messageId: string,
   ctx: SpindleFrontendContext,
 ): HTMLElement {
   if (widgetNeedsIsolation(html)) {
-    return buildWidgetIframe(html, scriptName, scriptId, ctx);
+    return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
   }
   const wrapper = ctx.dom.createElement('div', {
     'data-vishrun-widget': scriptName,

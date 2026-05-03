@@ -23,6 +23,20 @@ export interface MessageHooks {
    * card-load outcome (load with scripts, load without scripts, clear).
    */
   rescanAll: () => void;
+  /**
+   * Run processNode against the message DOM with the given id, retrying
+   * across rAFs if the message hasn't mounted yet. Used by the
+   * MESSAGE_SWIPED / MESSAGE_EDITED handlers in frontend.ts to force a
+   * targeted re-render after rebuilding captures from the event payload.
+   */
+  processMessageById: (messageId: string, retriesLeft?: number) => void;
+  /**
+   * Compile + return the active card's scripts, or null if there's no
+   * active card or it has no scripts. Exposed so the
+   * MESSAGE_SWIPED/MESSAGE_EDITED handlers can rebuild captures from
+   * the event payload's raw content without re-implementing the gating.
+   */
+  compiledForActiveCard: () => CompiledScript[] | null;
   dispose: () => void;
 }
 
@@ -68,7 +82,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     return active === chatId;
   }
 
-  function processMessageById(messageId: string, retriesLeft: number): void {
+  function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
     const compiled = compiledForActiveCard();
     if (!compiled) return;
     const sel = buildMessageSelector(messageId);
@@ -227,6 +241,8 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
 
   return {
     rescanAll,
+    processMessageById,
+    compiledForActiveCard,
     dispose: () => {
       detachObserver();
       teardownTagInterceptors();

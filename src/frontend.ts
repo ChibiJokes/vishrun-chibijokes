@@ -2,10 +2,18 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { fetchCharacter, extractRegexScripts } from './lumiverse/fetch-character';
 import { setActiveCard, clearActiveCard, getActiveCard } from './state/active-card';
 import { installMessageHooks } from './hooks/message-rendered';
+import { rebuildCapturesFromContent } from './hooks/tag-interceptor';
 
 interface ChatChangedPayload {
   chatId?: string | null;
   characterId?: string | null;
+}
+
+interface MessageEventPayload {
+  chatId?: string;
+  message?: { id?: string; content?: string };
+  action?: string;
+  swipeId?: number;
 }
 
 export function setup(ctx: SpindleFrontendContext) {
@@ -67,6 +75,37 @@ export function setup(ctx: SpindleFrontendContext) {
     void loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
   });
 
+  // Workaround for upstream issue: the host's `delivered` Set in
+  // Lumiverse/frontend/src/lib/spindle/message-interceptors.ts:21 dedupes
+  // tag intercept dispatches by (extensionId, messageId, isStreaming,
+  // tagName, fullMatch) and never clears. Swiping back to a previously-
+  // seen swipe doesn't re-fire the interceptor, so capturesByMessage
+  // holds stale captures and the widget shows content from another swipe
+  // (the last unique fullMatch the handler did fire for).
+  //
+  // We compute captures locally from the event payload to bypass the
+  // host pipeline entirely. MESSAGE_SWIPED + MESSAGE_EDITED both ship
+  // the new message body in `message.content` (chats.service.ts:982-989
+  // for swipe, similar for edit), so re-running each paired-tag script's
+  // findRe against that string lets us reconstruct what the captures
+  // *should* be without depending on the interceptor firing.
+  function handleMessageMutation(payload: unknown): void {
+    const p = (payload || {}) as MessageEventPayload;
+    const msg = p.message;
+    if (!msg || typeof msg.id !== 'string' || typeof msg.content !== 'string') return;
+    const active = ctx.getActiveChat();
+    if (active.chatId && p.chatId && active.chatId !== p.chatId) return;
+    const compiled = hooks.compiledForActiveCard();
+    if (!compiled) return;
+    const changed = rebuildCapturesFromContent(msg.id, msg.content, compiled);
+    if (changed) {
+      hooks.processMessageById(msg.id);
+    }
+  }
+
+  const unsubMessageSwiped = ctx.events.on('MESSAGE_SWIPED', handleMessageMutation);
+  const unsubMessageEdited = ctx.events.on('MESSAGE_EDITED', handleMessageMutation);
+
   // Cold-load from /characters: Lumiverse's SPA hydrates activeChatId /
   // activeCharacterId AFTER spindle setup() runs. CHAT_CHANGED only fires
   // on subsequent intra-app navigation, not on this initial hydration.
@@ -93,6 +132,8 @@ export function setup(ctx: SpindleFrontendContext) {
   return () => {
     unsubChatChanged();
     unsubSettingsUpdated();
+    unsubMessageSwiped();
+    unsubMessageEdited();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();
