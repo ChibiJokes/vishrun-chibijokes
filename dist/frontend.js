@@ -202,7 +202,7 @@ function substitute(template, fullMatch, groups) {
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
 var iframeRegistry = new Map;
-var REGISTRY_SEP = " ";
+var REGISTRY_SEP = "\x00";
 function registryKey(messageId, scriptId) {
   return messageId + REGISTRY_SEP + scriptId;
 }
@@ -305,7 +305,7 @@ function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
 function injectShimsAndSizeReporter(html) {
-  const stripped = stripExternalImageSrc(html);
+  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(html));
   const head = buildHeadInjection();
   const withHead = injectIntoHead(stripped, head);
   const shell = sizeReporterShell();
@@ -317,6 +317,15 @@ function injectShimsAndSizeReporter(html) {
 }
 function stripExternalImageSrc(html) {
   return html.replace(/<img\b[^>]*>/gi, (tag) => tag.replace(/(\s)src\s*=\s*(['"])(https?:\/\/[^'"]+)\2/i, "$1data-vishrun-extimg=$2$3$2"));
+}
+var VISHRUN_CSS_SENTINEL_PREFIX = "data:application/x-vishrun-cssproxy;base64,";
+function rewriteCssExternalUrls(html) {
+  if (html.indexOf("url(") === -1)
+    return html;
+  return html.replace(/url\(\s*(['"]?)(https?:\/\/[^'")\s]+)\1\s*\)/gi, (_match, _quote, url) => {
+    const encoded = btoa(url);
+    return `url("${VISHRUN_CSS_SENTINEL_PREFIX}${encoded}")`;
+  });
 }
 function buildHeadInjection() {
   return setChatMessagesShim() + externalImageProxyHelper();
@@ -489,8 +498,119 @@ function externalImageProxyHelper() {
     for (var i = 0; i < imgs.length; i++) processImg(imgs[i]);
   }
 
+  // ─── CSS url() sentinels ──────────────────────────────────────────────
+  //
+  // Host pre-rewrites \`url(['"]?https?://X['"]?)\` in <style> blocks and
+  // inline style="..." attributes to a sentinel data URL of the form
+  // \`data:application/x-vishrun-cssproxy;base64,<base64-of-X>\`. This
+  // resolver decodes each unique sentinel, fetches the original URL via
+  // corsProxy, builds a Blob, and replaces every occurrence of the
+  // sentinel in <style> textContent and [style] attributes with the new
+  // blob: URL. Cards see only the static replaceString — same as imgs.
+  var CSS_SENTINEL_PREFIX = 'data:application/x-vishrun-cssproxy;base64,';
+  var CSS_SENTINEL_RE = /data:application\\/x-vishrun-cssproxy;base64,([A-Za-z0-9+/=]+)/g;
+  // sentinel string -> blob URL once resolved, '__pending' while in flight,
+  // empty string for terminal failures (skip retry).
+  var cssBlobCache = {};
+
+  function decodeCssSentinel(sentinel) {
+    var idx = sentinel.indexOf(',');
+    if (idx === -1) return null;
+    try {
+      return atob(sentinel.slice(idx + 1));
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function findCssSentinels() {
+    var found = {};
+    var styles = document.querySelectorAll('style');
+    for (var i = 0; i < styles.length; i++) {
+      var t = styles[i].textContent || '';
+      if (t.indexOf(CSS_SENTINEL_PREFIX) === -1) continue;
+      var m;
+      CSS_SENTINEL_RE.lastIndex = 0;
+      while ((m = CSS_SENTINEL_RE.exec(t)) !== null) found[m[0]] = true;
+    }
+    var styled = document.querySelectorAll('[style]');
+    for (var i = 0; i < styled.length; i++) {
+      var s = styled[i].getAttribute('style') || '';
+      if (s.indexOf(CSS_SENTINEL_PREFIX) === -1) continue;
+      var m2;
+      CSS_SENTINEL_RE.lastIndex = 0;
+      while ((m2 = CSS_SENTINEL_RE.exec(s)) !== null) found[m2[0]] = true;
+    }
+    return Object.keys(found);
+  }
+
+  function replaceCssSentinel(sentinel, blobUrl) {
+    var styles = document.querySelectorAll('style');
+    for (var i = 0; i < styles.length; i++) {
+      var t = styles[i].textContent || '';
+      if (t.indexOf(sentinel) === -1) continue;
+      // textContent reassign re-parses the stylesheet, picking up the
+      // blob URL on the next style recompute. Cards in scope don't hold
+      // CSSOM rule references, so this is safe.
+      styles[i].textContent = t.split(sentinel).join(blobUrl);
+    }
+    var styled = document.querySelectorAll('[style]');
+    for (var i = 0; i < styled.length; i++) {
+      var s = styled[i].getAttribute('style') || '';
+      if (s.indexOf(sentinel) === -1) continue;
+      styled[i].setAttribute('style', s.split(sentinel).join(blobUrl));
+    }
+  }
+
+  function processCssSentinels() {
+    if (!window.spindleSandbox || typeof window.spindleSandbox.corsProxy !== 'function') return;
+    var sentinels = findCssSentinels();
+    for (var i = 0; i < sentinels.length; i++) {
+      var sentinel = sentinels[i];
+      var cached = cssBlobCache[sentinel];
+      if (cached === '__pending' || (typeof cached === 'string' && cached.length > 0)) continue;
+      if (cached === '') continue; // prior failure, don't retry
+      var url = decodeCssSentinel(sentinel);
+      if (!url) {
+        cssBlobCache[sentinel] = '';
+        continue;
+      }
+      cssBlobCache[sentinel] = '__pending';
+      (function(snt, u) {
+        window.spindleSandbox.corsProxy(u, { responseType: 'arraybuffer' }).then(
+          function(res) {
+            try {
+              if (!res || !res.body) {
+                console.warn('[vishrun] css corsProxy returned no body for', u);
+                cssBlobCache[snt] = '';
+                return;
+              }
+              var ct = '';
+              if (res.headers) {
+                ct = res.headers['content-type'] || res.headers['Content-Type'] || '';
+              }
+              ct = String(ct).split(';')[0].trim() || 'application/octet-stream';
+              var blob = new Blob([res.body], { type: ct });
+              var blobUrl = URL.createObjectURL(blob);
+              cssBlobCache[snt] = blobUrl;
+              replaceCssSentinel(snt, blobUrl);
+            } catch (e) {
+              console.warn('[vishrun] css decode failed for', u, e);
+              cssBlobCache[snt] = '';
+            }
+          },
+          function(err) {
+            console.warn('[vishrun] css corsProxy fetch failed for', u, err);
+            cssBlobCache[snt] = '';
+          }
+        );
+      })(sentinel, url);
+    }
+  }
+
   function init() {
     scan(document);
+    processCssSentinels();
     try {
       var mo = new MutationObserver(function(mutations) {
         for (var i = 0; i < mutations.length; i++) {
