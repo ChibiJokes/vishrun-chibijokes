@@ -7,6 +7,7 @@
     "build": "bun build src/frontend.ts --target browser --outfile dist/frontend.js && bun build src/backend.ts --target bun --outfile dist/backend.js"
   },
   "devDependencies": {
+    "lumiverse-spindle-types": "^0.4.71",
     "typescript": "^5.4.0"
   }
 }

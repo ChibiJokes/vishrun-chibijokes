@@ -5,13 +5,13 @@
     "": {
       "name": "vishrun",
       "devDependencies": {
-        "lumiverse-spindle-types": "file:../Lumiverse/node_modules/lumiverse-spindle-types",
+        "lumiverse-spindle-types": "^0.4.71",
         "typescript": "^5.4.0",
       },
     },
   },
   "packages": {
-    "lumiverse-spindle-types": ["lumiverse-spindle-types@file:../Lumiverse/node_modules/lumiverse-spindle-types", {}],
+    "lumiverse-spindle-types": ["lumiverse-spindle-types@0.4.71", "", {}, "sha512-+ilFBQ09xYg7v7aHk2KdHIwZbCrsR7iaCGgoKwg3QVdATYkhhHj+E4xE4eTLIvVUM5UJZvKo8hm3EKZ/I0M/Ug=="],
 
     "typescript": ["typescript@5.9.3", "", { "bin": { "tsc": "bin/tsc", "tsserver": "bin/tsserver" } }, "sha512-jl1vZzPDinLr9eUt3J/t7V6FgNEw9QjvBPdysz9KfQDD41fQrC2Y4vKQdiaUpFT4bXlb1RHhLpp8wtm6M5TgSw=="],
   }
