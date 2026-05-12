@@ -1,6 +1,7 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
 import { substitute } from '../core/substitute';
+import { applyNestedPipeline } from '../core/nested-pipeline';
 import {
   buildWidgetIframe,
   cleanupOrphansForMessage,
@@ -65,9 +66,9 @@ export async function processNode(
       // and surface here as captures via getCapturesForMessage. unknown
       // scripts are skipped (logged once at compile time).
       if (script.kind !== 'placeholder') continue;
-      total += await replacePlaceholderMatches(root, script, messageId, ctx);
+      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx);
     }
-    total += await renderPairedTagCaptures(root, messageId, ctx);
+    total += await renderPairedTagCaptures(root, scripts, messageId, ctx);
   } catch (err) {
     console.debug('[vishrun] processNode render error:', err);
   }
@@ -79,6 +80,7 @@ export async function processNode(
 async function replacePlaceholderMatches(
   root: HTMLElement,
   script: CompiledScript,
+  allScripts: CompiledScript[],
   messageId: string,
   ctx: SpindleFrontendContext,
 ): Promise<number> {
@@ -141,9 +143,12 @@ async function replacePlaceholderMatches(
       // substitute() handles the no-groups case fine.
       const groups = match.slice(1).map((g) => g ?? '');
       const html = substitute(script.replaceString, match[0], groups);
+      // Recursively substitute any nested tags this card's other scripts
+      // match before the HTML goes into a widget (one iframe, whole tree).
+      const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
       // await: buildWidget → buildWidgetIframe → injectShimsAndSizeReporter
       // may fetch the Tailwind bundle (cached after the first use).
-      const widget = await buildWidget(html, script.scriptName, script.id, messageId, ctx);
+      const widget = await buildWidget(expanded, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -173,6 +178,7 @@ async function replacePlaceholderMatches(
 
 async function renderPairedTagCaptures(
   root: HTMLElement,
+  allScripts: CompiledScript[],
   messageId: string,
   ctx: SpindleFrontendContext,
 ): Promise<number> {
@@ -250,12 +256,15 @@ async function renderPairedTagCaptures(
     }
     const groups = m.slice(1).map((g) => g ?? '');
     const html = substitute(cap.replaceString, m[0], groups);
+    // Recursively substitute nested tags (Satoru Bottom2's <role_npc> blocks)
+    // before the HTML goes into the iframe — one frame, whole nested tree.
+    const expanded = applyNestedPipeline(html, allScripts, new Set([cap.scriptId]), 0);
     // Paired-tag widgets always go through the iframe path. Vavesta
     // Court Ledger contains <script>, and even for hypothetical
     // script-free paired widgets the isolation is cheap insurance.
     // await: buildWidgetIframe → injectShimsAndSizeReporter may fetch the
     // Tailwind bundle (cached after the first use).
-    const iframe = await buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
+    const iframe = await buildWidgetIframe(expanded, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     // Re-validate after the await: another scan may have inserted this
     // capture's widget, or a React rebuild may have detached `target`. In

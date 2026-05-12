@@ -224,6 +224,45 @@ function substitute(template, fullMatch, groups) {
   return out;
 }
 
+// src/core/nested-pipeline.ts
+var MAX_RECURSION = 5;
+function applyNestedPipeline(html, allScripts, processing = new Set, depth = 0) {
+  if (depth >= MAX_RECURSION) {
+    console.warn(`[vishrun] nested pipeline hit MAX_RECURSION (${MAX_RECURSION}); deeper tags left unsubstituted`);
+    return html;
+  }
+  let out = html;
+  for (const script of allScripts) {
+    if (script.kind === "unknown")
+      continue;
+    if (processing.has(script.id))
+      continue;
+    out = expand(out, script, allScripts, processing, depth);
+  }
+  return out;
+}
+function expand(html, script, allScripts, processing, depth) {
+  script.findRe.lastIndex = 0;
+  let m = script.findRe.exec(html);
+  if (m === null)
+    return html;
+  const nextProcessing = new Set(processing).add(script.id);
+  let out = "";
+  let cursor = 0;
+  while (m !== null) {
+    out += html.slice(cursor, m.index);
+    const groups = m.slice(1).map((g) => g ?? "");
+    const substituted = substitute(script.replaceString, m[0], groups);
+    out += applyNestedPipeline(substituted, allScripts, nextProcessing, depth + 1);
+    cursor = m.index + m[0].length;
+    if (m[0].length === 0)
+      script.findRe.lastIndex++;
+    m = script.findRe.exec(html);
+  }
+  out += html.slice(cursor);
+  return out;
+}
+
 // src/core/asset-injector.ts
 function isFetchExternalResponse(p, requestId) {
   return !!p && typeof p === "object" && p.type === "fetch_external_response" && p.requestId === requestId;
@@ -1131,15 +1170,15 @@ async function processNode(root, scripts, ctx) {
     for (const script of scripts) {
       if (script.kind !== "placeholder")
         continue;
-      total += await replacePlaceholderMatches(root, script, messageId, ctx);
+      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx);
     }
-    total += await renderPairedTagCaptures(root, messageId, ctx);
+    total += await renderPairedTagCaptures(root, scripts, messageId, ctx);
   } catch (err) {
     console.debug("[vishrun] processNode render error:", err);
   }
   return total;
 }
-async function replacePlaceholderMatches(root, script, messageId, ctx) {
+async function replacePlaceholderMatches(root, script, allScripts, messageId, ctx) {
   const textNodes = collectTextNodes(root);
   let count = 0;
   let hasFreshMatch = false;
@@ -1181,7 +1220,8 @@ async function replacePlaceholderMatches(root, script, messageId, ctx) {
       }
       const groups = match.slice(1).map((g) => g ?? "");
       const html = substitute(script.replaceString, match[0], groups);
-      const widget = await buildWidget(html, script.scriptName, script.id, messageId, ctx);
+      const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
+      const widget = await buildWidget(expanded, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -1198,7 +1238,7 @@ async function replacePlaceholderMatches(root, script, messageId, ctx) {
   }
   return count;
 }
-async function renderPairedTagCaptures(root, messageId, ctx) {
+async function renderPairedTagCaptures(root, allScripts, messageId, ctx) {
   const captures = getCapturesForMessage(messageId);
   const target = findContentRoot(root);
   let added = 0;
@@ -1240,7 +1280,8 @@ async function renderPairedTagCaptures(root, messageId, ctx) {
     }
     const groups = m.slice(1).map((g) => g ?? "");
     const html = substitute(cap.replaceString, m[0], groups);
-    const iframe = await buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
+    const expanded = applyNestedPipeline(html, allScripts, new Set([cap.scriptId]), 0);
+    const iframe = await buildWidgetIframe(expanded, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
     if (!target.isConnected || target.querySelector(sel)) {
       destroyWidgetIframe(iframe);
