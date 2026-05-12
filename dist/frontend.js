@@ -1095,27 +1095,31 @@ function teardownTagInterceptors() {
 }
 function rebuildCapturesFromContent(messageId, content, compiled) {
   const newList = [];
+  let working = content;
   for (const script of compiled) {
     if (script.kind !== "pairedTag")
       continue;
     script.findRe.lastIndex = 0;
     let lastMatch = null;
     let m;
-    while ((m = script.findRe.exec(content)) !== null) {
+    while ((m = script.findRe.exec(working)) !== null) {
       lastMatch = m;
       if (m[0].length === 0)
         script.findRe.lastIndex++;
     }
-    if (!lastMatch)
-      continue;
-    newList.push({
-      scriptId: script.id,
-      scriptName: script.scriptName,
-      replaceString: script.replaceString,
-      findRe: script.findRe,
-      fullMatch: lastMatch[0],
-      attrs: {}
-    });
+    if (lastMatch) {
+      newList.push({
+        scriptId: script.id,
+        scriptName: script.scriptName,
+        replaceString: script.replaceString,
+        findRe: script.findRe,
+        fullMatch: lastMatch[0],
+        attrs: {}
+      });
+    }
+    script.findRe.lastIndex = 0;
+    working = working.replace(script.findRe, "");
+    script.findRe.lastIndex = 0;
   }
   const existing = capturesByMessage.get(messageId) || [];
   let changed = existing.length !== newList.length;

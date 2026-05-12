@@ -144,11 +144,14 @@ export function teardownTagInterceptors(): void {
  *
  * Frontend's MESSAGE_SWIPED / MESSAGE_EDITED handlers call this with the
  * fresh content from the WS event payload, bypassing the host pipeline
- * entirely. For each registered paired-tag script: run findRe against
- * the raw content (last match wins, mirroring onCapture's "latest
- * fullMatch is canonical" rule). Scripts that don't match drop their
- * capture for this messageId — that's how widgets disappear when a
- * swipe doesn't carry the tag.
+ * entirely. Scripts are scanned in `compiled` order (= host registration
+ * order) against an accumulatively-stripped working copy: once a paired-tag
+ * script claims a region, later scripts don't see it — mirrors the host's
+ * stripMessageTags, so a nested script (e.g. <role_npc> inside
+ * <status_bottom_npc>) doesn't double-capture (the parent expands it via the
+ * nested pipeline instead). Per script: last match wins (onCapture's "latest
+ * fullMatch is canonical" rule). Scripts that don't match drop their capture
+ * for this messageId — that's how widgets disappear when a swipe drops the tag.
  *
  * Returns true if capturesByMessage[messageId] changed, signalling the
  * caller to trigger processMessageById so phase 1 / phase 2 run with
@@ -161,28 +164,38 @@ export function rebuildCapturesFromContent(
 ): boolean {
   const newList: CapturedTag[] = [];
 
+  // compileScripts always merges `g` into paired-tag regexes (mergeFlags), so
+  // `working.replace(findRe, '')` strips every occurrence of the tag.
+  let working = content;
   for (const script of compiled) {
     if (script.kind !== 'pairedTag') continue;
     script.findRe.lastIndex = 0;
     let lastMatch: RegExpExecArray | null = null;
     let m: RegExpExecArray | null;
-    while ((m = script.findRe.exec(content)) !== null) {
+    while ((m = script.findRe.exec(working)) !== null) {
       lastMatch = m;
       if (m[0].length === 0) script.findRe.lastIndex++;
     }
-    if (!lastMatch) continue;
-    newList.push({
-      scriptId: script.id,
-      scriptName: script.scriptName,
-      replaceString: script.replaceString,
-      findRe: script.findRe,
-      fullMatch: lastMatch[0],
-      // attrs aren't needed downstream (renderPairedTagCaptures re-runs
-      // findRe on fullMatch to recover capture groups), but the field
-      // exists on CapturedTag — populate empty rather than parse the
-      // tag's attrs from raw HTML.
-      attrs: {},
-    });
+    if (lastMatch) {
+      newList.push({
+        scriptId: script.id,
+        scriptName: script.scriptName,
+        replaceString: script.replaceString,
+        findRe: script.findRe,
+        fullMatch: lastMatch[0],
+        // attrs aren't needed downstream (renderPairedTagCaptures re-runs
+        // findRe on fullMatch to recover capture groups), but the field
+        // exists on CapturedTag — populate empty rather than parse the
+        // tag's attrs from raw HTML.
+        attrs: {},
+      });
+    }
+    // Strip this tag's matches before the next script scans — accumulative,
+    // like the host. Whether or not we captured: a malformed instance the
+    // strict findRe missed shouldn't leak into a later script either way.
+    script.findRe.lastIndex = 0;
+    working = working.replace(script.findRe, '');
+    script.findRe.lastIndex = 0;
   }
 
   const existing = capturesByMessage.get(messageId) || [];
