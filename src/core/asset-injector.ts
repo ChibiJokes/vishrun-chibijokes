@@ -15,8 +15,9 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
  * `SpindleFrontendContext` (the context the frontend module gets) has no CORS
  * proxy, so the download is routed through the backend worker module, which
  * does have `spindle.cors`. The protocol (`fetch_external` → backend →
- * `fetch_external_response`) is generic and will be reused for Approach B
- * (React + Babel UMDs). See `src/backend.ts` for the worker side.
+ * `fetch_external_response`) is generic and is also used by Approach B
+ * (React + Babel UMDs — see `transformHtmlForReactBabel`). See `src/backend.ts`
+ * for the worker side.
  *
  * Bundles are cached in memory keyed by URL. A failed fetch is dropped from the
  * cache so a later render can retry; a card that referenced an unreachable URL
@@ -108,21 +109,22 @@ function fetchViaBackend(
   });
 }
 
-// ─── Tailwind bundle cache ─────────────────────────────────────────────────
+// ─── External bundle cache ─────────────────────────────────────────────────
 
-const tailwindCache = new Map<string, Promise<string>>();
+const bundleCache = new Map<string, Promise<string>>();
 
-function getTailwindBundle(url: string, ctx: SpindleFrontendContext): Promise<string> {
-  const cached = tailwindCache.get(url);
+// Backend fetch memoized by URL; shared by the Tailwind and React/Babel
+// transforms. Promise cached before it settles so concurrent renders join one
+// fetch; failed entries are dropped so a later render can retry.
+function getCachedBundle(url: string, ctx: SpindleFrontendContext): Promise<string> {
+  const cached = bundleCache.get(url);
   if (cached) return cached;
   const pending = fetchViaBackend(url, ctx);
-  // Cache the promise BEFORE awaiting so concurrent renders share one fetch.
-  tailwindCache.set(url, pending);
-  // Detached catch: drop failed entries so a later render can retry, without
-  // turning the rejection into an unhandled one (callers still see it via the
-  // cached promise) and without changing what `getTailwindBundle` returns.
+  bundleCache.set(url, pending);
+  // Detached catch: drop the failed entry without making the rejection unhandled
+  // (callers still see it via the returned promise).
   pending.catch(() => {
-    if (tailwindCache.get(url) === pending) tailwindCache.delete(url);
+    if (bundleCache.get(url) === pending) bundleCache.delete(url);
   });
   return pending;
 }
@@ -193,7 +195,7 @@ export async function transformHtmlForTailwind(
 
   const bundles = await Promise.all(
     urls.map((url) =>
-      getTailwindBundle(url, ctx).catch((err: unknown) => {
+      getCachedBundle(url, ctx).catch((err: unknown) => {
         console.warn(
           '[vishrun] Tailwind fetch failed:',
           url,
@@ -219,4 +221,104 @@ export async function transformHtmlForTailwind(
     ? '<style>:root{color:#000 !important}</style>'
     : '';
   return textColorOverride + inline + stripped;
+}
+
+// ─── React + Babel transform (Approach B) ──────────────────────────────────
+
+// `<script [type=...] src="https://unpkg.com/...">…</script>`. Same defensive
+// lookahead as TAILWIND_SCRIPT_RE so a decoy host (`unpkg.com.evil.com`) misses.
+// Slot assignment (if any) is `classifyUnpkgUrl`'s job.
+const UNPKG_SCRIPT_RE =
+  /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/unpkg\.com(?=[/?#"']|\s)[^"']*)["'][^>]*>\s*<\/script>/gi;
+
+type ReactBabelSlot = 'react' | 'reactDom' | 'babel';
+
+// Which slot a unpkg.com URL fills, by path: `/react[@v]/…`, `/react-dom[@v]/…`,
+// `/@babel/standalone[@v]/…` or `/babel-standalone[@v]/…`. `null` otherwise.
+function classifyUnpkgUrl(url: string): ReactBabelSlot | null {
+  const m = url.match(/^https?:\/\/unpkg\.com(\/[^"'?#]*)/i);
+  if (!m) return null;
+  const path = m[1];
+  if (/^\/(?:@babel\/standalone|babel-standalone)(?:@[^/]*)?(?:\/|$)/i.test(path)) return 'babel';
+  if (/^\/react-dom(?:@[^/]*)?(?:\/|$)/i.test(path)) return 'reactDom';
+  if (/^\/react(?:@[^/]*)?(?:\/|$)/i.test(path)) return 'react';
+  return null;
+}
+
+const REACT_BABEL_ORDER: readonly ReactBabelSlot[] = ['react', 'reactDom', 'babel'];
+
+// First unpkg.com `<script src>` for each slot; absent slots omitted, `{}` when
+// the card uses none (cheap `indexOf` short-circuit first).
+export function extractReactBabelUrls(html: string): { react?: string; reactDom?: string; babel?: string } {
+  if (html.indexOf('unpkg.com') === -1) return {};
+  const out: { react?: string; reactDom?: string; babel?: string } = {};
+  UNPKG_SCRIPT_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = UNPKG_SCRIPT_RE.exec(html)) !== null) {
+    const url = m[1];
+    const slot = classifyUnpkgUrl(url);
+    if (slot && out[slot] === undefined) out[slot] = url;
+  }
+  return out;
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+// Remove every `<script ... src="<url>">…</script>` for an exact `url`.
+function stripScriptTagBySrc(html: string, url: string): string {
+  return html.replace(
+    new RegExp(`<script\\b[^>]*\\bsrc\\s*=\\s*["']${escapeRegExp(url)}["'][^>]*>\\s*</script>`, 'gi'),
+    '',
+  );
+}
+
+// Inline React/ReactDOM/Babel UMD bundles fetched via the backend, dropping the
+// original `<script src>` for each one that downloaded. Order react → reactDom →
+// babel: ReactDOM needs React; Babel's `text/babel` scanner runs on load and the
+// JSX scripts it consumes are further down in the card HTML. Silent fallback per
+// bundle; idempotent (no matching `<script src>` ⇒ `html` returned untouched).
+export async function transformHtmlForReactBabel(
+  html: string,
+  ctx: SpindleFrontendContext,
+): Promise<string> {
+  const urls = extractReactBabelUrls(html);
+  const slots = REACT_BABEL_ORDER.filter((slot) => urls[slot] !== undefined);
+  if (slots.length === 0) return html;
+
+  // Parallel fetch, kept in REACT_BABEL_ORDER; per-URL silent fallback to ''.
+  const fetched = await Promise.all(
+    slots.map(async (slot) => {
+      const url = urls[slot]!;
+      try {
+        return { url, body: await getCachedBundle(url, ctx) };
+      } catch (err: unknown) {
+        console.warn(
+          '[vishrun] React/Babel fetch failed:',
+          url,
+          err instanceof Error ? err.message : String(err),
+        );
+        return { url, body: '' };
+      }
+    }),
+  );
+
+  const ok = fetched.filter((f) => f.body !== '');
+  if (ok.length === 0) return html;
+
+  let stripped = html;
+  for (const f of ok) stripped = stripScriptTagBySrc(stripped, f.url);
+  const inline = ok.map((f) => `<script>${f.body}</script>`).join('');
+  return inline + stripped;
+}
+
+// Run every host-side external-`<script>` transform in order: Tailwind, then
+// React/Babel. Each is a silent-fallback no-op when its tags aren't present.
+export async function transformHtmlForExternalScripts(
+  html: string,
+  ctx: SpindleFrontendContext,
+): Promise<string> {
+  const withTailwind = await transformHtmlForTailwind(html, ctx);
+  return transformHtmlForReactBabel(withTailwind, ctx);
 }

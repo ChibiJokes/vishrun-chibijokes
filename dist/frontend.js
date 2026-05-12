@@ -277,16 +277,16 @@ function fetchViaBackend(url, ctx, timeoutMs = 30000) {
     }
   });
 }
-var tailwindCache = new Map;
-function getTailwindBundle(url, ctx) {
-  const cached = tailwindCache.get(url);
+var bundleCache = new Map;
+function getCachedBundle(url, ctx) {
+  const cached = bundleCache.get(url);
   if (cached)
     return cached;
   const pending = fetchViaBackend(url, ctx);
-  tailwindCache.set(url, pending);
+  bundleCache.set(url, pending);
   pending.catch(() => {
-    if (tailwindCache.get(url) === pending)
-      tailwindCache.delete(url);
+    if (bundleCache.get(url) === pending)
+      bundleCache.delete(url);
   });
   return pending;
 }
@@ -320,7 +320,7 @@ async function transformHtmlForTailwind(html, ctx) {
   const urls = extractTailwindUrls(html);
   if (urls.length === 0)
     return html;
-  const bundles = await Promise.all(urls.map((url) => getTailwindBundle(url, ctx).catch((err) => {
+  const bundles = await Promise.all(urls.map((url) => getCachedBundle(url, ctx).catch((err) => {
     console.warn("[vishrun] Tailwind fetch failed:", url, err instanceof Error ? err.message : String(err));
     return "";
   })));
@@ -330,6 +330,68 @@ async function transformHtmlForTailwind(html, ctx) {
   const inline = bundles.filter((b) => b !== "").map((b) => `<script>${b}</script>`).join("");
   const textColorOverride = detectCardColorScheme(html) === null ? "<style>:root{color:#000 !important}</style>" : "";
   return textColorOverride + inline + stripped;
+}
+var UNPKG_SCRIPT_RE = /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/unpkg\.com(?=[/?#"']|\s)[^"']*)["'][^>]*>\s*<\/script>/gi;
+function classifyUnpkgUrl(url) {
+  const m = url.match(/^https?:\/\/unpkg\.com(\/[^"'?#]*)/i);
+  if (!m)
+    return null;
+  const path = m[1];
+  if (/^\/(?:@babel\/standalone|babel-standalone)(?:@[^/]*)?(?:\/|$)/i.test(path))
+    return "babel";
+  if (/^\/react-dom(?:@[^/]*)?(?:\/|$)/i.test(path))
+    return "reactDom";
+  if (/^\/react(?:@[^/]*)?(?:\/|$)/i.test(path))
+    return "react";
+  return null;
+}
+var REACT_BABEL_ORDER = ["react", "reactDom", "babel"];
+function extractReactBabelUrls(html) {
+  if (html.indexOf("unpkg.com") === -1)
+    return {};
+  const out = {};
+  UNPKG_SCRIPT_RE.lastIndex = 0;
+  let m;
+  while ((m = UNPKG_SCRIPT_RE.exec(html)) !== null) {
+    const url = m[1];
+    const slot = classifyUnpkgUrl(url);
+    if (slot && out[slot] === undefined)
+      out[slot] = url;
+  }
+  return out;
+}
+function escapeRegExp(s) {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+function stripScriptTagBySrc(html, url) {
+  return html.replace(new RegExp(`<script\\b[^>]*\\bsrc\\s*=\\s*["']${escapeRegExp(url)}["'][^>]*>\\s*</script>`, "gi"), "");
+}
+async function transformHtmlForReactBabel(html, ctx) {
+  const urls = extractReactBabelUrls(html);
+  const slots = REACT_BABEL_ORDER.filter((slot) => urls[slot] !== undefined);
+  if (slots.length === 0)
+    return html;
+  const fetched = await Promise.all(slots.map(async (slot) => {
+    const url = urls[slot];
+    try {
+      return { url, body: await getCachedBundle(url, ctx) };
+    } catch (err) {
+      console.warn("[vishrun] React/Babel fetch failed:", url, err instanceof Error ? err.message : String(err));
+      return { url, body: "" };
+    }
+  }));
+  const ok = fetched.filter((f) => f.body !== "");
+  if (ok.length === 0)
+    return html;
+  let stripped = html;
+  for (const f of ok)
+    stripped = stripScriptTagBySrc(stripped, f.url);
+  const inline = ok.map((f) => `<script>${f.body}</script>`).join("");
+  return inline + stripped;
+}
+async function transformHtmlForExternalScripts(html, ctx) {
+  const withTailwind = await transformHtmlForTailwind(html, ctx);
+  return transformHtmlForReactBabel(withTailwind, ctx);
 }
 
 // src/render/widget-iframe.ts
@@ -438,8 +500,8 @@ function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
 async function injectShimsAndSizeReporter(html, ctx) {
-  const withTailwind = await transformHtmlForTailwind(html, ctx);
-  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withTailwind));
+  const withExternalScripts = await transformHtmlForExternalScripts(html, ctx);
+  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withExternalScripts));
   const head = buildHeadInjection();
   const withHead = injectIntoHead(stripped, head);
   const shell = sizeReporterShell();
@@ -462,7 +524,10 @@ function rewriteCssExternalUrls(html) {
   });
 }
 function buildHeadInjection() {
-  return setChatMessagesShim() + externalImageProxyHelper();
+  return viewportHeightShim() + setChatMessagesShim() + externalImageProxyHelper();
+}
+function viewportHeightShim() {
+  return "<style>" + ".min-h-screen,.min-h-\\[100vh\\],.min-h-\\[100dvh\\]{min-height:0 !important}" + ".h-screen,.h-\\[100vh\\],.h-\\[100dvh\\]{height:auto !important}" + "</style>";
 }
 function setChatMessagesShim() {
   return `<script>(function(){` + `window.setChatMessages = function(chat_messages){` + `try{` + `if(window.spindleSandbox && typeof window.spindleSandbox.postMessage==='function'){` + `window.spindleSandbox.postMessage({kind:'set-chat-messages',payload:chat_messages});` + `}` + `}catch(e){}` + `};` + `})();</script>`;
