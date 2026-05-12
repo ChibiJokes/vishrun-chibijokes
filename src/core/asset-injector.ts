@@ -161,16 +161,28 @@ export function extractTailwindUrls(html: string): string[] {
 }
 
 /**
- * If `html` references the Tailwind Play CDN via `<script src>`, fetch the
- * bundle(s) through the backend, strip the `<script src>` tag(s), and prepend
- * the bundle(s) inline as `<script>…</script>` at the very start of `html`
- * (which becomes the start of the effective `<head>` once the sandbox host
- * wraps the document — see widget-iframe.ts:injectShimsAndSizeReporter).
- *
- * Silent fallback: a bundle that fails to fetch is logged via `console.warn`
- * and treated as empty (the others still inject); if *every* bundle fails,
- * `html` is returned unchanged. Idempotent — HTML with no Tailwind `<script
- * src>` (e.g. already transformed) is returned untouched.
+ * Card's declared `color-scheme` (from a `<meta name="color-scheme">` tag or a
+ * `:root{color-scheme:...}` rule), trimmed; `null` if the card declares none.
+ */
+export function detectCardColorScheme(html: string): string | null {
+  const meta = html.match(/<meta\s+name=["']color-scheme["']\s+content=["']([^"']+)["']/i);
+  if (meta) return meta[1].trim();
+
+  const css = html.match(/:root\s*\{[^}]*color-scheme\s*:\s*([^;}]+)/i);
+  if (css) return css[1].trim();
+
+  return null;
+}
+
+/**
+ * Inline Tailwind CDN bundles fetched via the backend, removing the original
+ * `<script src>`. For cards that don't declare color-scheme, also injects a
+ * `color:#000 !important` root rule so default text stays readable when the
+ * host forces `dark light` on a dark-mode OS — does NOT touch `color-scheme`,
+ * which would mismatch the parent and trigger an opaque iframe bg fallback.
+ * Silent fallback: a failed bundle is logged and skipped; if all fail, `html`
+ * is returned unchanged. Idempotent — HTML with no Tailwind `<script src>`
+ * (e.g. already transformed) is returned untouched.
  */
 export async function transformHtmlForTailwind(
   html: string,
@@ -199,5 +211,12 @@ export async function transformHtmlForTailwind(
     .filter((b) => b !== '')
     .map((b) => `<script>${b}</script>`)
     .join('');
-  return inline + stripped;
+  // Force text color (not color-scheme: that mismatches the parent and makes
+  // the browser auto-fill an opaque iframe bg, hiding Lumiverse's wallpaper) so
+  // legacy JSR-style cards stay readable on dark-mode OS. Only when the card
+  // declares no color-scheme; explicit declarations are left to cascade.
+  const textColorOverride = detectCardColorScheme(html) === null
+    ? '<style>:root{color:#000 !important}</style>'
+    : '';
+  return textColorOverride + inline + stripped;
 }

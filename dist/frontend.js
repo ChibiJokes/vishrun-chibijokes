@@ -307,6 +307,15 @@ function extractTailwindUrls(html) {
   }
   return out;
 }
+function detectCardColorScheme(html) {
+  const meta = html.match(/<meta\s+name=["']color-scheme["']\s+content=["']([^"']+)["']/i);
+  if (meta)
+    return meta[1].trim();
+  const css = html.match(/:root\s*\{[^}]*color-scheme\s*:\s*([^;}]+)/i);
+  if (css)
+    return css[1].trim();
+  return null;
+}
 async function transformHtmlForTailwind(html, ctx) {
   const urls = extractTailwindUrls(html);
   if (urls.length === 0)
@@ -319,7 +328,8 @@ async function transformHtmlForTailwind(html, ctx) {
     return html;
   const stripped = html.replace(TAILWIND_SCRIPT_RE, "");
   const inline = bundles.filter((b) => b !== "").map((b) => `<script>${b}</script>`).join("");
-  return inline + stripped;
+  const textColorOverride = detectCardColorScheme(html) === null ? "<style>:root{color:#000 !important}</style>" : "";
+  return textColorOverride + inline + stripped;
 }
 
 // src/render/widget-iframe.ts
