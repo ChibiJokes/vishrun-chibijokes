@@ -88,7 +88,10 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel) as HTMLElement | null;
     if (node) {
-      processNode(node, compiled, ctx);
+      // processNode is async (widget builds may fetch the Tailwind bundle on
+      // first use). Fire-and-forget — it swallows its own render errors, and
+      // a later observer-driven scan re-runs idempotently if needed.
+      void processNode(node, compiled, ctx);
       return;
     }
     if (retriesLeft > 0) {
@@ -98,7 +101,8 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
 
   function scanAllNow(compiled: CompiledScript[]): void {
     const nodes = document.querySelectorAll('[data-message-id]');
-    nodes.forEach((n) => { processNode(n as HTMLElement, compiled, ctx); });
+    // processNode is async and fire-and-forget (see processMessageById).
+    nodes.forEach((n) => { void processNode(n as HTMLElement, compiled, ctx); });
   }
 
   function handleMutations(): void {

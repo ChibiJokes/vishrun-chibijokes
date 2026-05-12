@@ -224,6 +224,104 @@ function substitute(template, fullMatch, groups) {
   return out;
 }
 
+// src/core/asset-injector.ts
+function isFetchExternalResponse(p, requestId) {
+  return !!p && typeof p === "object" && p.type === "fetch_external_response" && p.requestId === requestId;
+}
+var requestCounter = 0;
+function nextRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `vishrun-fx-${Date.now()}-${++requestCounter}`;
+}
+function fetchViaBackend(url, ctx, timeoutMs = 30000) {
+  return new Promise((resolve, reject) => {
+    const requestId = nextRequestId();
+    let settled = false;
+    let unsub = null;
+    let timer = null;
+    const finish = (run) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try {
+          unsub();
+        } catch {}
+        unsub = null;
+      }
+      run();
+    };
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isFetchExternalResponse(payload, requestId))
+        return;
+      if (payload.ok && typeof payload.body === "string") {
+        const body = payload.body;
+        finish(() => resolve(body));
+      } else {
+        finish(() => reject(new Error(payload.error || "fetch_external failed")));
+      }
+    });
+    timer = setTimeout(() => {
+      finish(() => reject(new Error("Backend fetch timeout")));
+    }, timeoutMs);
+    try {
+      ctx.sendToBackend({ type: "fetch_external", requestId, url });
+    } catch (err) {
+      finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+    }
+  });
+}
+var tailwindCache = new Map;
+function getTailwindBundle(url, ctx) {
+  const cached = tailwindCache.get(url);
+  if (cached)
+    return cached;
+  const pending = fetchViaBackend(url, ctx);
+  tailwindCache.set(url, pending);
+  pending.catch(() => {
+    if (tailwindCache.get(url) === pending)
+      tailwindCache.delete(url);
+  });
+  return pending;
+}
+var TAILWIND_SCRIPT_RE = /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/cdn\.tailwindcss\.com(?=[/?#"']|\s)[^"']*)["'][^>]*>\s*<\/script>/gi;
+function extractTailwindUrls(html) {
+  if (html.indexOf("cdn.tailwindcss.com") === -1)
+    return [];
+  const out = [];
+  const seen = new Set;
+  TAILWIND_SCRIPT_RE.lastIndex = 0;
+  let m;
+  while ((m = TAILWIND_SCRIPT_RE.exec(html)) !== null) {
+    const url = m[1];
+    if (!seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
+  }
+  return out;
+}
+async function transformHtmlForTailwind(html, ctx) {
+  const urls = extractTailwindUrls(html);
+  if (urls.length === 0)
+    return html;
+  const bundles = await Promise.all(urls.map((url) => getTailwindBundle(url, ctx).catch((err) => {
+    console.warn("[vishrun] Tailwind fetch failed:", url, err instanceof Error ? err.message : String(err));
+    return "";
+  })));
+  if (bundles.every((b) => b === ""))
+    return html;
+  const stripped = html.replace(TAILWIND_SCRIPT_RE, "");
+  const inline = bundles.filter((b) => b !== "").map((b) => `<script>${b}</script>`).join("");
+  return inline + stripped;
+}
+
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
 var iframeRegistry = new Map;
@@ -283,8 +381,8 @@ function destroyRegisteredWidgetsFor(messageId, scriptId) {
     destroyWidgetIframe(iframe);
   }
 }
-function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
-  const srcdoc = injectShimsAndSizeReporter(html);
+async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
+  const srcdoc = await injectShimsAndSizeReporter(html, ctx);
   const frame = ctx.dom.createSandboxFrame({
     html: srcdoc,
     autoResize: false,
@@ -329,8 +427,9 @@ function containsInlineEventHandler(html) {
 function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
-function injectShimsAndSizeReporter(html) {
-  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(html));
+async function injectShimsAndSizeReporter(html, ctx) {
+  const withTailwind = await transformHtmlForTailwind(html, ctx);
+  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withTailwind));
   const head = buildHeadInjection();
   const withHead = injectIntoHead(stripped, head);
   const shell = sizeReporterShell();
@@ -920,7 +1019,7 @@ function extractTagName(reSource) {
 }
 
 // src/render/inject-into-message.ts
-function processNode(root, scripts, ctx) {
+async function processNode(root, scripts, ctx) {
   const messageId = root.getAttribute("data-message-id") || undefined;
   if (!messageId) {
     return 0;
@@ -928,15 +1027,19 @@ function processNode(root, scripts, ctx) {
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
   let total = 0;
-  for (const script of scripts) {
-    if (script.kind !== "placeholder")
-      continue;
-    total += replacePlaceholderMatches(root, script, messageId, ctx);
+  try {
+    for (const script of scripts) {
+      if (script.kind !== "placeholder")
+        continue;
+      total += await replacePlaceholderMatches(root, script, messageId, ctx);
+    }
+    total += await renderPairedTagCaptures(root, messageId, ctx);
+  } catch (err) {
+    console.debug("[vishrun] processNode render error:", err);
   }
-  total += renderPairedTagCaptures(root, messageId, ctx);
   return total;
 }
-function replacePlaceholderMatches(root, script, messageId, ctx) {
+async function replacePlaceholderMatches(root, script, messageId, ctx) {
   const textNodes = collectTextNodes(root);
   let count = 0;
   let hasFreshMatch = false;
@@ -968,7 +1071,7 @@ function replacePlaceholderMatches(root, script, messageId, ctx) {
     if (ranges.length === 0)
       continue;
     const parent = tn.parentNode;
-    if (!parent)
+    if (!parent || !parent.isConnected)
       continue;
     const frag = document.createDocumentFragment();
     let cursor = 0;
@@ -978,7 +1081,7 @@ function replacePlaceholderMatches(root, script, messageId, ctx) {
       }
       const groups = match.slice(1).map((g) => g ?? "");
       const html = substitute(script.replaceString, match[0], groups);
-      const widget = buildWidget(html, script.scriptName, script.id, messageId, ctx);
+      const widget = await buildWidget(html, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -986,11 +1089,16 @@ function replacePlaceholderMatches(root, script, messageId, ctx) {
     if (cursor < text.length) {
       frag.appendChild(document.createTextNode(text.slice(cursor)));
     }
-    parent.replaceChild(frag, tn);
+    if (tn.parentNode === parent && parent.isConnected) {
+      parent.replaceChild(frag, tn);
+    } else {
+      frag.querySelectorAll("iframe[data-vishrun-widget]").forEach((el) => destroyWidgetIframe(el));
+      count -= ranges.length;
+    }
   }
   return count;
 }
-function renderPairedTagCaptures(root, messageId, ctx) {
+async function renderPairedTagCaptures(root, messageId, ctx) {
   const captures = getCapturesForMessage(messageId);
   const target = findContentRoot(root);
   let added = 0;
@@ -1024,14 +1132,20 @@ function renderPairedTagCaptures(root, messageId, ctx) {
       });
       failed.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
       failed.textContent = cap.fullMatch;
-      target.appendChild(failed);
-      added++;
+      if (target.isConnected) {
+        target.appendChild(failed);
+        added++;
+      }
       continue;
     }
     const groups = m.slice(1).map((g) => g ?? "");
     const html = substitute(cap.replaceString, m[0], groups);
-    const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
+    const iframe = await buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
+    if (!target.isConnected || target.querySelector(sel)) {
+      destroyWidgetIframe(iframe);
+      continue;
+    }
     target.appendChild(iframe);
     added++;
   }
@@ -1041,7 +1155,7 @@ function findContentRoot(messageNode) {
   const inner = messageNode.querySelector('[data-component="MessageContent"]');
   return inner ?? messageNode;
 }
-function buildWidget(html, scriptName, scriptId, messageId, ctx) {
+async function buildWidget(html, scriptName, scriptId, messageId, ctx) {
   if (widgetNeedsIsolation(html)) {
     return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
   }

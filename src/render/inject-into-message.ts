@@ -32,11 +32,11 @@ import { getCapturesForMessage } from '../hooks/tag-interceptor';
  * Idempotency: both pipelines skip work where a [data-vishrun-widget] is
  * already in place. Re-running on the same DOM is a no-op.
  */
-export function processNode(
+export async function processNode(
   root: HTMLElement,
   scripts: CompiledScript[],
   ctx: SpindleFrontendContext,
-): number {
+): Promise<number> {
   const messageId = root.getAttribute('data-message-id') || undefined;
   if (!messageId) {
     // Without a stable messageId, the global widget registry can't track
@@ -54,26 +54,34 @@ export function processNode(
   cleanupOrphansForMessage(messageId, target);
 
   let total = 0;
-  for (const script of scripts) {
-    // Only placeholder triggers run through the post-DOMPurify text scan.
-    // pairedTag scripts go through registerTagInterceptor (pre-sanitizer)
-    // and surface here as captures via getCapturesForMessage. unknown
-    // scripts are skipped (logged once at compile time).
-    if (script.kind !== 'placeholder') continue;
-    total += replacePlaceholderMatches(root, script, messageId, ctx);
+  // Widget building is async now (buildWidgetIframe → injectShimsAndSizeReporter
+  // → transformHtmlForTailwind may fetch the Tailwind bundle on first use).
+  // Swallow errors so a single bad render doesn't reject for fire-and-forget
+  // callers (scanAllNow / processMessageById) and so a later scan can retry.
+  try {
+    for (const script of scripts) {
+      // Only placeholder triggers run through the post-DOMPurify text scan.
+      // pairedTag scripts go through registerTagInterceptor (pre-sanitizer)
+      // and surface here as captures via getCapturesForMessage. unknown
+      // scripts are skipped (logged once at compile time).
+      if (script.kind !== 'placeholder') continue;
+      total += await replacePlaceholderMatches(root, script, messageId, ctx);
+    }
+    total += await renderPairedTagCaptures(root, messageId, ctx);
+  } catch (err) {
+    console.debug('[vishrun] processNode render error:', err);
   }
-  total += renderPairedTagCaptures(root, messageId, ctx);
   return total;
 }
 
 // ─── Placeholder pipeline ──────────────────────────────────────────────
 
-function replacePlaceholderMatches(
+async function replacePlaceholderMatches(
   root: HTMLElement,
   script: CompiledScript,
   messageId: string,
   ctx: SpindleFrontendContext,
-): number {
+): Promise<number> {
   const textNodes = collectTextNodes(root);
   let count = 0;
 
@@ -118,7 +126,9 @@ function replacePlaceholderMatches(
     if (ranges.length === 0) continue;
 
     const parent = tn.parentNode;
-    if (!parent) continue;
+    // Stale text node: a React subtree rebuild during an earlier iteration's
+    // await detached `tn` (or its parent). Skip — a later scan re-collects.
+    if (!parent || !parent.isConnected) continue;
 
     const frag = document.createDocumentFragment();
     let cursor = 0;
@@ -131,7 +141,9 @@ function replacePlaceholderMatches(
       // substitute() handles the no-groups case fine.
       const groups = match.slice(1).map((g) => g ?? '');
       const html = substitute(script.replaceString, match[0], groups);
-      const widget = buildWidget(html, script.scriptName, script.id, messageId, ctx);
+      // await: buildWidget → buildWidgetIframe → injectShimsAndSizeReporter
+      // may fetch the Tailwind bundle (cached after the first use).
+      const widget = await buildWidget(html, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -139,7 +151,19 @@ function replacePlaceholderMatches(
     if (cursor < text.length) {
       frag.appendChild(document.createTextNode(text.slice(cursor)));
     }
-    parent.replaceChild(frag, tn);
+    // Re-validate: `replaceChild` requires `tn` to still be a child of
+    // `parent`. If a React rebuild displaced it while we awaited a fetch,
+    // drop the fragment and release any host sandbox-frame records its
+    // iframes hold (else they leak until extension teardown). Next scan
+    // re-renders into the fresh DOM.
+    if (tn.parentNode === parent && parent.isConnected) {
+      parent.replaceChild(frag, tn);
+    } else {
+      frag.querySelectorAll('iframe[data-vishrun-widget]').forEach((el) =>
+        destroyWidgetIframe(el as HTMLIFrameElement),
+      );
+      count -= ranges.length;
+    }
   }
 
   return count;
@@ -147,11 +171,11 @@ function replacePlaceholderMatches(
 
 // ─── Paired-tag pipeline ───────────────────────────────────────────────
 
-function renderPairedTagCaptures(
+async function renderPairedTagCaptures(
   root: HTMLElement,
   messageId: string,
   ctx: SpindleFrontendContext,
-): number {
+): Promise<number> {
   const captures = getCapturesForMessage(messageId);
   const target = findContentRoot(root);
   let added = 0;
@@ -218,8 +242,10 @@ function renderPairedTagCaptures(
       }) as HTMLElement;
       failed.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
       failed.textContent = cap.fullMatch;
-      target.appendChild(failed);
-      added++;
+      if (target.isConnected) {
+        target.appendChild(failed);
+        added++;
+      }
       continue;
     }
     const groups = m.slice(1).map((g) => g ?? '');
@@ -227,8 +253,18 @@ function renderPairedTagCaptures(
     // Paired-tag widgets always go through the iframe path. Vavesta
     // Court Ledger contains <script>, and even for hypothetical
     // script-free paired widgets the isolation is cheap insurance.
-    const iframe = buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
+    // await: buildWidgetIframe → injectShimsAndSizeReporter may fetch the
+    // Tailwind bundle (cached after the first use).
+    const iframe = await buildWidgetIframe(html, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
+    // Re-validate after the await: another scan may have inserted this
+    // capture's widget, or a React rebuild may have detached `target`. In
+    // either case drop the just-built iframe (releasing its host record) and
+    // skip — a later scan re-renders into the current DOM.
+    if (!target.isConnected || target.querySelector(sel)) {
+      destroyWidgetIframe(iframe);
+      continue;
+    }
     target.appendChild(iframe);
     added++;
   }
@@ -245,13 +281,13 @@ function findContentRoot(messageNode: HTMLElement): HTMLElement {
 
 // ─── Shared helpers ────────────────────────────────────────────────────
 
-function buildWidget(
+async function buildWidget(
   html: string,
   scriptName: string,
   scriptId: string,
   messageId: string,
   ctx: SpindleFrontendContext,
-): HTMLElement {
+): Promise<HTMLElement> {
   if (widgetNeedsIsolation(html)) {
     return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
   }
