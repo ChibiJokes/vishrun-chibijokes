@@ -524,13 +524,16 @@ function rewriteCssExternalUrls(html) {
   });
 }
 function buildHeadInjection() {
-  return viewportHeightShim() + setChatMessagesShim() + externalImageProxyHelper();
+  return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper();
 }
 function viewportHeightShim() {
   return "<style>" + ".min-h-screen,.min-h-\\[100vh\\],.min-h-\\[100dvh\\]{min-height:0 !important}" + ".h-screen,.h-\\[100vh\\],.h-\\[100dvh\\]{height:auto !important}" + "</style>";
 }
 function setChatMessagesShim() {
   return `<script>(function(){` + `window.setChatMessages = function(chat_messages){` + `try{` + `if(window.spindleSandbox && typeof window.spindleSandbox.postMessage==='function'){` + `window.spindleSandbox.postMessage({kind:'set-chat-messages',payload:chat_messages});` + `}` + `}catch(e){}` + `};` + `})();</script>`;
+}
+function clipboardAlertShim() {
+  return `<script>(function(){` + `try{` + `if(!navigator.clipboard){Object.defineProperty(navigator,'clipboard',{value:{},configurable:true});}` + `navigator.clipboard.writeText=function(text){` + `try{window.spindleSandbox.postMessage({kind:'clipboard-write-text',payload:{text:String(text)}});return Promise.resolve();}` + `catch(e){return Promise.reject(e);}` + `};` + `}catch(e){}` + `window.alert=function(msg){` + `try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}` + `};` + `})();</script>`;
 }
 function externalImageProxyHelper() {
   return `<script>
@@ -925,6 +928,28 @@ function routeChildMessage(frame, payload, ctx) {
   const p = payload;
   if (p.kind === "set-chat-messages") {
     handleSetChatMessages(frame.element, p.payload, ctx);
+  } else if (p.kind === "clipboard-write-text") {
+    handleClipboardWriteText(p.payload);
+  } else if (p.kind === "alert") {
+    handleHostAlert(p.payload);
+  }
+}
+async function handleClipboardWriteText(payload) {
+  const text = payload && typeof payload === "object" ? payload.text : undefined;
+  if (typeof text !== "string")
+    return;
+  try {
+    await navigator.clipboard.writeText(text);
+  } catch (e) {
+    console.warn("[vishrun] clipboard writeText failed:", e);
+  }
+}
+function handleHostAlert(payload) {
+  const message = payload && typeof payload === "object" ? payload.message : undefined;
+  try {
+    window.alert(typeof message === "string" ? message : String(message));
+  } catch (e) {
+    console.warn("[vishrun] alert failed:", e);
   }
 }
 async function handleSetChatMessages(iframe, payload, ctx) {
