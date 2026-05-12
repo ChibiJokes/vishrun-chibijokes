@@ -39,15 +39,51 @@ export function stripCodeFence(s: string): string {
 }
 
 /**
+ * Parse a JS-style regex literal `/pattern/flags` out of a card's findRegex
+ * source. Some cards (e.g. ↦/↤-delimited capture scripts) author their
+ * findRegex with the literal delimiters intact; passing such a string raw
+ * to `new RegExp` makes the slashes part of the pattern and the regex
+ * never matches anything.
+ *
+ * The inner pattern is parsed tolerantly: escape sequences (`\.`, `\/`,
+ * `\\`) are preserved as-is; the closing `/` is the first unescaped slash.
+ * Flags are validated against the JS-supported set; anything else falls
+ * through to "not a literal" so we don't silently misinterpret a pattern
+ * that happens to start with `/`.
+ *
+ * Returns `{ pattern, flags }` — `flags` is `''` when the input wasn't a
+ * literal (caller treats the whole input as the pattern).
+ */
+export function parseRegexLiteral(s: string): { pattern: string; flags: string } {
+  const m = s.match(/^\s*\/((?:\\.|[^/\\])*)\/([gimsuy]*)\s*$/);
+  if (!m || !m[1]) return { pattern: s, flags: '' };
+  return { pattern: m[1], flags: m[2] };
+}
+
+/**
+ * Merge user flags from a regex literal with the default `gs` Vishrun
+ * relies on. `g` is required for `matchAll`-style scanning in the render
+ * pipeline; `s` (dotAll) is needed so paired-tag scripts whose inner
+ * content spans lines still match. Duplicates are deduped.
+ */
+export function mergeFlags(userFlags: string): string {
+  const set = new Set<string>(['g', 's']);
+  for (const f of userFlags) set.add(f);
+  return Array.from(set).join('');
+}
+
+/**
  * Compile raw regex_scripts into a usable form.
  *  - Drops disabled scripts.
  *  - Drops scripts whose `placement` is set and excludes 2 (render-side).
  *    Scripts with no placement are kept (treat as "applies anywhere").
- *  - Builds findRe with `new RegExp(source, 'gs')` from raw source — no
- *    slash-stripping (Step 1 finding: source arrives without delimiters).
- *    `s` (dotAll) lets `.` match newlines so paired-tag scripts whose
- *    inner content spans lines (e.g. Xiao Gu's 12 pipe-separated groups
- *    when the AI breaks them across lines) still match.
+ *  - Builds findRe with `new RegExp(pattern, flags)`. Pattern/flags come
+ *    from `parseRegexLiteral` which strips `/.../flags` delimiters when
+ *    the card authored them (ts-edition cards do; older Lumi cards don't).
+ *    Default flags `gs` are always merged in: `g` for matchAll scanning,
+ *    `s` (dotAll) so paired-tag scripts whose inner content spans lines
+ *    (e.g. Xiao Gu's 12 pipe-separated groups when the AI breaks them
+ *    across lines) still match.
  *  - Strips markdown code fence around replaceString.
  *  - Drops scripts whose findRegex fails to compile (with debug log).
  */
@@ -61,9 +97,10 @@ export function compileScripts(rawScripts: RawRegexScript[]): CompiledScript[] {
     if (!src || typeof src !== 'string') continue;
     const replace = stripCodeFence(s.replaceString ?? '');
 
+    const { pattern, flags } = parseRegexLiteral(src);
     let re: RegExp;
     try {
-      re = new RegExp(src, 'gs');
+      re = new RegExp(pattern, mergeFlags(flags));
     } catch (err) {
       console.debug(`[vishrun] script "${s.scriptName ?? '(unnamed)'}" findRegex failed to compile:`, err);
       continue;
@@ -137,7 +174,46 @@ export function compileScripts(rawScripts: RawRegexScript[]): CompiledScript[] {
       stripped.startsWith('<!DOCTYPE html>') && stripped.endsWith('</html>'),
       '[vishrun] stripCodeFence: Vavesta-shaped block unwraps cleanly',
     );
+
+    const r1 = parseRegexLiteral('/↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤/g');
+    console.assert(
+      r1.pattern === '↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤' && r1.flags === 'g',
+      '[vishrun] parseRegexLiteral: ↦/↤-delimited literal with g flag',
+    );
+
+    const r2 = parseRegexLiteral('【VAVESTA_HOME】');
+    console.assert(
+      r2.pattern === '【VAVESTA_HOME】' && r2.flags === '',
+      '[vishrun] parseRegexLiteral: non-literal placeholder passes through',
+    );
+
+    const r3 = parseRegexLiteral('<\\s*PACIFICA_UI\\s*>([\\s\\S]*?)<\\s*\\/PACIFICA_UI\\s*>');
+    console.assert(
+      r3.pattern === '<\\s*PACIFICA_UI\\s*>([\\s\\S]*?)<\\s*\\/PACIFICA_UI\\s*>' && r3.flags === '',
+      '[vishrun] parseRegexLiteral: paired-tag source without delimiters passes through',
+    );
+
+    const r4 = parseRegexLiteral('/foo\\/bar/i');
+    console.assert(
+      r4.pattern === 'foo\\/bar' && r4.flags === 'i',
+      '[vishrun] parseRegexLiteral: escaped slash inside pattern is not a closer',
+    );
+
+    const r5 = parseRegexLiteral('/no closer');
+    console.assert(
+      r5.pattern === '/no closer' && r5.flags === '',
+      '[vishrun] parseRegexLiteral: unmatched leading / passes through',
+    );
+
+    console.assert(
+      mergeFlags('') === 'gs',
+      '[vishrun] mergeFlags: empty user flags → default gs',
+    );
+    console.assert(
+      [...mergeFlags('gi')].sort().join('') === 'gis',
+      '[vishrun] mergeFlags: dedupes g and adds i',
+    );
   } catch (err) {
-    console.error('[vishrun] stripCodeFence self-test threw:', err);
+    console.error('[vishrun] parse-regex-script self-test threw:', err);
   }
 })();

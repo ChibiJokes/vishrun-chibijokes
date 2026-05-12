@@ -85,6 +85,18 @@ function stripCodeFence(s) {
   const m = s.match(FENCE_RE);
   return m ? m[1] : s;
 }
+function parseRegexLiteral(s) {
+  const m = s.match(/^\s*\/((?:\\.|[^/\\])*)\/([gimsuy]*)\s*$/);
+  if (!m || !m[1])
+    return { pattern: s, flags: "" };
+  return { pattern: m[1], flags: m[2] };
+}
+function mergeFlags(userFlags) {
+  const set = new Set(["g", "s"]);
+  for (const f of userFlags)
+    set.add(f);
+  return Array.from(set).join("");
+}
 function compileScripts(rawScripts) {
   const out = [];
   for (let i = 0;i < rawScripts.length; i++) {
@@ -97,9 +109,10 @@ function compileScripts(rawScripts) {
     if (!src || typeof src !== "string")
       continue;
     const replace = stripCodeFence(s.replaceString ?? "");
+    const { pattern, flags } = parseRegexLiteral(src);
     let re;
     try {
-      re = new RegExp(src, "gs");
+      re = new RegExp(pattern, mergeFlags(flags));
     } catch (err) {
       console.debug(`[vishrun] script "${s.scriptName ?? "(unnamed)"}" findRegex failed to compile:`, err);
       continue;
@@ -138,8 +151,20 @@ no fence here`;
     const t7 = '```html\n<!DOCTYPE html>\n<html lang="en">\n<body><div class="vav-home-wrap"></div></body>\n</html>\n```';
     const stripped = stripCodeFence(t7);
     console.assert(stripped.startsWith("<!DOCTYPE html>") && stripped.endsWith("</html>"), "[vishrun] stripCodeFence: Vavesta-shaped block unwraps cleanly");
+    const r1 = parseRegexLiteral("/↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤/g");
+    console.assert(r1.pattern === "↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤" && r1.flags === "g", "[vishrun] parseRegexLiteral: ↦/↤-delimited literal with g flag");
+    const r2 = parseRegexLiteral("【VAVESTA_HOME】");
+    console.assert(r2.pattern === "【VAVESTA_HOME】" && r2.flags === "", "[vishrun] parseRegexLiteral: non-literal placeholder passes through");
+    const r3 = parseRegexLiteral("<\\s*PACIFICA_UI\\s*>([\\s\\S]*?)<\\s*\\/PACIFICA_UI\\s*>");
+    console.assert(r3.pattern === "<\\s*PACIFICA_UI\\s*>([\\s\\S]*?)<\\s*\\/PACIFICA_UI\\s*>" && r3.flags === "", "[vishrun] parseRegexLiteral: paired-tag source without delimiters passes through");
+    const r4 = parseRegexLiteral("/foo\\/bar/i");
+    console.assert(r4.pattern === "foo\\/bar" && r4.flags === "i", "[vishrun] parseRegexLiteral: escaped slash inside pattern is not a closer");
+    const r5 = parseRegexLiteral("/no closer");
+    console.assert(r5.pattern === "/no closer" && r5.flags === "", "[vishrun] parseRegexLiteral: unmatched leading / passes through");
+    console.assert(mergeFlags("") === "gs", "[vishrun] mergeFlags: empty user flags → default gs");
+    console.assert([...mergeFlags("gi")].sort().join("") === "gis", "[vishrun] mergeFlags: dedupes g and adds i");
   } catch (err) {
-    console.error("[vishrun] stripCodeFence self-test threw:", err);
+    console.error("[vishrun] parse-regex-script self-test threw:", err);
   }
 })();
 
