@@ -1,3 +1,4 @@
+import type { SpindleAPI } from 'lumiverse-spindle-types';
 import { api, varsLog } from './common';
 
 // Frontend → backend: resolve a batch of `{{macro}}` widget templates via the
@@ -11,6 +12,10 @@ interface ResolveMacrosRequest {
   characterId?: string;
   templates: string[];
 }
+
+// Structural slice of SpindleAPI.variables used by applyAndStripSetvars.
+// Lets the self-test inject a fake without dragging the full API in.
+type VarsApi = Pick<SpindleAPI['variables'], 'local' | 'chat' | 'global'>;
 
 function isResolveMacrosRequest(p: unknown): p is ResolveMacrosRequest {
   if (!p || typeof p !== 'object') return false;
@@ -65,6 +70,72 @@ function unmaskInvalidMacros(text: string, masks: string[]): string {
   return text.replace(SENTINEL_RE, (_m, idx: string) => masks[Number(idx)] ?? '');
 }
 
+// ─── Apply + strip `{{setvar/setchatvar/setgvar/setglobalvar}}` ──────────────
+//
+// `api.macros.resolve` does NOT persist setvars: the env Map built per call is
+// discarded after evaluate(), regardless of `commit`. So {{setvar::yen::5000}}
+// inside a widget template evaluates but vanishes — the next widget's
+// {{getvar::yen}} sees nothing. To fix: detect setvars BEFORE the resolve,
+// apply them via api.variables.*.set (which writes to chat.metadata), strip
+// them from the template, and let the rest of the macros resolve as usual.
+// addvar/incvar/decvar (arithmetic ops on existing vars) and nested {{...}}
+// values are NOT handled here — they pass through to the engine with
+// commit:false and no-op. Re-enable if a card in scope needs them.
+const SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/g;
+const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+
+export async function applyAndStripSetvars(
+  template: string,
+  chatId: string,
+  userId: string,
+  vars: VarsApi = api.variables,
+): Promise<string> {
+  interface SetvarMatch { start: number; end: number; kind: string; name: string; value: string }
+  const matches: SetvarMatch[] = [];
+  for (const m of template.matchAll(SETVAR_RE)) {
+    const [match, kind, name, value] = m;
+    matches.push({ start: m.index!, end: m.index! + match.length, kind, name, value });
+  }
+  if (matches.length === 0) return template;
+
+  const stripFlags = new Array(matches.length).fill(false);
+  for (let i = 0; i < matches.length; i++) {
+    const { kind, name, value } = matches[i];
+    if (!NAME_RE.test(name)) continue;
+    try {
+      if (kind === 'setvar') {
+        await vars.local.set(chatId, name, value);
+        stripFlags[i] = true;
+      } else if (kind === 'setchatvar') {
+        await vars.chat.set(chatId, name, value);
+        stripFlags[i] = true;
+      } else {
+        // setgvar / setglobalvar — DISABLED this iteration.
+        // Lumiverse-host split: api.variables.global.set writes to
+        // settings.macro_variables_global, but {{getgvar}} reads from
+        // chat.metadata.macro_variables.global (MacroEnv.ts:105). Setting via
+        // API wouldn't be visible to the subsequent resolve. Re-enable when
+        // upstream unifies the read/write paths. For now: leave the match in
+        // the template (no strip) so the engine still no-ops it via commit:false.
+        varsLog.debug(`skipping ${kind} (upstream get/set path split):`, { name, userId });
+      }
+    } catch (err) {
+      varsLog.warn('setvar persist failed:', { kind, name, err: err instanceof Error ? err.message : String(err) });
+    }
+  }
+
+  let out = '';
+  let cursor = 0;
+  for (let i = 0; i < matches.length; i++) {
+    const { start, end } = matches[i];
+    out += template.slice(cursor, start);
+    if (!stripFlags[i]) out += template.slice(start, end);
+    cursor = end;
+  }
+  out += template.slice(cursor);
+  return out;
+}
+
 export function installMacroResolveHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (!isResolveMacrosRequest(payload)) return;
@@ -73,8 +144,13 @@ export function installMacroResolveHandler(): void {
       const results: string[] = new Array(templates.length);
       for (let i = 0; i < templates.length; i++) {
         const original = templates[i];
-        const { masked, masks } = maskInvalidMacros(original);
         try {
+          // Persist + strip setvars first so subsequent {{getvar}} on the same
+          // chat (and within this same template) reads the freshly set value
+          // when the engine resolves. addvar/etc. and disabled gvars pass
+          // through to the engine no-op via commit:false.
+          const stripped = await applyAndStripSetvars(original, chatId, userId);
+          const { masked, masks } = maskInvalidMacros(stripped);
           // userId — required for operator-scoped extensions (which is how Vishrun
           // installs); the host injects it as onFrontendMessage's 2nd arg.
           // commit:false — `{{setvar}}` that happens to appear in widget HTML
@@ -100,3 +176,67 @@ export function installMacroResolveHandler(): void {
     })();
   });
 }
+
+// ─── In-module sanity tests for applyAndStripSetvars ────────────────────────
+// Runs once at import time, like classify-trigger.ts. Cheap; uses a fake
+// `vars` injected via the optional 4th param. Wrapped so any assertion failure
+// logs but never crashes the extension.
+(function selfTest() {
+  try {
+    interface Call { scope: 'local' | 'chat' | 'global'; args: unknown[] }
+    function makeFakeVars(opts?: { throwOn?: { scope: 'local' | 'chat' | 'global'; key: string } }): { vars: VarsApi; calls: Call[] } {
+      const calls: Call[] = [];
+      const mk = (scope: 'local' | 'chat' | 'global') => async (...args: unknown[]) => {
+        const keyArg = scope === 'global' ? args[0] : args[1];
+        if (opts?.throwOn && opts.throwOn.scope === scope && opts.throwOn.key === keyArg) {
+          throw new Error(`fake set throws for ${scope}/${keyArg}`);
+        }
+        calls.push({ scope, args });
+      };
+      const vars = {
+        local: { set: mk('local') },
+        chat: { set: mk('chat') },
+        global: { set: mk('global') },
+      } as unknown as VarsApi;
+      return { vars, calls };
+    }
+
+    const CHAT = 'chatX';
+    const USER = 'userX';
+    const ck = async (label: string, input: string, expectOut: string, expectCalls: Call[], throwOn?: { scope: 'local' | 'chat' | 'global'; key: string }) => {
+      const { vars, calls } = makeFakeVars({ throwOn });
+      const out = await applyAndStripSetvars(input, CHAT, USER, vars);
+      console.assert(out === expectOut, `[vishrun] applyAndStripSetvars: ${label} → expected out ${JSON.stringify(expectOut)}, got ${JSON.stringify(out)}`);
+      const callsOk = JSON.stringify(calls) === JSON.stringify(expectCalls);
+      console.assert(callsOk, `[vishrun] applyAndStripSetvars: ${label} → expected calls ${JSON.stringify(expectCalls)}, got ${JSON.stringify(calls)}`);
+    };
+
+    // Run async; collect failures via console.assert. Caught by outer try.
+    void (async () => {
+      await ck('single setvar local', '{{setvar::yen::5000}}foo', 'foo', [{ scope: 'local', args: [CHAT, 'yen', '5000'] }]);
+      await ck('multiple setvars in order', '{{setvar::yen::5000}}{{setvar::grade::Grade 2}}foo', 'foo', [
+        { scope: 'local', args: [CHAT, 'yen', '5000'] },
+        { scope: 'local', args: [CHAT, 'grade', 'Grade 2'] },
+      ]);
+      await ck('duplicate name applied in document order', '{{setvar::yen::5000}}foo{{setvar::yen::6000}}bar', 'foobar', [
+        { scope: 'local', args: [CHAT, 'yen', '5000'] },
+        { scope: 'local', args: [CHAT, 'yen', '6000'] },
+      ]);
+      await ck('invalid NAME left in template, not applied', '{{setvar::1bad::x}}foo', '{{setvar::1bad::x}}foo', []);
+      // setgvar/setglobalvar — DISABLED this iteration; match preserved, no calls.
+      await ck('setgvar disabled — not stripped, no call', '{{setgvar::level::99}}foo', '{{setgvar::level::99}}foo', []);
+      await ck('setglobalvar disabled — not stripped, no call', '{{setglobalvar::level::99}}foo', '{{setglobalvar::level::99}}foo', []);
+      await ck('setchatvar routes to chat namespace', '{{setchatvar::loc::Tokyo}}foo', 'foo', [{ scope: 'chat', args: [CHAT, 'loc', 'Tokyo'] }]);
+      await ck('JSX inline style untouched, setvar stripped', `<div style={{position:'absolute'}}>{{setvar::yen::5000}}</div>`, `<div style={{position:'absolute'}}></div>`, [
+        { scope: 'local', args: [CHAT, 'yen', '5000'] },
+      ]);
+      await ck('empty value', '{{setvar::yen::}}foo', 'foo', [{ scope: 'local', args: [CHAT, 'yen', ''] }]);
+      await ck('set throws → match not stripped', '{{setvar::yen::5000}}foo', '{{setvar::yen::5000}}foo', [], { scope: 'local', key: 'yen' });
+      await ck('mix setvar + getvar — setvar stripped, getvar untouched', '{{setvar::yen::5000}}precio={{getvar::yen}}', 'precio={{getvar::yen}}', [
+        { scope: 'local', args: [CHAT, 'yen', '5000'] },
+      ]);
+    })();
+  } catch (err) {
+    console.error('[vishrun] applyAndStripSetvars self-test threw:', err);
+  }
+})();

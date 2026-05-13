@@ -61,12 +61,12 @@ function isPlaceholder(re) {
 }
 function isPairedTag(re) {
   const src = re.source;
-  const stripped = src.replace(/\\s\*/g, "").replace(/\s+/g, "").replace(/\\\//g, "/");
-  const open = stripped.match(/^<([a-zA-Z_][a-zA-Z0-9_-]*)/);
+  const stripped = src.replace(/\\s\*/g, "").replace(/\\\//g, "/");
+  const open = stripped.match(/^\s*<\s*([a-zA-Z_][a-zA-Z0-9_-]*)/);
   if (!open)
     return false;
   const tagName = open[1];
-  const closeRe = new RegExp(`</${escapeRegex(tagName)}\\b`);
+  const closeRe = new RegExp(`</\\s*${escapeRegex(tagName)}\\s*>`);
   return closeRe.test(stripped);
 }
 var DELIM_PAIRS = [
@@ -151,6 +151,8 @@ function escapeRegex(s) {
     ck(/<StatusPlaceHolderImpl\/>/, "placeholder", "self-closing tag, no captures");
     ck(/<status_top>([\s\S]*?)<\/status_top>/, "pairedTag", "paired tag with capture");
     ck(/<phone app="([^"]*)">([\s\S]*?)<\/phone>/, "pairedTag", "paired tag with attr + captures");
+    ck(/<phone a="x" b="y">([\s\S]*?)<\/phone>/, "pairedTag", "paired tag with multiple attrs");
+    ck(/<my-widget>([\s\S]*?)<\/my-widget>/, "pairedTag", "paired tag with dash in name");
     ck(/【SYS_HUD \| Loc: (.*?) \| Time: (.*?)】/, "delimitedCapture", "【】 with captures");
     ck(/『Present Characters Start』([\s\S]*?)『Present Characters End』/, "delimitedCapture", "『』 block with capture");
     ck(/↦(\S+)\s([^:]+):([\s\S]*?)↤/, "delimitedCapture", "↦↤ with captures");

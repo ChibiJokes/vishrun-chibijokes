@@ -97,20 +97,24 @@ export function isPlaceholder(re: RegExp): boolean {
 export function isPairedTag(re: RegExp): boolean {
   const src = re.source;
   // Normalize for structural matching:
-  //  1. Drop `\s*` literal decorations (3-char sequence `\`, `s`, `*`).
-  //  2. Drop plain whitespace.
-  //  3. Replace `\/` with `/` (regex-escape style from /.../-delimited
-  //     copy-paste sources).
-  // After these, paired tags reduce to a clean `<TAGNAME>...</TAGNAME>`.
+  //  1. Drop `\s*` literal decorations (3-char sequence `\`, `s`, `*`) so
+  //     paranoia-decorated tags like `<\s*TAG\s*>` reduce to `<TAG>`.
+  //  2. Replace `\/` with `/` (regex-escape style from /.../-delimited
+  //     copy-paste sources) so `<\/TAG>` reduces to `</TAG>`.
+  // Do NOT globally collapse whitespace — that destroys the space between
+  // tag name and attributes (e.g. `<phone app="X">` → `<phoneapp="X">`),
+  // which made attr-bearing paired tags misclassify as `unknown`.
   const stripped = src
     .replace(/\\s\*/g, '')
-    .replace(/\s+/g, '')
     .replace(/\\\//g, '/');
 
-  const open = stripped.match(/^<([a-zA-Z_][a-zA-Z0-9_-]*)/);
+  // Tag name is the first identifier after `<` (whitespace tolerated on
+  // either side of `<`); it ends at whitespace, `>`, `/`, or attribute.
+  const open = stripped.match(/^\s*<\s*([a-zA-Z_][a-zA-Z0-9_-]*)/);
   if (!open) return false;
   const tagName = open[1];
-  const closeRe = new RegExp(`</${escapeRegex(tagName)}\\b`);
+  // Close form: `</TAG>` with optional whitespace inside the closing tag.
+  const closeRe = new RegExp(`</\\s*${escapeRegex(tagName)}\\s*>`);
   return closeRe.test(stripped);
 }
 
@@ -223,6 +227,8 @@ function escapeRegex(s: string): string {
     ck(/<StatusPlaceHolderImpl\/>/, 'placeholder', 'self-closing tag, no captures');
     ck(/<status_top>([\s\S]*?)<\/status_top>/, 'pairedTag', 'paired tag with capture');
     ck(/<phone app="([^"]*)">([\s\S]*?)<\/phone>/, 'pairedTag', 'paired tag with attr + captures');
+    ck(/<phone a="x" b="y">([\s\S]*?)<\/phone>/, 'pairedTag', 'paired tag with multiple attrs');
+    ck(/<my-widget>([\s\S]*?)<\/my-widget>/, 'pairedTag', 'paired tag with dash in name');
     ck(/【SYS_HUD \| Loc: (.*?) \| Time: (.*?)】/, 'delimitedCapture', '【】 with captures');
     ck(/『Present Characters Start』([\s\S]*?)『Present Characters End』/, 'delimitedCapture', '『』 block with capture');
     ck(/↦(\S+)\s([^:]+):([\s\S]*?)↤/, 'delimitedCapture', '↦↤ with captures');
