@@ -1,7 +1,11 @@
 /**
- * Apply `$0` and `$1..$N` backreferences in a card's `replaceString`.
+ * Apply `$0` / `$1..$N` backreferences and the `{{match}}` macro in a card's
+ * `replaceString`.
  *
- *  - `$0` → the full match string (entire trigger).
+ *  - `$0` / `{{match}}` → the full match string (entire trigger). `{{match}}`
+ *    is the SillyTavern regex-context macro; Lumiverse's macro engine has no
+ *    such macro, so we expand it here while the full match is in hand (used by
+ *    the Jujutsu Check scripts, `{{setvar::var::$N}}{{match}}`).
  *  - `$1..$N` → 1-indexed capture groups.
  *  - `$$`   → escaped literal `$` (defensive — none of the cards in scope
  *             use it, but the standard String.replace contract includes it).
@@ -17,6 +21,11 @@ export function substitute(template: string, fullMatch: string, groups: string[]
   let i = 0;
   while (i < template.length) {
     const ch = template[i];
+    if (ch === '{' && template.slice(i, i + 9).toLowerCase() === '{{match}}') {
+      out += fullMatch;
+      i += 9;
+      continue;
+    }
     if (ch !== '$') {
       out += ch;
       i++;

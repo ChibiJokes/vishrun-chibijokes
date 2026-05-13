@@ -25,6 +25,9 @@ function clearActiveCard() {
 }
 
 // src/core/classify-trigger.ts
+function isPlaceholderLikeKind(kind) {
+  return kind === "placeholder" || kind === "delimitedCapture";
+}
 function isPlaceholder(re) {
   const src = re.source;
   let i = 0;
@@ -66,16 +69,99 @@ function isPairedTag(re) {
   const closeRe = new RegExp(`</${escapeRegex(tagName)}\\b`);
   return closeRe.test(stripped);
 }
+var DELIM_PAIRS = [
+  ["【", "】"],
+  ["「", "」"],
+  ["《", "》"],
+  ["『", "』"],
+  ["↦", "↤"]
+];
+function hasRealCapture(src) {
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === "\\") {
+      i += 2;
+      continue;
+    }
+    if (ch === "[") {
+      i++;
+      while (i < src.length && src[i] !== "]") {
+        i += src[i] === "\\" ? 2 : 1;
+      }
+      i++;
+      continue;
+    }
+    if (ch === "(") {
+      const a = src.slice(i + 1, i + 3);
+      const grouping = a === "?:" || a === "?=" || a === "?!" || a[0] === "?" && a[1] === "<";
+      if (!grouping)
+        return true;
+    }
+    i++;
+  }
+  return false;
+}
+function textualMarkerName(src, kw) {
+  const i = src.indexOf(kw);
+  if (i < 0)
+    return null;
+  const rest = src.slice(i + kw.length);
+  const end = rest.search(/\\?\]/);
+  if (end < 0)
+    return null;
+  const name = rest.slice(0, end).replace(/\\s[*+]?/g, "").replace(/\\/g, "").replace(/\s+/g, " ").trim();
+  return name || null;
+}
+function isDelimitedCapture(re) {
+  const src = re.source;
+  if (!hasRealCapture(src))
+    return false;
+  const head = src.replace(/^(?:\\s[*+]?|\s)+/, "");
+  if (/^<[a-zA-Z_]/.test(head))
+    return false;
+  for (const [open, close] of DELIM_PAIRS) {
+    const oi = src.indexOf(open);
+    if (oi >= 0 && src.indexOf(close, oi + open.length) >= 0)
+      return true;
+  }
+  const n1 = textualMarkerName(src, "START OF");
+  const n2 = textualMarkerName(src, "END OF");
+  return !!n1 && n1 === n2;
+}
 function classifyTrigger(re) {
   if (isPairedTag(re))
     return "pairedTag";
   if (isPlaceholder(re))
     return "placeholder";
+  if (isDelimitedCapture(re))
+    return "delimitedCapture";
   return "unknown";
 }
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
+(function selfTest() {
+  try {
+    const ck = (re, expect, label) => {
+      const got = classifyTrigger(re);
+      console.assert(got === expect, `[vishrun] classifyTrigger: ${label} → expected ${expect}, got ${got}`);
+    };
+    ck(/【女王蜂】/, "placeholder", "【】 no captures");
+    ck(/<StatusPlaceHolderImpl\/>/, "placeholder", "self-closing tag, no captures");
+    ck(/<status_top>([\s\S]*?)<\/status_top>/, "pairedTag", "paired tag with capture");
+    ck(/<phone app="([^"]*)">([\s\S]*?)<\/phone>/, "pairedTag", "paired tag with attr + captures");
+    ck(/【SYS_HUD \| Loc: (.*?) \| Time: (.*?)】/, "delimitedCapture", "【】 with captures");
+    ck(/『Present Characters Start』([\s\S]*?)『Present Characters End』/, "delimitedCapture", "『』 block with capture");
+    ck(/↦(\S+)\s([^:]+):([\s\S]*?)↤/, "delimitedCapture", "↦↤ with captures");
+    ck(/「(.*?)」/, "delimitedCapture", "「」 with capture");
+    ck(/《(.*?)》/, "delimitedCapture", "《》 with capture");
+    ck(new RegExp("\\[\\s*START OF ANN SYS\\s*\\]([\\s\\S]*?)\\[\\s*END OF ANN SYS\\s*\\]"), "delimitedCapture", "[ START OF X ]…[ END OF X ] textual markers with capture");
+    ck(/foo(.*?)bar/, "unknown", "capture but no recognized delimiter");
+  } catch (err) {
+    console.error("[vishrun] classify-trigger self-test threw:", err);
+  }
+})();
 
 // src/core/parse-regex-script.ts
 var FENCE_RE = /^\s*```[A-Za-z]*[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```\s*$/;
@@ -119,7 +205,7 @@ function compileScripts(rawScripts) {
     }
     const kind = classifyTrigger(re);
     if (kind === "unknown") {
-      console.debug(`[vishrun] script "${s.scriptName ?? "(unnamed)"}" has unrecognized trigger shape ` + `(neither placeholder nor paired-tag) — will not render. findRegex: ${src}`);
+      console.debug(`[vishrun] script "${s.scriptName ?? "(unnamed)"}" has unrecognized trigger shape ` + `(not placeholder, paired-tag, nor delimited-capture) — will not render. findRegex: ${src}`);
     }
     out.push({
       id: s.id ?? `idx-${i}`,
@@ -132,7 +218,7 @@ function compileScripts(rawScripts) {
   }
   return out;
 }
-(function selfTest() {
+(function selfTest2() {
   try {
     const t1 = "```html\n<!DOCTYPE html>\n<body>x</body>\n```";
     console.assert(stripCodeFence(t1) === `<!DOCTYPE html>
@@ -174,6 +260,11 @@ function substitute(template, fullMatch, groups) {
   let i = 0;
   while (i < template.length) {
     const ch = template[i];
+    if (ch === "{" && template.slice(i, i + 9).toLowerCase() === "{{match}}") {
+      out += fullMatch;
+      i += 9;
+      continue;
+    }
     if (ch !== "$") {
       out += ch;
       i++;
@@ -1161,7 +1252,77 @@ function extractTagName(reSource) {
   return m ? m[1] : null;
 }
 
+// src/core/macro-detection.ts
+var MACRO_RE = /\{\{\s*[A-Za-z_@$][\w@$]*\s*(?:::|\}\})/;
+function hasMacros(html) {
+  return MACRO_RE.test(html);
+}
+
+// src/core/macro-resolver.ts
+function isResolveMacrosResponse(p, requestId) {
+  return !!p && typeof p === "object" && p.type === "resolve_macros_response" && p.requestId === requestId && Array.isArray(p.results);
+}
+var requestCounter2 = 0;
+function nextRequestId2() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `vishrun-rm-${Date.now()}-${++requestCounter2}`;
+}
+var RESOLVE_TIMEOUT_MS = 5000;
+function resolveMacrosBatch(ctx, chatId, characterId, templates, timeoutMs = RESOLVE_TIMEOUT_MS) {
+  if (templates.length === 0)
+    return Promise.resolve([]);
+  return new Promise((resolve, reject) => {
+    const requestId = nextRequestId2();
+    let settled = false;
+    let unsub = null;
+    let timer = null;
+    const finish = (run) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try {
+          unsub();
+        } catch {}
+        unsub = null;
+      }
+      run();
+    };
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isResolveMacrosResponse(payload, requestId))
+        return;
+      if (payload.results.length === templates.length && payload.results.every((r) => typeof r === "string")) {
+        const results = payload.results;
+        finish(() => resolve(results));
+      } else {
+        finish(() => reject(new Error("resolve_macros malformed response")));
+      }
+    });
+    timer = setTimeout(() => {
+      finish(() => reject(new Error("resolve_macros timeout")));
+    }, timeoutMs);
+    try {
+      ctx.sendToBackend({
+        type: "resolve_macros",
+        requestId,
+        chatId,
+        characterId: characterId ?? undefined,
+        templates
+      });
+    } catch (err) {
+      finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+    }
+  });
+}
+
 // src/render/inject-into-message.ts
+var resolutionCache = new Map;
 async function processNode(root, scripts, ctx) {
   const messageId = root.getAttribute("data-message-id") || undefined;
   if (!messageId) {
@@ -1169,20 +1330,80 @@ async function processNode(root, scripts, ctx) {
   }
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
+  const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
   let total = 0;
   try {
     for (const script of scripts) {
-      if (script.kind !== "placeholder")
+      if (!isPlaceholderLikeKind(script.kind))
         continue;
-      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx);
+      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
     }
-    total += await renderPairedTagCaptures(root, scripts, messageId, ctx);
+    total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
   } catch (err) {
     console.debug("[vishrun] processNode render error:", err);
   }
   return total;
 }
-async function replacePlaceholderMatches(root, script, allScripts, messageId, ctx) {
+async function resolveMacrosForMessage(root, scripts, messageId, ctx) {
+  const map = new Map;
+  if (!scripts.some((s) => s.replaceString.includes("{{")))
+    return map;
+  const templates = collectExpandedTemplates(root, scripts, messageId).filter(hasMacros);
+  if (templates.length === 0)
+    return map;
+  const { chatId, characterId } = ctx.getActiveChat();
+  if (!chatId) {
+    console.warn("[vishrun:variables] no active chatId; widget macros left unresolved");
+    return map;
+  }
+  try {
+    const resolved = await resolveMacrosBatch(ctx, chatId, characterId, templates);
+    templates.forEach((t, i) => {
+      map.set(t, resolved[i]);
+      resolutionCache.set(t, resolved[i]);
+    });
+  } catch (err) {
+    console.warn("[vishrun:variables] macro resolve failed; widgets render unresolved:", err instanceof Error ? err.message : String(err));
+  }
+  return map;
+}
+function collectExpandedTemplates(root, scripts, messageId) {
+  const out = new Set;
+  const textNodes = collectTextNodes(root);
+  for (const script of scripts) {
+    if (!isPlaceholderLikeKind(script.kind))
+      continue;
+    for (const tn of textNodes) {
+      const text = tn.nodeValue ?? "";
+      if (!text)
+        continue;
+      script.findRe.lastIndex = 0;
+      let m;
+      while ((m = script.findRe.exec(text)) !== null) {
+        const groups = m.slice(1).map((g) => g ?? "");
+        const html = substitute(script.replaceString, m[0], groups);
+        out.add(applyNestedPipeline(html, scripts, new Set([script.id]), 0));
+        if (m[0].length === 0)
+          script.findRe.lastIndex++;
+      }
+    }
+  }
+  const target = findContentRoot(root);
+  for (const cap of getCapturesForMessage(messageId)) {
+    const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
+    if (target.querySelector(sel))
+      continue;
+    cap.findRe.lastIndex = 0;
+    const m = cap.findRe.exec(cap.fullMatch);
+    if (!m)
+      continue;
+    const groups = m.slice(1).map((g) => g ?? "");
+    const html = substitute(cap.replaceString, m[0], groups);
+    out.add(applyNestedPipeline(html, scripts, new Set([cap.scriptId]), 0));
+  }
+  return [...out];
+}
+async function replacePlaceholderMatches(root, script, allScripts, messageId, ctx, resolvedMap) {
   const textNodes = collectTextNodes(root);
   let count = 0;
   let hasFreshMatch = false;
@@ -1225,7 +1446,10 @@ async function replacePlaceholderMatches(root, script, allScripts, messageId, ct
       const groups = match.slice(1).map((g) => g ?? "");
       const html = substitute(script.replaceString, match[0], groups);
       const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
-      const widget = await buildWidget(expanded, script.scriptName, script.id, messageId, ctx);
+      const fromMap = resolvedMap.get(expanded);
+      const fromCache = fromMap ?? resolutionCache.get(expanded);
+      const finalHtml = fromCache ?? expanded;
+      const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -1242,7 +1466,7 @@ async function replacePlaceholderMatches(root, script, allScripts, messageId, ct
   }
   return count;
 }
-async function renderPairedTagCaptures(root, allScripts, messageId, ctx) {
+async function renderPairedTagCaptures(root, allScripts, messageId, ctx, resolvedMap) {
   const captures = getCapturesForMessage(messageId);
   const target = findContentRoot(root);
   let added = 0;
@@ -1285,7 +1509,10 @@ async function renderPairedTagCaptures(root, allScripts, messageId, ctx) {
     const groups = m.slice(1).map((g) => g ?? "");
     const html = substitute(cap.replaceString, m[0], groups);
     const expanded = applyNestedPipeline(html, allScripts, new Set([cap.scriptId]), 0);
-    const iframe = await buildWidgetIframe(expanded, cap.scriptName, cap.scriptId, messageId, ctx);
+    const fromMap = resolvedMap.get(expanded);
+    const fromCache = fromMap ?? resolutionCache.get(expanded);
+    const finalHtml = fromCache ?? expanded;
+    const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute("data-vishrun-paired-fullmatch", hashKey(cap.fullMatch));
     if (!target.isConnected || target.querySelector(sel)) {
       destroyWidgetIframe(iframe);

@@ -1,5 +1,6 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
+import { isPlaceholderLikeKind } from '../core/classify-trigger';
 import { substitute } from '../core/substitute';
 import { applyNestedPipeline } from '../core/nested-pipeline';
 import {
@@ -11,16 +12,39 @@ import {
   widgetNeedsIsolation,
 } from './widget-iframe';
 import { getCapturesForMessage } from '../hooks/tag-interceptor';
+import { hasMacros } from '../core/macro-detection';
+import { resolveMacrosBatch } from '../core/macro-resolver';
+
+// Expanded widget HTML → macro-resolved HTML, for one processNode pass.
+type ResolvedMap = Map<string, string>;
+
+// Global cache of macro resolutions. Key: expanded raw template (what was sent
+// to the backend). Value: resolved HTML (what the backend returned). Lives
+// across processNode passes so replacePlaceholderMatches can recover the
+// resolution even when the current run's map is empty — which happens when
+// processNode re-fires after the first render: collectExpandedTemplates returns
+// 0 (the matched text now lives inside a [data-vishrun-widget], so it's excluded
+// from the text-node scan) → no resolve → empty map → otherwise a MISS → raw
+// `{{getvar::}}` re-rendered into the DOM.
+//
+// Limitation: not invalidated when variables change. If a /setvar mutates
+// player_grade mid-session, widgets with a cached entry keep showing the old
+// value. A browser refresh clears the cache. Acceptable for the current use
+// case (variables are set up front, rarely mutate).
+const resolutionCache = new Map<string, string>();
 
 /**
  * Process a single message DOM. Two pipelines, kept separate per the
  * Step 3 design constraint:
  *
  *   1. Placeholder pipeline (Step 2 + iframe extension)
- *      For each compiled placeholder script, find every match in the
- *      message's text nodes and replace with a widget. The widget is a
- *      <div> with innerHTML if the replaceString has no <script>, or a
- *      sandboxed iframe if it does.
+ *      For each compiled placeholder-like script (`placeholder` and
+ *      `delimitedCapture` — Fix B), find every match in the message's text
+ *      nodes and replace with a widget. The widget is a <div> with innerHTML
+ *      if the replaceString has no <script>, or a sandboxed iframe if it does.
+ *      `delimitedCapture` scripts (`【…(…)…】`, `↦…↤`, `[START OF X]…[END OF X]`,
+ *      etc.) survive DOMPurify just like plain placeholders, so they share
+ *      this path; `$N` substitution handles their capture groups.
  *
  *   2. Paired-tag pipeline (Step 3)
  *      Read the captures map populated by tag-interceptor.ts. For each
@@ -54,6 +78,11 @@ export async function processNode(
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
 
+  // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
+  // widget HTML before any widget is built. Always returns a map; missing
+  // entries → widget renders the raw template (no worse than pre-MVU-lite).
+  const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
+
   let total = 0;
   // Widget building is async now (buildWidgetIframe → injectShimsAndSizeReporter
   // → transformHtmlForTailwind may fetch the Tailwind bundle on first use).
@@ -61,18 +90,109 @@ export async function processNode(
   // callers (scanAllNow / processMessageById) and so a later scan can retry.
   try {
     for (const script of scripts) {
-      // Only placeholder triggers run through the post-DOMPurify text scan.
-      // pairedTag scripts go through registerTagInterceptor (pre-sanitizer)
-      // and surface here as captures via getCapturesForMessage. unknown
-      // scripts are skipped (logged once at compile time).
-      if (script.kind !== 'placeholder') continue;
-      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx);
+      // placeholder + delimitedCapture run through the post-DOMPurify text scan.
+      // pairedTag scripts go through registerTagInterceptor (pre-sanitizer) and
+      // surface here as captures via getCapturesForMessage. unknown is skipped
+      // (logged once at compile time).
+      if (!isPlaceholderLikeKind(script.kind)) continue;
+      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
     }
-    total += await renderPairedTagCaptures(root, scripts, messageId, ctx);
+    total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
   } catch (err) {
     console.debug('[vishrun] processNode render error:', err);
   }
   return total;
+}
+
+// ─── Macro resolution ──────────────────────────────────────────────────
+
+// Resolve this message's widget macros in one backend round-trip. Returns a map
+// keyed by the exact expanded HTML the render functions recompute, so their
+// `get(expanded) ?? expanded` lookup picks up the resolved version. Best-effort:
+// any failure (no macros, no chatId, timeout, error) → partial/empty map →
+// widgets render raw (pre-MVU-lite behaviour). Never throws.
+async function resolveMacrosForMessage(
+  root: HTMLElement,
+  scripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<ResolvedMap> {
+  const map: ResolvedMap = new Map();
+  // Fast out: if no script's replaceString has `{{` at all, no expanded HTML
+  // (even after nested expansion) can carry a macro — skip the whole pass.
+  if (!scripts.some((s) => s.replaceString.includes('{{'))) return map;
+  const templates = collectExpandedTemplates(root, scripts, messageId).filter(hasMacros);
+  if (templates.length === 0) return map;
+
+  const { chatId, characterId } = ctx.getActiveChat();
+  if (!chatId) {
+    console.warn('[vishrun:variables] no active chatId; widget macros left unresolved');
+    return map;
+  }
+
+  try {
+    const resolved = await resolveMacrosBatch(ctx, chatId, characterId, templates);
+    templates.forEach((t, i) => {
+      map.set(t, resolved[i]);
+      resolutionCache.set(t, resolved[i]); // global cache, survives across processNode passes
+    });
+  } catch (err) {
+    console.warn(
+      '[vishrun:variables] macro resolve failed; widgets render unresolved:',
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  return map;
+}
+
+// Read-only pass mirroring what the render functions would compute as the
+// per-widget expanded HTML, without touching the DOM. Recomputing the same
+// (deterministic) substitute()+applyNestedPipeline() there makes the map lookup
+// hit — unless the DOM changed under us, in which case that widget renders
+// unresolved (acceptable). Skips already-rendered paired captures so re-scans
+// don't re-resolve.
+function collectExpandedTemplates(
+  root: HTMLElement,
+  scripts: CompiledScript[],
+  messageId: string,
+): string[] {
+  const out = new Set<string>();
+
+  // Placeholder-like scripts (placeholder + delimitedCapture): scan text nodes
+  // outside existing widgets. After a render the matched text lives inside a
+  // [data-vishrun-widget], so re-scans collect nothing here and skip the round-trip.
+  const textNodes = collectTextNodes(root);
+  for (const script of scripts) {
+    if (!isPlaceholderLikeKind(script.kind)) continue;
+    for (const tn of textNodes) {
+      const text = tn.nodeValue ?? '';
+      if (!text) continue;
+      script.findRe.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = script.findRe.exec(text)) !== null) {
+        const groups = m.slice(1).map((g) => g ?? '');
+        const html = substitute(script.replaceString, m[0], groups);
+        out.add(applyNestedPipeline(html, scripts, new Set([script.id]), 0));
+        if (m[0].length === 0) script.findRe.lastIndex++;
+      }
+    }
+  }
+
+  // Paired-tag captures: skip ones already on screen (matches the idempotency
+  // check in renderPairedTagCaptures) so re-scans don't re-resolve them.
+  const target = findContentRoot(root);
+  for (const cap of getCapturesForMessage(messageId)) {
+    const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
+    if (target.querySelector(sel)) continue;
+    cap.findRe.lastIndex = 0;
+    const m = cap.findRe.exec(cap.fullMatch);
+    if (!m) continue; // failed re-match renders raw text — no macros
+    const groups = m.slice(1).map((g) => g ?? '');
+    const html = substitute(cap.replaceString, m[0], groups);
+    out.add(applyNestedPipeline(html, scripts, new Set([cap.scriptId]), 0));
+  }
+
+  return [...out];
 }
 
 // ─── Placeholder pipeline ──────────────────────────────────────────────
@@ -83,6 +203,7 @@ async function replacePlaceholderMatches(
   allScripts: CompiledScript[],
   messageId: string,
   ctx: SpindleFrontendContext,
+  resolvedMap: ResolvedMap,
 ): Promise<number> {
   const textNodes = collectTextNodes(root);
   let count = 0;
@@ -146,9 +267,15 @@ async function replacePlaceholderMatches(
       // Recursively substitute any nested tags this card's other scripts
       // match before the HTML goes into a widget (one iframe, whole tree).
       const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
+      // Macro-resolved HTML: the current run's map first, then the global
+      // resolutionCache (survives across processNode passes — see its comment),
+      // then the raw template as last resort.
+      const fromMap = resolvedMap.get(expanded);
+      const fromCache = fromMap ?? resolutionCache.get(expanded);
+      const finalHtml = fromCache ?? expanded;
       // await: buildWidget → buildWidgetIframe → injectShimsAndSizeReporter
       // may fetch the Tailwind bundle (cached after the first use).
-      const widget = await buildWidget(expanded, script.scriptName, script.id, messageId, ctx);
+      const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
       cursor = end;
       count++;
@@ -181,6 +308,7 @@ async function renderPairedTagCaptures(
   allScripts: CompiledScript[],
   messageId: string,
   ctx: SpindleFrontendContext,
+  resolvedMap: ResolvedMap,
 ): Promise<number> {
   const captures = getCapturesForMessage(messageId);
   const target = findContentRoot(root);
@@ -259,12 +387,16 @@ async function renderPairedTagCaptures(
     // Recursively substitute nested tags (Satoru Bottom2's <role_npc> blocks)
     // before the HTML goes into the iframe — one frame, whole nested tree.
     const expanded = applyNestedPipeline(html, allScripts, new Set([cap.scriptId]), 0);
+    // Macro-resolved HTML: current run's map → global resolutionCache → raw.
+    const fromMap = resolvedMap.get(expanded);
+    const fromCache = fromMap ?? resolutionCache.get(expanded);
+    const finalHtml = fromCache ?? expanded;
     // Paired-tag widgets always go through the iframe path. Vavesta
     // Court Ledger contains <script>, and even for hypothetical
     // script-free paired widgets the isolation is cheap insurance.
     // await: buildWidgetIframe → injectShimsAndSizeReporter may fetch the
     // Tailwind bundle (cached after the first use).
-    const iframe = await buildWidgetIframe(expanded, cap.scriptName, cap.scriptId, messageId, ctx);
+    const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     // Re-validate after the await: another scan may have inserted this
     // capture's widget, or a React rebuild may have detached `target`. In

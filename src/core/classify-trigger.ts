@@ -1,9 +1,10 @@
 /**
- * Trigger classification — three buckets:
+ * Trigger classification — four buckets:
  *
  *   - `placeholder` → trigger is a literal-ish marker that isn't shaped like
- *     an HTML tag (e.g. `【VAVESTA_HOME】`, `[STATUS]`). Renders via the
- *     post-DOMPurify text-node scan in `replacePlaceholderMatches`.
+ *     an HTML tag and has no capture groups (e.g. `【VAVESTA_HOME】`,
+ *     `<StatusPlaceHolderImpl/>`). Renders via the post-DOMPurify text-node
+ *     scan in `replacePlaceholderMatches`.
  *
  *   - `pairedTag` → trigger has `<TAGNAME>...</TAGNAME>` shape regardless of
  *     whether it carries capture groups. Pacifica University is the canonical
@@ -16,19 +17,30 @@
  *     KEEP_CONTENT). The interceptor fires PRE-sanitizer in
  *     `stripAndDispatchMessageTags` (`MessageContent.tsx:561`).
  *
- *   - `unknown` → trigger has captures or other regex structure but doesn't
- *     match the paired-tag shape. None of the cards in scope hit this; we
- *     log once at compile time so the card author has a hint if it ever
- *     surfaces.
+ *   - `delimitedCapture` → trigger has capture group(s) wrapped in a
+ *     recognized non-tag delimiter: a Unicode bracket pair (`【】` `「」` `《》`
+ *     `『』`, the asymmetric `↦↤`) or a symmetric `[ START OF X ]…[ END OF X ]`
+ *     textual block marker. Behaves like `placeholder` for DOM purposes (the
+ *     delimiters survive DOMPurify, so it goes through the text-node scan +
+ *     `$N` substitution). Jujutsu Kaisen World's HUD/Profile/Inventory lines,
+ *     Domain Clash, Inner Monologue, Present Characters, the Check scripts.
+ *
+ *   - `unknown` → has captures or other regex structure but matches none of
+ *     the above. We log once at compile time so the card author has a hint.
  *
  * Why we no longer use the "has capture group" heuristic alone: it conflates
  * "needs paired-tag pipeline" with "needs $N substitution". Pacifica needs
  * paired-tag (because of DOMPurify) but uses only `$0` (full match) — zero
  * captures. Vavesta Home is the inverse: placeholder shape, no captures.
- * The two axes are independent. Step 6 split them.
+ * The two axes are independent. Step 6 split them; Fix B added the fourth bucket.
  */
 
-export type TriggerKind = 'placeholder' | 'pairedTag' | 'unknown';
+export type TriggerKind = 'placeholder' | 'pairedTag' | 'delimitedCapture' | 'unknown';
+
+/** Kinds that render through the placeholder pipeline (text-node scan + $N). */
+export function isPlaceholderLikeKind(kind: TriggerKind): boolean {
+  return kind === 'placeholder' || kind === 'delimitedCapture';
+}
 
 /**
  * Heuristic: regex source has no unescaped, non-grouping `(`.
@@ -102,17 +114,127 @@ export function isPairedTag(re: RegExp): boolean {
   return closeRe.test(stripped);
 }
 
+// Unicode delimiter pairs Vishrun recognizes for `delimitedCapture` — symmetric
+// CJK brackets plus the asymmetric ↦…↤. Strict allowlist on purpose: a future
+// card with another delimiter gets added here, no generic wildcard.
+const DELIM_PAIRS: ReadonlyArray<readonly [open: string, close: string]> = [
+  ['【', '】'],
+  ['「', '」'],
+  ['《', '》'],
+  ['『', '』'],
+  ['↦', '↤'],
+];
+
 /**
- * Three-bucket classification. `pairedTag` wins over `placeholder` when both
- * could apply (Pacifica's regex satisfies `isPlaceholder` because it has no
- * captures, but it's structurally a paired tag and must go that route).
+ * Heuristic: regex source contains a `(` that opens a real capturing group —
+ * i.e. not `(?:`, `(?=`, `(?!`, or `(?<...` (lookbehind / named group). Skips
+ * escapes and char classes the same way `isPlaceholder` does.
+ */
+function hasRealCapture(src: string): boolean {
+  let i = 0;
+  while (i < src.length) {
+    const ch = src[i];
+    if (ch === '\\') { i += 2; continue; }
+    if (ch === '[') {
+      i++;
+      while (i < src.length && src[i] !== ']') { i += src[i] === '\\' ? 2 : 1; }
+      i++;
+      continue;
+    }
+    if (ch === '(') {
+      const a = src.slice(i + 1, i + 3);
+      const grouping = a === '?:' || a === '?=' || a === '?!' || (a[0] === '?' && a[1] === '<');
+      if (!grouping) return true;
+    }
+    i++;
+  }
+  return false;
+}
+
+/**
+ * For `[ START OF X ]…[ END OF X ]` textual block markers: the decoration-
+ * stripped name following `kw` in the regex source, up to the first `]` /
+ * `\]`. `null` if `kw` (or its closing bracket) isn't present. Used only to
+ * confirm the START and END names match (symmetric markers).
+ */
+function textualMarkerName(src: string, kw: 'START OF' | 'END OF'): string | null {
+  const i = src.indexOf(kw);
+  if (i < 0) return null;
+  const rest = src.slice(i + kw.length);
+  const end = rest.search(/\\?\]/);
+  if (end < 0) return null;
+  const name = rest
+    .slice(0, end)
+    .replace(/\\s[*+]?/g, '')   // drop `\s` / `\s*` / `\s+` decorations
+    .replace(/\\/g, '')          // drop stray backslashes
+    .replace(/\s+/g, ' ')
+    .trim();
+  return name || null;
+}
+
+/**
+ * Heuristic: regex carries real capture group(s) AND wraps them in a
+ * recognized non-tag delimiter — a Unicode pair from `DELIM_PAIRS` (opener
+ * before a matching closer) or symmetric `START OF X` / `END OF X` textual
+ * markers. Tag-shaped sources are explicitly rejected (that's `pairedTag`'s
+ * job, checked first). Conservative: anything else stays `unknown`.
+ */
+export function isDelimitedCapture(re: RegExp): boolean {
+  const src = re.source;
+  if (!hasRealCapture(src)) return false;
+  const head = src.replace(/^(?:\\s[*+]?|\s)+/, '');
+  if (/^<[a-zA-Z_]/.test(head)) return false; // tag-like opener — not ours
+  for (const [open, close] of DELIM_PAIRS) {
+    const oi = src.indexOf(open);
+    if (oi >= 0 && src.indexOf(close, oi + open.length) >= 0) return true;
+  }
+  const n1 = textualMarkerName(src, 'START OF');
+  const n2 = textualMarkerName(src, 'END OF');
+  return !!n1 && n1 === n2;
+}
+
+/**
+ * Four-bucket classification. Order matters: `pairedTag` wins over `placeholder`
+ * (Pacifica satisfies `isPlaceholder` — no captures — but is structurally a
+ * paired tag); both win over `delimitedCapture` (a `<TAGNAME (foo)>…</TAGNAME>`
+ * with captures is a paired tag, not a delimited-capture marker).
  */
 export function classifyTrigger(re: RegExp): TriggerKind {
   if (isPairedTag(re)) return 'pairedTag';
   if (isPlaceholder(re)) return 'placeholder';
+  if (isDelimitedCapture(re)) return 'delimitedCapture';
   return 'unknown';
 }
 
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
+
+// ─── In-module sanity tests for classifyTrigger ─────────────────────────
+// Run once at import time. Cheap; catches classifier regressions. Wrapped so
+// any assertion failure logs but never crashes the extension.
+(function selfTest() {
+  try {
+    const ck = (re: RegExp, expect: TriggerKind, label: string) => {
+      const got = classifyTrigger(re);
+      console.assert(got === expect, `[vishrun] classifyTrigger: ${label} → expected ${expect}, got ${got}`);
+    };
+    ck(/【女王蜂】/, 'placeholder', '【】 no captures');
+    ck(/<StatusPlaceHolderImpl\/>/, 'placeholder', 'self-closing tag, no captures');
+    ck(/<status_top>([\s\S]*?)<\/status_top>/, 'pairedTag', 'paired tag with capture');
+    ck(/<phone app="([^"]*)">([\s\S]*?)<\/phone>/, 'pairedTag', 'paired tag with attr + captures');
+    ck(/【SYS_HUD \| Loc: (.*?) \| Time: (.*?)】/, 'delimitedCapture', '【】 with captures');
+    ck(/『Present Characters Start』([\s\S]*?)『Present Characters End』/, 'delimitedCapture', '『』 block with capture');
+    ck(/↦(\S+)\s([^:]+):([\s\S]*?)↤/, 'delimitedCapture', '↦↤ with captures');
+    ck(/「(.*?)」/, 'delimitedCapture', '「」 with capture');
+    ck(/《(.*?)》/, 'delimitedCapture', '《》 with capture');
+    ck(
+      new RegExp('\\[\\s*START OF ANN SYS\\s*\\]([\\s\\S]*?)\\[\\s*END OF ANN SYS\\s*\\]'),
+      'delimitedCapture',
+      '[ START OF X ]…[ END OF X ] textual markers with capture',
+    );
+    ck(/foo(.*?)bar/, 'unknown', 'capture but no recognized delimiter');
+  } catch (err) {
+    console.error('[vishrun] classify-trigger self-test threw:', err);
+  }
+})();

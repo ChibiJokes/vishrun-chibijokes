@@ -110,7 +110,7 @@ export function compileScripts(rawScripts: RawRegexScript[]): CompiledScript[] {
     if (kind === 'unknown') {
       console.debug(
         `[vishrun] script "${s.scriptName ?? '(unnamed)'}" has unrecognized trigger shape ` +
-        `(neither placeholder nor paired-tag) — will not render. findRegex: ${src}`,
+        `(not placeholder, paired-tag, nor delimited-capture) — will not render. findRegex: ${src}`,
       );
     }
 
