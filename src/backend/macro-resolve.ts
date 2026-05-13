@@ -1,5 +1,6 @@
-import type { SpindleAPI } from 'lumiverse-spindle-types';
 import { api, varsLog } from './common';
+import { applySetvarOp, type VarsApi } from './setvar-ops';
+import type { SetvarKind } from './parsers/setvar';
 
 // Frontend → backend: resolve a batch of `{{macro}}` widget templates via the
 // Lumiverse macro engine (the frontend ctx has none). One round-trip carries
@@ -12,10 +13,6 @@ interface ResolveMacrosRequest {
   characterId?: string;
   templates: string[];
 }
-
-// Structural slice of SpindleAPI.variables used by applyAndStripSetvars.
-// Lets the self-test inject a fake without dragging the full API in.
-type VarsApi = Pick<SpindleAPI['variables'], 'local' | 'chat' | 'global'>;
 
 function isResolveMacrosRequest(p: unknown): p is ResolveMacrosRequest {
   if (!p || typeof p !== 'object') return false;
@@ -103,22 +100,7 @@ export async function applyAndStripSetvars(
     const { kind, name, value } = matches[i];
     if (!NAME_RE.test(name)) continue;
     try {
-      if (kind === 'setvar') {
-        await vars.local.set(chatId, name, value);
-        stripFlags[i] = true;
-      } else if (kind === 'setchatvar') {
-        await vars.chat.set(chatId, name, value);
-        stripFlags[i] = true;
-      } else {
-        // setgvar / setglobalvar — DISABLED this iteration.
-        // Lumiverse-host split: api.variables.global.set writes to
-        // settings.macro_variables_global, but {{getgvar}} reads from
-        // chat.metadata.macro_variables.global (MacroEnv.ts:105). Setting via
-        // API wouldn't be visible to the subsequent resolve. Re-enable when
-        // upstream unifies the read/write paths. For now: leave the match in
-        // the template (no strip) so the engine still no-ops it via commit:false.
-        varsLog.debug(`skipping ${kind} (upstream get/set path split):`, { name, userId });
-      }
+      stripFlags[i] = await applySetvarOp({ kind: kind as SetvarKind, name, value }, chatId, userId, vars);
     } catch (err) {
       varsLog.warn('setvar persist failed:', { kind, name, err: err instanceof Error ? err.message : String(err) });
     }

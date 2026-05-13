@@ -1,6 +1,7 @@
 import { installFetchExternalHandler } from './fetch-external';
 import { installMacroResolveHandler } from './macro-resolve';
 import { installMessageContentProcessor } from './message-content-processor';
+import { installDispatchSlashHandler } from './dispatch-slash';
 
 /**
  * Backend worker module. Vishrun is logically frontend-only, but the worker
@@ -16,6 +17,7 @@ import { installMessageContentProcessor } from './message-content-processor';
 installFetchExternalHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
+installDispatchSlashHandler();
 
 export function setup(): void {
   // intentionally empty — registration happens at module top level (above).

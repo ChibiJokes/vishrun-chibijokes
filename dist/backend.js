@@ -36,6 +36,20 @@ function installFetchExternalHandler() {
   });
 }
 
+// src/backend/setvar-ops.ts
+async function applySetvarOp(op, chatId, userId, vars = api.variables) {
+  if (op.kind === "setvar") {
+    await vars.local.set(chatId, op.name, op.value);
+    return true;
+  }
+  if (op.kind === "setchatvar") {
+    await vars.chat.set(chatId, op.name, op.value);
+    return true;
+  }
+  varsLog.debug(`skipping ${op.kind} (upstream get/set path split):`, { name: op.name, userId });
+  return false;
+}
+
 // src/backend/macro-resolve.ts
 function isResolveMacrosRequest(p) {
   if (!p || typeof p !== "object")
@@ -99,15 +113,7 @@ async function applyAndStripSetvars(template, chatId, userId, vars = api.variabl
     if (!NAME_RE.test(name))
       continue;
     try {
-      if (kind === "setvar") {
-        await vars.local.set(chatId, name, value);
-        stripFlags[i] = true;
-      } else if (kind === "setchatvar") {
-        await vars.chat.set(chatId, name, value);
-        stripFlags[i] = true;
-      } else {
-        varsLog.debug(`skipping ${kind} (upstream get/set path split):`, { name, userId });
-      }
+      stripFlags[i] = await applySetvarOp({ kind, name, value }, chatId, userId, vars);
     } catch (err) {
       varsLog.warn("setvar persist failed:", { kind, name, err: err instanceof Error ? err.message : String(err) });
     }
@@ -211,8 +217,8 @@ function installMacroResolveHandler() {
 })();
 
 // src/backend/parsers/setvar.ts
-var SETVAR_HEAD = /^\/setvar\s+key\s*=\s*([^\s"'=|]+)\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+))\s*/i;
-var SETVAR_HINT = /\/setvar\b/i;
+var SETVAR_HEAD = /^\/(setvar|setchatvar|setgvar|setglobalvar)\s+key\s*=\s*([^\s"'=|]+)\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+))\s*/i;
+var SETVAR_HINT = /\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
 function unescapeQuoted(s, quote) {
   return s.replace(/\\(.)/g, (_m, c) => c === quote || c === "\\" ? c : "\\" + c);
 }
@@ -250,15 +256,16 @@ function parseSegment(seg) {
   const m = SETVAR_HEAD.exec(trimmed);
   if (!m)
     return { pair: null, rest: trimmed };
-  const key = m[1];
+  const kind = m[1].toLowerCase();
+  const key = m[2];
   let value;
-  if (m[2] !== undefined)
-    value = unescapeQuoted(m[2], '"');
-  else if (m[3] !== undefined)
-    value = unescapeQuoted(m[3], "'");
+  if (m[3] !== undefined)
+    value = unescapeQuoted(m[3], '"');
+  else if (m[4] !== undefined)
+    value = unescapeQuoted(m[4], "'");
   else
-    value = m[4];
-  return { pair: { key, value }, rest: trimmed.slice(m[0].length).trim() };
+    value = m[5];
+  return { pair: { kind, key, value }, rest: trimmed.slice(m[0].length).trim() };
 }
 function parseSetvarChain(content) {
   if (!SETVAR_HINT.test(content))
@@ -285,16 +292,16 @@ function installMessageContentProcessor() {
       return;
     if (ctx.origin === "render")
       return;
-    if (!ctx.content.includes("/setvar"))
+    if (!/\/(setvar|setchatvar|setgvar|setglobalvar)\b/i.test(ctx.content))
       return;
     const parsed = parseSetvarChain(ctx.content);
     if (!parsed)
       return;
-    for (const { key, value } of parsed.pairs) {
+    for (const { kind, key, value } of parsed.pairs) {
       try {
-        await api.variables.local.set(ctx.chatId, key, value);
+        await applySetvarOp({ kind, name: key, value }, ctx.chatId, ctx.userId);
       } catch (err) {
-        varsLog.warn(`setvar failed for "${key}":`, err instanceof Error ? err.message : String(err));
+        varsLog.warn(`setvar failed for "${kind}::${key}":`, err instanceof Error ? err.message : String(err));
       }
     }
     const stripped = parsed.strippedContent.trim();
@@ -302,10 +309,64 @@ function installMessageContentProcessor() {
   }, 50);
 }
 
+// src/backend/dispatch-slash.ts
+function isDispatchSlashRequest(p) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.type === "dispatch_slash_text" && typeof r.requestId === "string" && typeof r.text === "string" && typeof r.chatId === "string";
+}
+var SETVAR_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
+var SYS_PREFIX_RE = /^\s*\/sys\b/i;
+async function dispatchSlashText(text, chatId, userId, deps = {}) {
+  if (SETVAR_PREFIX_RE.test(text)) {
+    const parsed = parseSetvarChain(text);
+    if (!parsed || parsed.pairs.length === 0) {
+      varsLog.warn("dispatch_slash_text: setvar prefix matched but parse failed; treating as handled");
+      return { handled: true, kind: "setvar_chain" };
+    }
+    for (const { kind, key, value } of parsed.pairs) {
+      try {
+        await applySetvarOp({ kind, name: key, value }, chatId, userId, deps.vars);
+      } catch (err) {
+        varsLog.warn(`dispatch_slash_text: applySetvarOp failed for ${kind}::${key}:`, err instanceof Error ? err.message : String(err));
+      }
+    }
+    return { handled: true, kind: "setvar_chain" };
+  }
+  if (SYS_PREFIX_RE.test(text)) {
+    const content = text.replace(/^\s*\/sys\s*/i, "");
+    const append = deps.appendMessage ?? api.chat.appendMessage.bind(api.chat);
+    await append(chatId, { role: "system", content });
+    return { handled: true, kind: "sys_message" };
+  }
+  return { handled: false, kind: "none" };
+}
+function installDispatchSlashHandler() {
+  api.onFrontendMessage((payload, userId) => {
+    if (!isDispatchSlashRequest(payload))
+      return;
+    const { requestId, text, chatId } = payload;
+    (async () => {
+      let response;
+      try {
+        const result = await dispatchSlashText(text, chatId, userId);
+        response = { type: "dispatch_slash_text_response", requestId, handled: result.handled, kind: result.kind };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        varsLog.warn("dispatch_slash_text handler threw:", msg);
+        response = { type: "dispatch_slash_text_response", requestId, handled: false, kind: "none", error: msg };
+      }
+      api.sendToFrontend(response, userId);
+    })();
+  });
+}
+
 // src/backend/index.ts
 installFetchExternalHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
+installDispatchSlashHandler();
 function setup() {}
 export {
   setup

@@ -526,6 +526,134 @@ async function transformHtmlForExternalScripts(html, ctx) {
   return transformHtmlForReactBabel(withTailwind, ctx);
 }
 
+// src/core/dispatch-slash.ts
+function isDispatchSlashResponse(p, requestId) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.type === "dispatch_slash_text_response" && r.requestId === requestId && typeof r.handled === "boolean" && typeof r.kind === "string";
+}
+var requestCounter2 = 0;
+function nextRequestId2() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `vishrun-ds-${Date.now()}-${++requestCounter2}`;
+}
+var DISPATCH_TIMEOUT_MS = 5000;
+function dispatchSlashViaBackend(ctx, chatId, text, timeoutMs = DISPATCH_TIMEOUT_MS) {
+  return new Promise((resolve, reject) => {
+    const requestId = nextRequestId2();
+    let settled = false;
+    let unsub = null;
+    let timer = null;
+    const finish = (run) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try {
+          unsub();
+        } catch {}
+        unsub = null;
+      }
+      run();
+    };
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isDispatchSlashResponse(payload, requestId))
+        return;
+      finish(() => resolve({ handled: payload.handled, kind: payload.kind, error: payload.error }));
+    });
+    timer = setTimeout(() => {
+      finish(() => reject(new Error("dispatch_slash_text timeout")));
+    }, timeoutMs);
+    try {
+      ctx.sendToBackend({ type: "dispatch_slash_text", requestId, text, chatId });
+    } catch (err) {
+      finish(() => reject(err instanceof Error ? err : new Error(String(err))));
+    }
+  });
+}
+
+// src/render/clipboard-shim.ts
+var DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys)\b/i;
+var DISPATCH_CORRELATION_WINDOW_MS = 1000;
+var DISPATCH_CLEANUP_INTERVAL_MS = 2000;
+var recentlyDispatched = new Map;
+var cleanupTimer = null;
+function ensureCleanupTimer() {
+  if (cleanupTimer !== null)
+    return;
+  cleanupTimer = setInterval(() => {
+    const now = Date.now();
+    for (const [text, ts] of recentlyDispatched) {
+      if (now - ts > DISPATCH_CLEANUP_INTERVAL_MS)
+        recentlyDispatched.delete(text);
+    }
+  }, DISPATCH_CLEANUP_INTERVAL_MS);
+}
+async function handleClipboardWriteText(payload, ctx, deps = {}) {
+  const text = payload && typeof payload === "object" ? payload.text : undefined;
+  if (typeof text !== "string")
+    return;
+  const dispatched = deps.recentlyDispatched ?? recentlyDispatched;
+  const now = deps.now ?? Date.now;
+  if (DISPATCH_PREFIX_RE.test(text)) {
+    const chatId = ctx.getActiveChat().chatId;
+    if (!chatId) {
+      console.warn("[vishrun] dispatch_slash_text: no active chatId, falling back to clipboard");
+    } else {
+      if (!deps.recentlyDispatched)
+        ensureCleanupTimer();
+      dispatched.set(text, now());
+      try {
+        const dispatch = deps.dispatch ?? dispatchSlashViaBackend;
+        const result = await dispatch(ctx, chatId, text);
+        if (result.handled) {
+          dispatched.set(text, now());
+          return;
+        }
+        dispatched.delete(text);
+      } catch (e) {
+        console.warn("[vishrun] dispatch_slash_text failed, falling back to clipboard:", e instanceof Error ? e.message : String(e));
+        dispatched.delete(text);
+      }
+    }
+  }
+  const writeText = deps.clipboardWriteText ?? (typeof navigator !== "undefined" && navigator.clipboard ? navigator.clipboard.writeText.bind(navigator.clipboard) : null);
+  if (!writeText)
+    return;
+  try {
+    await writeText(text);
+  } catch (e) {
+    console.warn("[vishrun] clipboard writeText failed:", e);
+  }
+}
+function handleHostAlert(payload, deps = {}) {
+  const message = payload && typeof payload === "object" ? payload.message : undefined;
+  if (typeof message !== "string")
+    return;
+  const dispatched = deps.recentlyDispatched ?? recentlyDispatched;
+  const now = deps.now ?? Date.now;
+  const tNow = now();
+  for (const ts of dispatched.values()) {
+    if (tNow - ts < DISPATCH_CORRELATION_WINDOW_MS)
+      return;
+  }
+  const alertFn = deps.alert ?? (typeof window !== "undefined" && typeof window.alert === "function" ? window.alert.bind(window) : null);
+  if (!alertFn)
+    return;
+  try {
+    alertFn(message);
+  } catch (e) {
+    console.warn("[vishrun] alert failed:", e);
+  }
+}
+
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
 var iframeRegistry = new Map;
@@ -1061,27 +1189,9 @@ function routeChildMessage(frame, payload, ctx) {
   if (p.kind === "set-chat-messages") {
     handleSetChatMessages(frame.element, p.payload, ctx);
   } else if (p.kind === "clipboard-write-text") {
-    handleClipboardWriteText(p.payload);
+    handleClipboardWriteText(p.payload, ctx);
   } else if (p.kind === "alert") {
     handleHostAlert(p.payload);
-  }
-}
-async function handleClipboardWriteText(payload) {
-  const text = payload && typeof payload === "object" ? payload.text : undefined;
-  if (typeof text !== "string")
-    return;
-  try {
-    await navigator.clipboard.writeText(text);
-  } catch (e) {
-    console.warn("[vishrun] clipboard writeText failed:", e);
-  }
-}
-function handleHostAlert(payload) {
-  const message = payload && typeof payload === "object" ? payload.message : undefined;
-  try {
-    window.alert(typeof message === "string" ? message : String(message));
-  } catch (e) {
-    console.warn("[vishrun] alert failed:", e);
   }
 }
 async function handleSetChatMessages(iframe, payload, ctx) {
@@ -1264,19 +1374,19 @@ function hasMacros(html) {
 function isResolveMacrosResponse(p, requestId) {
   return !!p && typeof p === "object" && p.type === "resolve_macros_response" && p.requestId === requestId && Array.isArray(p.results);
 }
-var requestCounter2 = 0;
-function nextRequestId2() {
+var requestCounter3 = 0;
+function nextRequestId3() {
   if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
     return crypto.randomUUID();
   }
-  return `vishrun-rm-${Date.now()}-${++requestCounter2}`;
+  return `vishrun-rm-${Date.now()}-${++requestCounter3}`;
 }
 var RESOLVE_TIMEOUT_MS = 5000;
 function resolveMacrosBatch(ctx, chatId, characterId, templates, timeoutMs = RESOLVE_TIMEOUT_MS) {
   if (templates.length === 0)
     return Promise.resolve([]);
   return new Promise((resolve, reject) => {
-    const requestId = nextRequestId2();
+    const requestId = nextRequestId3();
     let settled = false;
     let unsub = null;
     let timer = null;

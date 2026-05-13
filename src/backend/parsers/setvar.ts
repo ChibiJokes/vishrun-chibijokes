@@ -1,25 +1,29 @@
-// Parser for SillyTavern `/setvar` slash-command chains pasted into the chat
-// input. Subset only — `/setvar key=NAME VALUE` with `|` chaining, quoted or
-// bare values. No other slash commands. Used by message-content-processor.ts.
+// Parser for SillyTavern setvar-family slash-command chains pasted into the
+// chat input or pushed by widgets via `pushToSillyTavern`. Supports
+// `/setvar`, `/setchatvar`, `/setgvar`, `/setglobalvar` with `key=NAME VALUE`
+// + `|` chaining, quoted or bare values. No other slash commands, no nested.
+
+export type SetvarKind = 'setvar' | 'setchatvar' | 'setgvar' | 'setglobalvar';
 
 export interface SetvarPair {
+  kind: SetvarKind;
   key: string;
   value: string;
 }
 
 export interface SetvarParseResult {
   pairs: SetvarPair[];
-  /** The message content with the parsed `/setvar` commands removed. */
+  /** The message content with the parsed setvar commands removed. */
   strippedContent: string;
 }
 
-// Leading `/setvar key=NAME VALUE` at the start of a (trimmed) chain segment.
+// Leading `/<kind> key=NAME VALUE` at the start of a (trimmed) chain segment.
 // NAME: up to whitespace / quote / `=` / `|`. VALUE: "..."(\-escapes) | '...'(\-escapes) | bare token.
 const SETVAR_HEAD =
-  /^\/setvar\s+key\s*=\s*([^\s"'=|]+)\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+))\s*/i;
+  /^\/(setvar|setchatvar|setgvar|setglobalvar)\s+key\s*=\s*([^\s"'=|]+)\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+))\s*/i;
 
-// Cheap pre-check: does the content reference a `/setvar` command at all?
-const SETVAR_HINT = /\/setvar\b/i;
+// Cheap pre-check: does the content reference any setvar-family command?
+const SETVAR_HINT = /\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
 
 function unescapeQuoted(s: string, quote: '"' | "'"): string {
   // Only `\<quote>` and `\\` are real escapes; leave other backslash pairs intact.
@@ -64,17 +68,18 @@ function parseSegment(seg: string): { pair: SetvarPair | null; rest: string } {
   const trimmed = seg.trim();
   const m = SETVAR_HEAD.exec(trimmed);
   if (!m) return { pair: null, rest: trimmed };
-  const key = m[1];
+  const kind = m[1].toLowerCase() as SetvarKind;
+  const key = m[2];
   let value: string;
-  if (m[2] !== undefined) value = unescapeQuoted(m[2], '"');
-  else if (m[3] !== undefined) value = unescapeQuoted(m[3], "'");
-  else value = m[4]; // bare token
-  return { pair: { key, value }, rest: trimmed.slice(m[0].length).trim() };
+  if (m[3] !== undefined) value = unescapeQuoted(m[3], '"');
+  else if (m[4] !== undefined) value = unescapeQuoted(m[4], "'");
+  else value = m[5]; // bare token
+  return { pair: { kind, key, value }, rest: trimmed.slice(m[0].length).trim() };
 }
 
-// Extract `/setvar` pairs from a message and return the content with those
-// commands removed (preserved text re-joined with ` | `). `null` when there's
-// no parseable `/setvar` — caller leaves the message untouched.
+// Extract setvar-family pairs from a message and return the content with
+// those commands removed (preserved text re-joined with ` | `). `null` when
+// there's no parseable setvar — caller leaves the message untouched.
 export function parseSetvarChain(content: string): SetvarParseResult | null {
   if (!SETVAR_HINT.test(content)) return null;
   const pairs: SetvarPair[] = [];
