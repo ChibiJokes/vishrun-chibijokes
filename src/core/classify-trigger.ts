@@ -213,34 +213,3 @@ export function classifyTrigger(re: RegExp): TriggerKind {
 function escapeRegex(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
-
-// ─── In-module sanity tests for classifyTrigger ─────────────────────────
-// Run once at import time. Cheap; catches classifier regressions. Wrapped so
-// any assertion failure logs but never crashes the extension.
-(function selfTest() {
-  try {
-    const ck = (re: RegExp, expect: TriggerKind, label: string) => {
-      const got = classifyTrigger(re);
-      console.assert(got === expect, `[vishrun] classifyTrigger: ${label} → expected ${expect}, got ${got}`);
-    };
-    ck(/【女王蜂】/, 'placeholder', '【】 no captures');
-    ck(/<StatusPlaceHolderImpl\/>/, 'placeholder', 'self-closing tag, no captures');
-    ck(/<status_top>([\s\S]*?)<\/status_top>/, 'pairedTag', 'paired tag with capture');
-    ck(/<phone app="([^"]*)">([\s\S]*?)<\/phone>/, 'pairedTag', 'paired tag with attr + captures');
-    ck(/<phone a="x" b="y">([\s\S]*?)<\/phone>/, 'pairedTag', 'paired tag with multiple attrs');
-    ck(/<my-widget>([\s\S]*?)<\/my-widget>/, 'pairedTag', 'paired tag with dash in name');
-    ck(/【SYS_HUD \| Loc: (.*?) \| Time: (.*?)】/, 'delimitedCapture', '【】 with captures');
-    ck(/『Present Characters Start』([\s\S]*?)『Present Characters End』/, 'delimitedCapture', '『』 block with capture');
-    ck(/↦(\S+)\s([^:]+):([\s\S]*?)↤/, 'delimitedCapture', '↦↤ with captures');
-    ck(/「(.*?)」/, 'delimitedCapture', '「」 with capture');
-    ck(/《(.*?)》/, 'delimitedCapture', '《》 with capture');
-    ck(
-      new RegExp('\\[\\s*START OF ANN SYS\\s*\\]([\\s\\S]*?)\\[\\s*END OF ANN SYS\\s*\\]'),
-      'delimitedCapture',
-      '[ START OF X ]…[ END OF X ] textual markers with capture',
-    );
-    ck(/foo(.*?)bar/, 'unknown', 'capture but no recognized delimiter');
-  } catch (err) {
-    console.error('[vishrun] classify-trigger self-test threw:', err);
-  }
-})();

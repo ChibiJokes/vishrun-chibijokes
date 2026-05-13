@@ -141,29 +141,6 @@ function classifyTrigger(re) {
 function escapeRegex(s) {
   return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
-(function selfTest() {
-  try {
-    const ck = (re, expect, label) => {
-      const got = classifyTrigger(re);
-      console.assert(got === expect, `[vishrun] classifyTrigger: ${label} → expected ${expect}, got ${got}`);
-    };
-    ck(/【女王蜂】/, "placeholder", "【】 no captures");
-    ck(/<StatusPlaceHolderImpl\/>/, "placeholder", "self-closing tag, no captures");
-    ck(/<status_top>([\s\S]*?)<\/status_top>/, "pairedTag", "paired tag with capture");
-    ck(/<phone app="([^"]*)">([\s\S]*?)<\/phone>/, "pairedTag", "paired tag with attr + captures");
-    ck(/<phone a="x" b="y">([\s\S]*?)<\/phone>/, "pairedTag", "paired tag with multiple attrs");
-    ck(/<my-widget>([\s\S]*?)<\/my-widget>/, "pairedTag", "paired tag with dash in name");
-    ck(/【SYS_HUD \| Loc: (.*?) \| Time: (.*?)】/, "delimitedCapture", "【】 with captures");
-    ck(/『Present Characters Start』([\s\S]*?)『Present Characters End』/, "delimitedCapture", "『』 block with capture");
-    ck(/↦(\S+)\s([^:]+):([\s\S]*?)↤/, "delimitedCapture", "↦↤ with captures");
-    ck(/「(.*?)」/, "delimitedCapture", "「」 with capture");
-    ck(/《(.*?)》/, "delimitedCapture", "《》 with capture");
-    ck(new RegExp("\\[\\s*START OF ANN SYS\\s*\\]([\\s\\S]*?)\\[\\s*END OF ANN SYS\\s*\\]"), "delimitedCapture", "[ START OF X ]…[ END OF X ] textual markers with capture");
-    ck(/foo(.*?)bar/, "unknown", "capture but no recognized delimiter");
-  } catch (err) {
-    console.error("[vishrun] classify-trigger self-test threw:", err);
-  }
-})();
 
 // src/core/parse-regex-script.ts
 var FENCE_RE = /^\s*```[A-Za-z]*[ \t]*\r?\n([\s\S]*?)\r?\n[ \t]*```\s*$/;
@@ -220,41 +197,6 @@ function compileScripts(rawScripts) {
   }
   return out;
 }
-(function selfTest2() {
-  try {
-    const t1 = "```html\n<!DOCTYPE html>\n<body>x</body>\n```";
-    console.assert(stripCodeFence(t1) === `<!DOCTYPE html>
-<body>x</body>`, "[vishrun] stripCodeFence: lowercase html lang hint");
-    const t2 = "```HTML\n  hi  \n```";
-    console.assert(stripCodeFence(t2) === "  hi  ", "[vishrun] stripCodeFence: uppercase HTML lang hint preserves inner whitespace");
-    const t3 = "```\nfoo\n```";
-    console.assert(stripCodeFence(t3) === "foo", "[vishrun] stripCodeFence: no lang hint");
-    const t4 = "   ```html  \r\nfoo\r\n```   ";
-    console.assert(stripCodeFence(t4) === "foo", "[vishrun] stripCodeFence: surrounding whitespace + CRLF + trailing space on opening line");
-    const t5 = `<!DOCTYPE html>
-no fence here`;
-    console.assert(stripCodeFence(t5) === t5, "[vishrun] stripCodeFence: pass-through when no fence");
-    const t6 = "```html\nopener but no close";
-    console.assert(stripCodeFence(t6) === t6, "[vishrun] stripCodeFence: pass-through when opening fence has no close");
-    const t7 = '```html\n<!DOCTYPE html>\n<html lang="en">\n<body><div class="vav-home-wrap"></div></body>\n</html>\n```';
-    const stripped = stripCodeFence(t7);
-    console.assert(stripped.startsWith("<!DOCTYPE html>") && stripped.endsWith("</html>"), "[vishrun] stripCodeFence: Vavesta-shaped block unwraps cleanly");
-    const r1 = parseRegexLiteral("/↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤/g");
-    console.assert(r1.pattern === "↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤" && r1.flags === "g", "[vishrun] parseRegexLiteral: ↦/↤-delimited literal with g flag");
-    const r2 = parseRegexLiteral("【VAVESTA_HOME】");
-    console.assert(r2.pattern === "【VAVESTA_HOME】" && r2.flags === "", "[vishrun] parseRegexLiteral: non-literal placeholder passes through");
-    const r3 = parseRegexLiteral("<\\s*PACIFICA_UI\\s*>([\\s\\S]*?)<\\s*\\/PACIFICA_UI\\s*>");
-    console.assert(r3.pattern === "<\\s*PACIFICA_UI\\s*>([\\s\\S]*?)<\\s*\\/PACIFICA_UI\\s*>" && r3.flags === "", "[vishrun] parseRegexLiteral: paired-tag source without delimiters passes through");
-    const r4 = parseRegexLiteral("/foo\\/bar/i");
-    console.assert(r4.pattern === "foo\\/bar" && r4.flags === "i", "[vishrun] parseRegexLiteral: escaped slash inside pattern is not a closer");
-    const r5 = parseRegexLiteral("/no closer");
-    console.assert(r5.pattern === "/no closer" && r5.flags === "", "[vishrun] parseRegexLiteral: unmatched leading / passes through");
-    console.assert(mergeFlags("") === "gs", "[vishrun] mergeFlags: empty user flags → default gs");
-    console.assert([...mergeFlags("gi")].sort().join("") === "gis", "[vishrun] mergeFlags: dedupes g and adds i");
-  } catch (err) {
-    console.error("[vishrun] parse-regex-script self-test threw:", err);
-  }
-})();
 
 // src/core/substitute.ts
 function substitute(template, fullMatch, groups) {

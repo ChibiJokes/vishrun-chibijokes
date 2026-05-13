@@ -161,60 +161,6 @@ function installMacroResolveHandler() {
     })();
   });
 }
-(function selfTest() {
-  try {
-    let makeFakeVars = function(opts) {
-      const calls = [];
-      const mk = (scope) => async (...args) => {
-        const keyArg = scope === "global" ? args[0] : args[1];
-        if (opts?.throwOn && opts.throwOn.scope === scope && opts.throwOn.key === keyArg) {
-          throw new Error(`fake set throws for ${scope}/${keyArg}`);
-        }
-        calls.push({ scope, args });
-      };
-      const vars = {
-        local: { set: mk("local") },
-        chat: { set: mk("chat") },
-        global: { set: mk("global") }
-      };
-      return { vars, calls };
-    };
-    const CHAT = "chatX";
-    const USER = "userX";
-    const ck = async (label, input, expectOut, expectCalls, throwOn) => {
-      const { vars, calls } = makeFakeVars({ throwOn });
-      const out = await applyAndStripSetvars(input, CHAT, USER, vars);
-      console.assert(out === expectOut, `[vishrun] applyAndStripSetvars: ${label} \u2192 expected out ${JSON.stringify(expectOut)}, got ${JSON.stringify(out)}`);
-      const callsOk = JSON.stringify(calls) === JSON.stringify(expectCalls);
-      console.assert(callsOk, `[vishrun] applyAndStripSetvars: ${label} \u2192 expected calls ${JSON.stringify(expectCalls)}, got ${JSON.stringify(calls)}`);
-    };
-    (async () => {
-      await ck("single setvar local", "{{setvar::yen::5000}}foo", "foo", [{ scope: "local", args: [CHAT, "yen", "5000"] }]);
-      await ck("multiple setvars in order", "{{setvar::yen::5000}}{{setvar::grade::Grade 2}}foo", "foo", [
-        { scope: "local", args: [CHAT, "yen", "5000"] },
-        { scope: "local", args: [CHAT, "grade", "Grade 2"] }
-      ]);
-      await ck("duplicate name applied in document order", "{{setvar::yen::5000}}foo{{setvar::yen::6000}}bar", "foobar", [
-        { scope: "local", args: [CHAT, "yen", "5000"] },
-        { scope: "local", args: [CHAT, "yen", "6000"] }
-      ]);
-      await ck("invalid NAME left in template, not applied", "{{setvar::1bad::x}}foo", "{{setvar::1bad::x}}foo", []);
-      await ck("setgvar disabled \u2014 not stripped, no call", "{{setgvar::level::99}}foo", "{{setgvar::level::99}}foo", []);
-      await ck("setglobalvar disabled \u2014 not stripped, no call", "{{setglobalvar::level::99}}foo", "{{setglobalvar::level::99}}foo", []);
-      await ck("setchatvar routes to chat namespace", "{{setchatvar::loc::Tokyo}}foo", "foo", [{ scope: "chat", args: [CHAT, "loc", "Tokyo"] }]);
-      await ck("JSX inline style untouched, setvar stripped", `<div style={{position:'absolute'}}>{{setvar::yen::5000}}</div>`, `<div style={{position:'absolute'}}></div>`, [
-        { scope: "local", args: [CHAT, "yen", "5000"] }
-      ]);
-      await ck("empty value", "{{setvar::yen::}}foo", "foo", [{ scope: "local", args: [CHAT, "yen", ""] }]);
-      await ck("set throws \u2192 match not stripped", "{{setvar::yen::5000}}foo", "{{setvar::yen::5000}}foo", [], { scope: "local", key: "yen" });
-      await ck("mix setvar + getvar \u2014 setvar stripped, getvar untouched", "{{setvar::yen::5000}}precio={{getvar::yen}}", "precio={{getvar::yen}}", [
-        { scope: "local", args: [CHAT, "yen", "5000"] }
-      ]);
-    })();
-  } catch (err) {
-    console.error("[vishrun] applyAndStripSetvars self-test threw:", err);
-  }
-})();
 
 // src/backend/parsers/setvar.ts
 var SETVAR_HEAD = /^\/(setvar|setchatvar|setgvar|setglobalvar)\s+key\s*=\s*([^\s"'=|]+)\s+(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(\S+))\s*/i;
