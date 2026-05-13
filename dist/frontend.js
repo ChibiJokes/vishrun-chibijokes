@@ -26,7 +26,17 @@ function clearActiveCard() {
 
 // src/core/classify-trigger.ts
 function isPlaceholderLikeKind(kind) {
-  return kind === "placeholder" || kind === "delimitedCapture";
+  return kind === "placeholder" || kind === "delimitedCapture" || kind === "delimitedCaptureMultiLine";
+}
+function isMultiLineRegex(re) {
+  const src = re.source;
+  if (src.includes("[\\s\\S]"))
+    return true;
+  if (src.includes("\\n"))
+    return true;
+  if (re.flags.includes("m") && (src.includes("^") || src.includes("$")))
+    return true;
+  return false;
 }
 function isPlaceholder(re) {
   const src = re.source;
@@ -135,7 +145,7 @@ function classifyTrigger(re) {
   if (isPlaceholder(re))
     return "placeholder";
   if (isDelimitedCapture(re))
-    return "delimitedCapture";
+    return isMultiLineRegex(re) ? "delimitedCaptureMultiLine" : "delimitedCapture";
   return "unknown";
 }
 function escapeRegex(s) {
@@ -1375,6 +1385,107 @@ function resolveMacrosBatch(ctx, chatId, characterId, templates, timeoutMs = RES
   });
 }
 
+// src/render/linearize-bubble.ts
+var BLOCK_TAGS = new Set([
+  "P",
+  "DIV",
+  "BLOCKQUOTE",
+  "PRE",
+  "UL",
+  "OL",
+  "LI",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6",
+  "HR"
+]);
+function linearizeBubble(root) {
+  let text = "";
+  const offsetMap = [];
+  function walk(node) {
+    if (node.nodeType === Node.TEXT_NODE) {
+      const t = node;
+      const value = t.nodeValue ?? "";
+      if (value.length === 0)
+        return;
+      const sourceStart = text.length;
+      text += value;
+      offsetMap.push({
+        node: t,
+        nodeStart: 0,
+        nodeEnd: value.length,
+        sourceStart,
+        sourceEnd: text.length
+      });
+      return;
+    }
+    if (node.nodeType !== Node.ELEMENT_NODE)
+      return;
+    const el = node;
+    if (el.hasAttribute && el.hasAttribute("data-vishrun-widget"))
+      return;
+    if (el.tagName === "BR") {
+      text += `
+`;
+      return;
+    }
+    const isBlock = BLOCK_TAGS.has(el.tagName);
+    let prevText = "";
+    if (isBlock && text.length > 0 && !text.endsWith(`
+
+`)) {
+      prevText = text.endsWith(`
+`) ? `
+` : `
+
+`;
+      text += prevText;
+    }
+    for (const child of Array.from(el.childNodes))
+      walk(child);
+    if (isBlock && text.length > 0 && !text.endsWith(`
+
+`)) {
+      text += text.endsWith(`
+`) ? `
+` : `
+
+`;
+    }
+  }
+  for (const child of Array.from(root.childNodes))
+    walk(child);
+  while (text.endsWith(`
+`))
+    text = text.slice(0, -1);
+  return { text, offsetMap };
+}
+var cache = new WeakMap;
+function getLinearizedBubble(root) {
+  const tc = root.textContent ?? "";
+  const hash = quickHash(tc);
+  const cached = cache.get(root);
+  if (cached && cached.hash === hash)
+    return cached.result;
+  const result = linearizeBubble(root);
+  cache.set(root, { hash, result });
+  return result;
+}
+function invalidateLinearizedBubble(root) {
+  cache.delete(root);
+}
+function quickHash(s) {
+  let h = 2166136261;
+  for (let i = 0;i < s.length; i++) {
+    h ^= s.charCodeAt(i);
+    h = Math.imul(h, 16777619);
+  }
+  return (h >>> 0).toString(36);
+}
+
 // src/render/inject-into-message.ts
 var resolutionCache = new Map;
 async function processNode(root, scripts, ctx) {
@@ -1390,7 +1501,11 @@ async function processNode(root, scripts, ctx) {
     for (const script of scripts) {
       if (!isPlaceholderLikeKind(script.kind))
         continue;
-      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
+      if (script.kind === "delimitedCaptureMultiLine") {
+        total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
+      } else {
+        total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
+      }
     }
     total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
   } catch (err) {
@@ -1427,6 +1542,20 @@ function collectExpandedTemplates(root, scripts, messageId) {
   for (const script of scripts) {
     if (!isPlaceholderLikeKind(script.kind))
       continue;
+    if (script.kind === "delimitedCaptureMultiLine") {
+      const bubble = findContentRoot(root);
+      const linear = getLinearizedBubble(bubble);
+      script.findRe.lastIndex = 0;
+      let m;
+      while ((m = script.findRe.exec(linear.text)) !== null) {
+        const groups = m.slice(1).map((g) => g ?? "");
+        const html = substitute(script.replaceString, m[0], groups);
+        out.add(applyNestedPipeline(html, scripts, new Set([script.id]), 0));
+        if (m[0].length === 0)
+          script.findRe.lastIndex++;
+      }
+      continue;
+    }
     for (const tn of textNodes) {
       const text = tn.nodeValue ?? "";
       if (!text)
@@ -1456,6 +1585,140 @@ function collectExpandedTemplates(root, scripts, messageId) {
     out.add(applyNestedPipeline(html, scripts, new Set([cap.scriptId]), 0));
   }
   return [...out];
+}
+async function replaceMultiLineMatches(root, script, allScripts, messageId, ctx, resolvedMap) {
+  const bubble = findContentRoot(root);
+  if (!bubble.isConnected)
+    return 0;
+  const linear = getLinearizedBubble(bubble);
+  if (linear.text.length === 0)
+    return 0;
+  script.findRe.lastIndex = 0;
+  const matches = [];
+  let m;
+  while ((m = script.findRe.exec(linear.text)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length, match: m });
+    if (m[0].length === 0)
+      script.findRe.lastIndex++;
+  }
+  if (matches.length === 0)
+    return 0;
+  if (hasRegisteredWidgetsFor(messageId, script.id)) {
+    destroyRegisteredWidgetsFor(messageId, script.id);
+  }
+  let count = 0;
+  for (let i = matches.length - 1;i >= 0; i--) {
+    const { start, end, match } = matches[i];
+    const groups = match.slice(1).map((g) => g ?? "");
+    const html = substitute(script.replaceString, match[0], groups);
+    const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
+    const fromMap = resolvedMap.get(expanded);
+    const fromCache = fromMap ?? resolutionCache.get(expanded);
+    const finalHtml = fromCache ?? expanded;
+    const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+    const placed = replaceLinearRange(bubble, linear.offsetMap, start, end, widget);
+    if (placed) {
+      count++;
+    } else if (widget.tagName === "IFRAME") {
+      destroyWidgetIframe(widget);
+    }
+  }
+  invalidateLinearizedBubble(bubble);
+  return count;
+}
+function replaceLinearRange(bubble, offsetMap, start, end, widget) {
+  let startEntry = null;
+  let endEntry = null;
+  for (const e of offsetMap) {
+    if (!startEntry && e.sourceStart <= start && start < e.sourceEnd)
+      startEntry = e;
+    if (e.sourceStart < end && end <= e.sourceEnd)
+      endEntry = e;
+  }
+  if (!startEntry || !endEntry)
+    return false;
+  if (!bubble.contains(startEntry.node) || !bubble.contains(endEntry.node))
+    return false;
+  const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
+  const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
+  let range;
+  try {
+    range = document.createRange();
+    range.setStart(startEntry.node, startNodeOffset);
+    range.setEnd(endEntry.node, endNodeOffset);
+  } catch {
+    return false;
+  }
+  range.deleteContents();
+  range.insertNode(widget);
+  cleanupEmptyAroundWidget(widget, bubble);
+  return true;
+}
+var MULTILINE_BLOCK_TAGS = new Set([
+  "P",
+  "DIV",
+  "BLOCKQUOTE",
+  "PRE",
+  "UL",
+  "OL",
+  "LI",
+  "H1",
+  "H2",
+  "H3",
+  "H4",
+  "H5",
+  "H6"
+]);
+function cleanupEmptyAroundWidget(widget, stopAt) {
+  let current2 = widget;
+  for (;; ) {
+    const parent = current2.parentElement;
+    if (!parent)
+      break;
+    let prev = current2.previousSibling;
+    while (prev) {
+      const next = prev.previousSibling;
+      if (isEmptyResidue(prev))
+        prev.parentNode?.removeChild(prev);
+      else
+        break;
+      prev = next;
+    }
+    let nxt = current2.nextSibling;
+    while (nxt) {
+      const next = nxt.nextSibling;
+      if (isEmptyResidue(nxt))
+        nxt.parentNode?.removeChild(nxt);
+      else
+        break;
+      nxt = next;
+    }
+    if (parent === stopAt)
+      break;
+    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current2;
+    if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
+      const gparent = parent.parentNode;
+      if (!gparent)
+        break;
+      gparent.replaceChild(current2, parent);
+      continue;
+    }
+    break;
+  }
+}
+function isEmptyResidue(node) {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.nodeValue ?? "").length === 0;
+  }
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const el = node;
+    if (el.tagName === "BR")
+      return true;
+    if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
+      return false;
+    return (el.textContent ?? "").length === 0;
+  }
+  return false;
 }
 async function replacePlaceholderMatches(root, script, allScripts, messageId, ctx, resolvedMap) {
   const textNodes = collectTextNodes(root);

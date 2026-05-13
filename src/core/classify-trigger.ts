@@ -35,11 +35,24 @@
  * The two axes are independent. Step 6 split them; Fix B added the fourth bucket.
  */
 
-export type TriggerKind = 'placeholder' | 'pairedTag' | 'delimitedCapture' | 'unknown';
+export type TriggerKind = 'placeholder' | 'pairedTag' | 'delimitedCapture' | 'delimitedCaptureMultiLine' | 'unknown';
 
-/** Kinds that render through the placeholder pipeline (text-node scan + $N). */
+/** Kinds that render through the placeholder pipeline (text-node scan + $N).
+ * Multi-line variant uses the linearize-bubble path inside the same pipeline. */
 export function isPlaceholderLikeKind(kind: TriggerKind): boolean {
-  return kind === 'placeholder' || kind === 'delimitedCapture';
+  return kind === 'placeholder' || kind === 'delimitedCapture' || kind === 'delimitedCaptureMultiLine';
+}
+
+// Heuristic: regex pattern needs to span multiple text nodes / paragraphs.
+// `[\s\S]` and `\n` in the source explicitly cross newlines; the `m` flag with
+// `^`/`$` anchors implies the author wrote line-aware matching. Anything else
+// stays single-line.
+function isMultiLineRegex(re: RegExp): boolean {
+  const src = re.source;
+  if (src.includes('[\\s\\S]')) return true;
+  if (src.includes('\\n')) return true;
+  if (re.flags.includes('m') && (src.includes('^') || src.includes('$'))) return true;
+  return false;
 }
 
 /**
@@ -206,7 +219,7 @@ export function isDelimitedCapture(re: RegExp): boolean {
 export function classifyTrigger(re: RegExp): TriggerKind {
   if (isPairedTag(re)) return 'pairedTag';
   if (isPlaceholder(re)) return 'placeholder';
-  if (isDelimitedCapture(re)) return 'delimitedCapture';
+  if (isDelimitedCapture(re)) return isMultiLineRegex(re) ? 'delimitedCaptureMultiLine' : 'delimitedCapture';
   return 'unknown';
 }
 

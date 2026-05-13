@@ -14,6 +14,7 @@ import {
 import { getCapturesForMessage } from '../hooks/tag-interceptor';
 import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
+import { getLinearizedBubble, invalidateLinearizedBubble, type OffsetMapEntry } from './linearize-bubble';
 
 // Expanded widget HTML → macro-resolved HTML, for one processNode pass.
 type ResolvedMap = Map<string, string>;
@@ -91,11 +92,16 @@ export async function processNode(
   try {
     for (const script of scripts) {
       // placeholder + delimitedCapture run through the post-DOMPurify text scan.
-      // pairedTag scripts go through registerTagInterceptor (pre-sanitizer) and
-      // surface here as captures via getCapturesForMessage. unknown is skipped
-      // (logged once at compile time).
+      // delimitedCaptureMultiLine routes through the linearize-bubble path
+      // (single regex across all text nodes in the bubble). pairedTag scripts
+      // go through registerTagInterceptor (pre-sanitizer) and surface here as
+      // captures via getCapturesForMessage. unknown is skipped.
       if (!isPlaceholderLikeKind(script.kind)) continue;
-      total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
+      if (script.kind === 'delimitedCaptureMultiLine') {
+        total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
+      } else {
+        total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
+      }
     }
     total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
   } catch (err) {
@@ -164,6 +170,19 @@ function collectExpandedTemplates(
   const textNodes = collectTextNodes(root);
   for (const script of scripts) {
     if (!isPlaceholderLikeKind(script.kind)) continue;
+    if (script.kind === 'delimitedCaptureMultiLine') {
+      const bubble = findContentRoot(root);
+      const linear = getLinearizedBubble(bubble);
+      script.findRe.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = script.findRe.exec(linear.text)) !== null) {
+        const groups = m.slice(1).map((g) => g ?? '');
+        const html = substitute(script.replaceString, m[0], groups);
+        out.add(applyNestedPipeline(html, scripts, new Set([script.id]), 0));
+        if (m[0].length === 0) script.findRe.lastIndex++;
+      }
+      continue;
+    }
     for (const tn of textNodes) {
       const text = tn.nodeValue ?? '';
       if (!text) continue;
@@ -193,6 +212,147 @@ function collectExpandedTemplates(
   }
 
   return [...out];
+}
+
+// ─── Multi-line placeholder pipeline ───────────────────────────────────
+//
+// `delimitedCaptureMultiLine` scripts use a single regex executed against the
+// linearized bubble (text + <br>→\n + <p>-gap→\n\n). When a match is found,
+// the corresponding DOM range is removed via the Range API and the widget is
+// inserted in its place. Matches are processed in reverse document order so
+// earlier offsets in the precomputed offsetMap remain valid after each splice.
+// Empty block ancestors that were drained by the deletion are pruned so we
+// don't leave stray empty <p> elements polluting the bubble.
+
+async function replaceMultiLineMatches(
+  root: HTMLElement,
+  script: CompiledScript,
+  allScripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+  resolvedMap: ResolvedMap,
+): Promise<number> {
+  const bubble = findContentRoot(root);
+  if (!bubble.isConnected) return 0;
+
+  const linear = getLinearizedBubble(bubble);
+  if (linear.text.length === 0) return 0;
+
+  script.findRe.lastIndex = 0;
+  const matches: Array<{ start: number; end: number; match: RegExpExecArray }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = script.findRe.exec(linear.text)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length, match: m });
+    if (m[0].length === 0) script.findRe.lastIndex++;
+  }
+  if (matches.length === 0) return 0;
+
+  if (hasRegisteredWidgetsFor(messageId, script.id)) {
+    destroyRegisteredWidgetsFor(messageId, script.id);
+  }
+
+  let count = 0;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const { start, end, match } = matches[i];
+    const groups = match.slice(1).map((g) => g ?? '');
+    const html = substitute(script.replaceString, match[0], groups);
+    const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
+    const fromMap = resolvedMap.get(expanded);
+    const fromCache = fromMap ?? resolutionCache.get(expanded);
+    const finalHtml = fromCache ?? expanded;
+
+    const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+    const placed = replaceLinearRange(bubble, linear.offsetMap, start, end, widget);
+    if (placed) {
+      count++;
+    } else if (widget.tagName === 'IFRAME') {
+      destroyWidgetIframe(widget as HTMLIFrameElement);
+    }
+  }
+
+  invalidateLinearizedBubble(bubble);
+  return count;
+}
+
+export function replaceLinearRange(
+  bubble: HTMLElement,
+  offsetMap: OffsetMapEntry[],
+  start: number,
+  end: number,
+  widget: HTMLElement,
+): boolean {
+  let startEntry: OffsetMapEntry | null = null;
+  let endEntry: OffsetMapEntry | null = null;
+  for (const e of offsetMap) {
+    if (!startEntry && e.sourceStart <= start && start < e.sourceEnd) startEntry = e;
+    if (e.sourceStart < end && end <= e.sourceEnd) endEntry = e;
+  }
+  if (!startEntry || !endEntry) return false;
+  if (!bubble.contains(startEntry.node) || !bubble.contains(endEntry.node)) return false;
+
+  const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
+  const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
+  let range: Range;
+  try {
+    range = document.createRange();
+    range.setStart(startEntry.node, startNodeOffset);
+    range.setEnd(endEntry.node, endNodeOffset);
+  } catch {
+    return false;
+  }
+  range.deleteContents();
+  range.insertNode(widget);
+  cleanupEmptyAroundWidget(widget, bubble);
+  return true;
+}
+
+const MULTILINE_BLOCK_TAGS = new Set([
+  'P', 'DIV', 'BLOCKQUOTE', 'PRE', 'UL', 'OL', 'LI',
+  'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+]);
+
+function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
+  let current: Element = widget;
+  for (;;) {
+    const parent = current.parentElement;
+    if (!parent) break;
+    let prev = current.previousSibling;
+    while (prev) {
+      const next = prev.previousSibling;
+      if (isEmptyResidue(prev)) prev.parentNode?.removeChild(prev);
+      else break;
+      prev = next;
+    }
+    let nxt = current.nextSibling;
+    while (nxt) {
+      const next = nxt.nextSibling;
+      if (isEmptyResidue(nxt)) nxt.parentNode?.removeChild(nxt);
+      else break;
+      nxt = next;
+    }
+    if (parent === stopAt) break;
+    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
+    if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
+      const gparent = parent.parentNode;
+      if (!gparent) break;
+      gparent.replaceChild(current, parent);
+      continue;
+    }
+    break;
+  }
+}
+
+function isEmptyResidue(node: Node): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return (node.nodeValue ?? '').length === 0;
+  }
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const el = node as HTMLElement;
+    if (el.tagName === 'BR') return true;
+    if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
+    return (el.textContent ?? '').length === 0;
+  }
+  return false;
 }
 
 // ─── Placeholder pipeline ──────────────────────────────────────────────

@@ -35,12 +35,12 @@ test('CJK brackets with captures classify as delimitedCapture', () => {
   expect(classifyTrigger(new RegExp('【SYS_HUD \\| Loc: (.*?) \\| Time: (.*?)】'))).toBe('delimitedCapture');
 });
 
-test('double CJK brackets with block capture classify as delimitedCapture', () => {
-  expect(classifyTrigger(new RegExp('『Present Characters Start』([\\s\\S]*?)『Present Characters End』'))).toBe('delimitedCapture');
+test('double CJK brackets with [\\s\\S] body classify as delimitedCaptureMultiLine', () => {
+  expect(classifyTrigger(new RegExp('『Present Characters Start』([\\s\\S]*?)『Present Characters End』'))).toBe('delimitedCaptureMultiLine');
 });
 
-test('asymmetric arrows with captures classify as delimitedCapture', () => {
-  expect(classifyTrigger(new RegExp('↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤'))).toBe('delimitedCapture');
+test('asymmetric arrows with [\\s\\S] body classify as delimitedCaptureMultiLine', () => {
+  expect(classifyTrigger(new RegExp('↦(\\S+)\\s([^:]+):([\\s\\S]*?)↤'))).toBe('delimitedCaptureMultiLine');
 });
 
 test('corner brackets with capture classify as delimitedCapture', () => {
@@ -51,11 +51,26 @@ test('double angle brackets with capture classify as delimitedCapture', () => {
   expect(classifyTrigger(new RegExp('《(.*?)》'))).toBe('delimitedCapture');
 });
 
-test('START OF / END OF textual markers with capture classify as delimitedCapture', () => {
+test('START OF / END OF textual markers with [\\s\\S] body classify as delimitedCaptureMultiLine', () => {
   const re = new RegExp('\\[\\s*START OF ANN SYS\\s*\\]([\\s\\S]*?)\\[\\s*END OF ANN SYS\\s*\\]');
-  expect(classifyTrigger(re)).toBe('delimitedCapture');
+  expect(classifyTrigger(re)).toBe('delimitedCaptureMultiLine');
 });
 
 test('capture with no recognized delimiter classifies as unknown', () => {
   expect(classifyTrigger(/foo(.*?)bar/)).toBe('unknown');
+});
+
+// ─── delimitedCaptureMultiLine — additional heuristics ──────────────────
+// The unicode cases above with [\s\S] in the body now classify as
+// delimitedCaptureMultiLine (regression-checked); the remaining heuristics
+// for m-flag and explicit \n are covered here.
+
+test('m flag plus ^ anchor classifies as delimitedCaptureMultiLine', () => {
+  const re = new RegExp('【block】([^\\n]+)$', 'm');
+  expect(classifyTrigger(re)).toBe('delimitedCaptureMultiLine');
+});
+
+test('explicit \\\\n in source classifies as delimitedCaptureMultiLine', () => {
+  const re = new RegExp('【capt】([^\\n]+)\\n([^\\n]+)');
+  expect(classifyTrigger(re)).toBe('delimitedCaptureMultiLine');
 });
