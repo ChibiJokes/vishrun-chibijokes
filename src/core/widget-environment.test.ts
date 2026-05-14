@@ -2,6 +2,7 @@ import { test, expect, beforeEach } from 'bun:test';
 import {
   classifyWidgetEnvironment,
   shouldInjectThHelpersShim,
+  shouldInjectJQuery,
   extractScriptBodies,
   __resetWidgetEnvironmentCacheForTests,
 } from './widget-environment';
@@ -146,6 +147,14 @@ test('shouldInjectThHelpersShim activates for helpers-light/jq/mvu', () => {
   expect(shouldInjectThHelpersShim('tavern-jq')).toBe(true);
   expect(shouldInjectThHelpersShim('tavern-mvu')).toBe(true);
   expect(shouldInjectThHelpersShim('tavern-slash')).toBe(false);
+});
+
+test('shouldInjectJQuery activates for jq/mvu only', () => {
+  expect(shouldInjectJQuery('static')).toBe(false);
+  expect(shouldInjectJQuery('tavern-helpers-light')).toBe(false);
+  expect(shouldInjectJQuery('tavern-jq')).toBe(true);
+  expect(shouldInjectJQuery('tavern-mvu')).toBe(true);
+  expect(shouldInjectJQuery('tavern-slash')).toBe(false);
 });
 
 test('dollar sign in CSS selector strings (not call) does NOT escalate', () => {

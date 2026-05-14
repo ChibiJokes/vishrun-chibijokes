@@ -101,6 +101,10 @@ export function shouldInjectThHelpersShim(env: WidgetEnvironment): boolean {
   );
 }
 
+export function shouldInjectJQuery(env: WidgetEnvironment): boolean {
+  return env === 'tavern-jq' || env === 'tavern-mvu';
+}
+
 export function __resetWidgetEnvironmentCacheForTests(): void {
   stringCache.clear();
 }
