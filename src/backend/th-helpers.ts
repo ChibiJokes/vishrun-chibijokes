@@ -10,7 +10,7 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-chat-messages' | 'th-set-chat-message';
+  op: 'th-get-messages-snapshot' | 'th-set-chat-message';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -40,9 +40,6 @@ function isThHelpersRequest(p: unknown): p is ThHelpersRequest {
   );
 }
 
-// Resolve a JSR-style range argument ('0', '-1', 'latest', 0, etc.) to a
-// zero-based index into the chat messages array. Returns null when the
-// input doesn't make sense for our acotado set of supported call shapes.
 function resolveRangeToIndex(
   range: unknown,
   total: number,
@@ -64,54 +61,53 @@ function resolveRangeToIndex(
   return null;
 }
 
-function shapeMessage(
-  msg: ChatMessageDTO & { role?: string; extra?: Record<string, unknown> },
-  includeSwipes: boolean,
-): Record<string, unknown> {
-  const role = typeof msg.role === 'string' ? msg.role : msg.is_user ? 'user' : 'assistant';
-  const base: Record<string, unknown> = {
+// Rich snapshot row: bakes both .message (active swipe content) and .swipes
+// so the iframe-side shim can shape the JSR ChatMessage vs ChatMessageSwiped
+// variants synchronously without round-tripping back to the backend.
+export interface SnapshotMessage {
+  message_id: number;
+  name: string;
+  role: 'system' | 'user' | 'assistant';
+  is_hidden: boolean;
+  message: string;
+  swipe_id: number;
+  swipes: string[];
+  data: Record<string, unknown>;
+  extra: Record<string, unknown>;
+}
+
+function shapeSnapshotMessage(
+  msg: ChatMessageDTO & { role?: 'system' | 'user' | 'assistant'; extra?: Record<string, unknown> },
+): SnapshotMessage {
+  const role =
+    msg.role === 'system' || msg.role === 'user' || msg.role === 'assistant'
+      ? msg.role
+      : msg.is_user
+        ? 'user'
+        : 'assistant';
+  const swipes =
+    Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
+  return {
     message_id: msg.index_in_chat,
     name: msg.name,
     role,
     is_hidden: false,
+    message: msg.content,
+    swipe_id: msg.swipe_id ?? 0,
+    swipes,
+    data: {},
+    extra: msg.extra ?? {},
   };
-  if (includeSwipes) {
-    base.swipe_id = msg.swipe_id ?? 0;
-    base.swipes = Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
-    base.swipes_data = (base.swipes as string[]).map(() => ({}));
-    base.swipes_info = (base.swipes as string[]).map(() => ({}));
-  } else {
-    base.message = msg.content;
-    base.data = {};
-    base.extra = msg.extra ?? {};
-  }
-  return base;
 }
 
 type ChatApi = SpindleAPI['chat'];
 
-export async function handleGetChatMessages(
-  body: Record<string, unknown>,
+export async function handleGetMessagesSnapshot(
   chatId: string,
-  currentMessageIndex: number,
   chat: ChatApi = api.chat,
-): Promise<unknown[]> {
-  const range = body.range;
-  const opts = (body.opts as Record<string, unknown> | undefined) ?? {};
-  const includeSwipes = opts.include_swipe === true || opts.include_swipes === true;
-
+): Promise<SnapshotMessage[]> {
   const messages = await chat.getMessages(chatId);
-  const total = messages.length;
-  if (total === 0) return [];
-
-  const idx = resolveRangeToIndex(range, total, currentMessageIndex);
-  if (idx === null) {
-    log.debug('getChatMessages: unsupported range', range);
-    return [];
-  }
-  if (idx < 0 || idx >= total) return [];
-
-  return [shapeMessage(messages[idx] as ChatMessageDTO, includeSwipes)];
+  return messages.map((m) => shapeSnapshotMessage(m as ChatMessageDTO));
 }
 
 export async function handleSetChatMessage(
@@ -159,8 +155,8 @@ export function installThHelpersHandler(): void {
     void (async () => {
       let response: ThHelpersResponse;
       try {
-        if (op === 'th-get-chat-messages') {
-          const result = await handleGetChatMessages(body, chatId, currentMessageIndex);
+        if (op === 'th-get-messages-snapshot') {
+          const result = await handleGetMessagesSnapshot(chatId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

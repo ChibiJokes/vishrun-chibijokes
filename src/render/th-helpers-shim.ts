@@ -1,6 +1,10 @@
-// TS twin of the ES5 shim string that lives in widget-iframe.ts as
-// `thHelpersShim()`. Mirror the logic in both — the twin is testable
-// with happy-dom, the string runs inside the sandbox iframe.
+import type { SnapshotMessage } from '../backend/th-helpers';
+
+// TS twin of the ES5 shim string that lives below as `thHelpersShim()`.
+// Mirror the logic in both — the twin is testable with happy-dom, the
+// string runs inside the sandbox iframe. getChatMessages and the two
+// id helpers are sync per the JSR contract (cards call them without
+// await); setChatMessage stays async via the backend round-trip.
 
 export interface ThHelpersBridge {
   postRequest(kind: string, payload: Record<string, unknown>): Promise<unknown>;
@@ -10,17 +14,91 @@ export interface ThHelpersConstants {
   currentMessageIndex: number;
   currentMessageId: string;
   chatId: string;
+  messagesSnapshot: SnapshotMessage[];
+}
+
+export interface ChatMessageNonSwiped {
+  message_id: number;
+  name: string;
+  role: 'system' | 'user' | 'assistant';
+  is_hidden: boolean;
+  message: string;
+  data: Record<string, unknown>;
+  extra: Record<string, unknown>;
+}
+
+export interface ChatMessageSwiped {
+  message_id: number;
+  name: string;
+  role: 'system' | 'user' | 'assistant';
+  is_hidden: boolean;
+  swipe_id: number;
+  swipes: string[];
+  swipes_data: Record<string, unknown>[];
+  swipes_info: Record<string, unknown>[];
 }
 
 export interface ThHelpersHandle {
   getCurrentMessageId(): number;
   getChatId(): string;
-  getChatMessages(range: string | number, opts?: Record<string, unknown>): Promise<unknown>;
+  getChatMessages(
+    range: string | number,
+    opts?: Record<string, unknown>,
+  ): Array<ChatMessageNonSwiped | ChatMessageSwiped>;
   setChatMessage(
     fieldValues: string | Record<string, unknown>,
     messageId: number | string,
     opts?: Record<string, unknown>,
   ): Promise<void>;
+}
+
+function resolveRangeToIndex(
+  range: unknown,
+  total: number,
+  currentMessageIndex: number,
+): number | null {
+  if (total === 0) return null;
+  if (typeof range === 'number') {
+    return range >= 0 ? range : total + range;
+  }
+  if (typeof range === 'string') {
+    const trimmed = range.trim();
+    if (trimmed === '' || trimmed === 'latest') return total - 1;
+    if (trimmed === 'this') return currentMessageIndex;
+    if (/^-?\d+$/.test(trimmed)) {
+      const n = parseInt(trimmed, 10);
+      return n >= 0 ? n : total + n;
+    }
+  }
+  return null;
+}
+
+function shapeFromSnapshot(
+  msg: SnapshotMessage,
+  includeSwipes: boolean,
+): ChatMessageNonSwiped | ChatMessageSwiped {
+  if (includeSwipes) {
+    const swipes = msg.swipes;
+    return {
+      message_id: msg.message_id,
+      name: msg.name,
+      role: msg.role,
+      is_hidden: msg.is_hidden,
+      swipe_id: msg.swipe_id,
+      swipes,
+      swipes_data: swipes.map(() => ({})),
+      swipes_info: swipes.map(() => ({})),
+    };
+  }
+  return {
+    message_id: msg.message_id,
+    name: msg.name,
+    role: msg.role,
+    is_hidden: msg.is_hidden,
+    message: msg.message,
+    data: msg.data,
+    extra: msg.extra,
+  };
 }
 
 export function createThHelpers(
@@ -34,12 +112,13 @@ export function createThHelpers(
     getChatId(): string {
       return consts.chatId;
     },
-    async getChatMessages(range, opts) {
-      const result = await bridge.postRequest('th-get-chat-messages', {
-        range,
-        opts: opts ?? {},
-      });
-      return result;
+    getChatMessages(range, opts) {
+      const snap = consts.messagesSnapshot;
+      const idx = resolveRangeToIndex(range, snap.length, consts.currentMessageIndex);
+      if (idx === null || idx < 0 || idx >= snap.length) return [];
+      const includeSwipes =
+        !!opts && (opts.include_swipe === true || opts.include_swipes === true);
+      return [shapeFromSnapshot(snap[idx], includeSwipes)];
     },
     async setChatMessage(fieldValues, messageId, opts) {
       const normalized =
@@ -53,15 +132,16 @@ export function createThHelpers(
   };
 }
 
-// ES5 shim string injected into the iframe srcdoc head. The host-side
-// frontend module routes 'th-request' postMessages to backend via
-// ctx.sendToBackend and forwards backend responses back to the iframe
-// via frame.postMessage with kind 'th-response'.
+// ES5 shim string injected into the iframe srcdoc head. getChatMessages
+// and the two id helpers resolve synchronously from a baked snapshot;
+// setChatMessage goes through the postMessage bridge to backend
+// (host-side dispatcher posts 'th-response' back keyed by requestId).
 export function thHelpersShim(consts: ThHelpersConstants): string {
   const constsJson = JSON.stringify({
     currentMessageIndex: consts.currentMessageIndex,
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
+    messagesSnapshot: consts.messagesSnapshot,
   });
   return `<script>(function(){
 var THC = ${constsJson};
@@ -98,10 +178,43 @@ function postRequest(kind, body){
     }
   });
 }
+function resolveIdx(range, total, cur){
+  if (total === 0) return null;
+  if (typeof range === 'number') return range >= 0 ? range : total + range;
+  if (typeof range === 'string') {
+    var t = range.trim();
+    if (t === '' || t === 'latest') return total - 1;
+    if (t === 'this') return cur;
+    if (/^-?\\d+$/.test(t)) {
+      var n = parseInt(t, 10);
+      return n >= 0 ? n : total + n;
+    }
+  }
+  return null;
+}
+function shape(m, withSwipes){
+  if (withSwipes) {
+    var sw = m.swipes;
+    var blanks = [];
+    for (var i = 0; i < sw.length; i++) blanks.push({});
+    return {
+      message_id: m.message_id, name: m.name, role: m.role, is_hidden: m.is_hidden,
+      swipe_id: m.swipe_id, swipes: sw, swipes_data: blanks.slice(), swipes_info: blanks.slice()
+    };
+  }
+  return {
+    message_id: m.message_id, name: m.name, role: m.role, is_hidden: m.is_hidden,
+    message: m.message, data: m.data, extra: m.extra
+  };
+}
 window.getCurrentMessageId = function(){ return THC.currentMessageIndex; };
 window.getChatId = function(){ return THC.chatId; };
 window.getChatMessages = function(range, opts){
-  return postRequest('th-get-chat-messages', { range: range, opts: opts || {} });
+  var snap = THC.messagesSnapshot;
+  var idx = resolveIdx(range, snap.length, THC.currentMessageIndex);
+  if (idx === null || idx < 0 || idx >= snap.length) return [];
+  var withSwipes = !!opts && (opts.include_swipe === true || opts.include_swipes === true);
+  return [shape(snap[idx], withSwipes)];
 };
 window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;

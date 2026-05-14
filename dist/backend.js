@@ -373,42 +373,24 @@ function resolveRangeToIndex(range, total, currentMessageIndex) {
   }
   return null;
 }
-function shapeMessage(msg, includeSwipes) {
-  const role = typeof msg.role === "string" ? msg.role : msg.is_user ? "user" : "assistant";
-  const base = {
+function shapeSnapshotMessage(msg) {
+  const role = msg.role === "system" || msg.role === "user" || msg.role === "assistant" ? msg.role : msg.is_user ? "user" : "assistant";
+  const swipes = Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
+  return {
     message_id: msg.index_in_chat,
     name: msg.name,
     role,
-    is_hidden: false
+    is_hidden: false,
+    message: msg.content,
+    swipe_id: msg.swipe_id ?? 0,
+    swipes,
+    data: {},
+    extra: msg.extra ?? {}
   };
-  if (includeSwipes) {
-    base.swipe_id = msg.swipe_id ?? 0;
-    base.swipes = Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
-    base.swipes_data = base.swipes.map(() => ({}));
-    base.swipes_info = base.swipes.map(() => ({}));
-  } else {
-    base.message = msg.content;
-    base.data = {};
-    base.extra = msg.extra ?? {};
-  }
-  return base;
 }
-async function handleGetChatMessages(body, chatId, currentMessageIndex, chat = api.chat) {
-  const range = body.range;
-  const opts = body.opts ?? {};
-  const includeSwipes = opts.include_swipe === true || opts.include_swipes === true;
+async function handleGetMessagesSnapshot(chatId, chat = api.chat) {
   const messages = await chat.getMessages(chatId);
-  const total = messages.length;
-  if (total === 0)
-    return [];
-  const idx = resolveRangeToIndex(range, total, currentMessageIndex);
-  if (idx === null) {
-    log.debug("getChatMessages: unsupported range", range);
-    return [];
-  }
-  if (idx < 0 || idx >= total)
-    return [];
-  return [shapeMessage(messages[idx], includeSwipes)];
+  return messages.map((m) => shapeSnapshotMessage(m));
 }
 async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = api.chat) {
   const fieldValues = body.fieldValues ?? {};
@@ -445,8 +427,8 @@ function installThHelpersHandler() {
     (async () => {
       let response;
       try {
-        if (op === "th-get-chat-messages") {
-          const result = await handleGetChatMessages(body, chatId, currentMessageIndex);
+        if (op === "th-get-messages-snapshot") {
+          const result = await handleGetMessagesSnapshot(chatId);
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

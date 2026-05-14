@@ -844,7 +844,8 @@ function thHelpersShim(consts) {
   const constsJson = JSON.stringify({
     currentMessageIndex: consts.currentMessageIndex,
     currentMessageId: consts.currentMessageId,
-    chatId: consts.chatId
+    chatId: consts.chatId,
+    messagesSnapshot: consts.messagesSnapshot
   });
   return `<script>(function(){
 var THC = ${constsJson};
@@ -881,10 +882,43 @@ function postRequest(kind, body){
     }
   });
 }
+function resolveIdx(range, total, cur){
+  if (total === 0) return null;
+  if (typeof range === 'number') return range >= 0 ? range : total + range;
+  if (typeof range === 'string') {
+    var t = range.trim();
+    if (t === '' || t === 'latest') return total - 1;
+    if (t === 'this') return cur;
+    if (/^-?\\d+$/.test(t)) {
+      var n = parseInt(t, 10);
+      return n >= 0 ? n : total + n;
+    }
+  }
+  return null;
+}
+function shape(m, withSwipes){
+  if (withSwipes) {
+    var sw = m.swipes;
+    var blanks = [];
+    for (var i = 0; i < sw.length; i++) blanks.push({});
+    return {
+      message_id: m.message_id, name: m.name, role: m.role, is_hidden: m.is_hidden,
+      swipe_id: m.swipe_id, swipes: sw, swipes_data: blanks.slice(), swipes_info: blanks.slice()
+    };
+  }
+  return {
+    message_id: m.message_id, name: m.name, role: m.role, is_hidden: m.is_hidden,
+    message: m.message, data: m.data, extra: m.extra
+  };
+}
 window.getCurrentMessageId = function(){ return THC.currentMessageIndex; };
 window.getChatId = function(){ return THC.chatId; };
 window.getChatMessages = function(range, opts){
-  return postRequest('th-get-chat-messages', { range: range, opts: opts || {} });
+  var snap = THC.messagesSnapshot;
+  var idx = resolveIdx(range, snap.length, THC.currentMessageIndex);
+  if (idx === null || idx < 0 || idx >= snap.length) return [];
+  var withSwipes = !!opts && (opts.include_swipe === true || opts.include_swipes === true);
+  return [shape(snap[idx], withSwipes)];
 };
 window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
@@ -906,6 +940,13 @@ function isThRequest(p) {
     return false;
   const r = p;
   return r.kind === "th-request" && typeof r.requestId === "string" && typeof r.op === "string" && !!r.body && typeof r.body === "object";
+}
+var backendRequestCounter = 0;
+function nextBackendRequestId() {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
 }
 function dispatchThRequest(frame, request, context, ctx) {
   const { requestId, op, body } = request;
@@ -951,6 +992,58 @@ function dispatchThRequest(frame, request, context, ctx) {
   } catch (err) {
     respond({ ok: false, error: err instanceof Error ? err.message : String(err) });
   }
+}
+function fetchMessagesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const requestId = nextBackendRequestId();
+    let settled = false;
+    let unsub = null;
+    let timer = null;
+    const finish = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try {
+          unsub();
+        } catch {}
+        unsub = null;
+      }
+      resolve(value);
+    };
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isThHelpersResponse(payload, requestId))
+        return;
+      if (payload.ok && Array.isArray(payload.result)) {
+        finish(payload.result);
+      } else {
+        console.warn("[vishrun:th-helpers] messages snapshot fetch failed:", payload.ok ? "malformed result" : payload.error || "unknown error");
+        finish([]);
+      }
+    });
+    timer = setTimeout(() => {
+      console.warn("[vishrun:th-helpers] messages snapshot fetch timed out");
+      finish([]);
+    }, timeoutMs);
+    try {
+      ctx.sendToBackend({
+        type: "th_helpers_request",
+        requestId,
+        op: "th-get-messages-snapshot",
+        chatId: context.chatId,
+        currentMessageId: context.currentMessageId,
+        currentMessageIndex: context.currentMessageIndex,
+        body: {}
+      });
+    } catch (err) {
+      console.warn("[vishrun:th-helpers] sendToBackend threw:", err instanceof Error ? err.message : String(err));
+      finish([]);
+    }
+  });
 }
 function computeMessageIndexInChat(messageId, doc = document) {
   const all = doc.querySelectorAll("[data-message-id]");
@@ -1041,11 +1134,13 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   const active = ctx.getActiveChat();
   const chatId = active.chatId ?? "";
   const currentMessageIndex = computeMessageIndexInChat(messageId);
+  const messagesSnapshot = shouldInjectThHelpersShim(env) ? await fetchMessagesSnapshot({ chatId, currentMessageId: messageId, currentMessageIndex }, ctx) : [];
   const srcdoc = await injectShimsAndSizeReporter(html, ctx, {
     env,
     chatId,
     messageId,
-    currentMessageIndex
+    currentMessageIndex,
+    messagesSnapshot
   });
   const frame = ctx.dom.createSandboxFrame({
     html: srcdoc,
@@ -1122,7 +1217,8 @@ function buildHeadInjection(iframeCtx) {
   const thHelpers = shouldInjectThHelpersShim(iframeCtx.env) ? thHelpersShim({
     currentMessageIndex: iframeCtx.currentMessageIndex,
     currentMessageId: iframeCtx.messageId,
-    chatId: iframeCtx.chatId
+    chatId: iframeCtx.chatId,
+    messagesSnapshot: iframeCtx.messagesSnapshot
   }) : "";
   return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + thHelpers;
 }

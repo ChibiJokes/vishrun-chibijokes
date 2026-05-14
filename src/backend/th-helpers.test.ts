@@ -1,7 +1,7 @@
 import { test, expect, mock } from 'bun:test';
-import { handleGetChatMessages, handleSetChatMessage } from './th-helpers';
+import { handleGetMessagesSnapshot, handleSetChatMessage } from './th-helpers';
 
-function makeMessages(specs: Array<{ id?: string; content: string; swipes?: string[]; swipeId?: number; isUser?: boolean }>) {
+function makeMessages(specs: Array<{ id?: string; content: string; swipes?: string[]; swipeId?: number; isUser?: boolean; extra?: Record<string, unknown> }>) {
   return specs.map((s, i) => ({
     id: s.id ?? `msg-${i}`,
     chat_id: 'chat-1',
@@ -13,7 +13,7 @@ function makeMessages(specs: Array<{ id?: string; content: string; swipes?: stri
     swipe_id: s.swipeId ?? 0,
     swipes: s.swipes ?? [s.content],
     swipe_dates: [0],
-    extra: {},
+    extra: s.extra ?? {},
     parent_message_id: null,
     branch_id: null,
     created_at: 0,
@@ -48,88 +48,45 @@ function makeChatApi(initial: ReturnType<typeof makeMessages>) {
   };
 }
 
-test('getChatMessages range "0" returns first message non-swipe shape', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'greet' }, { content: 'reply', isUser: true }]));
-  const out = (await handleGetChatMessages({ range: '0', opts: {} }, 'chat-1', 0, api.chat)) as Array<Record<string, unknown>>;
-  expect(out.length).toBe(1);
-  expect(out[0].message_id).toBe(0);
-  expect(out[0].message).toBe('greet');
-  expect((out[0] as { swipes?: unknown }).swipes).toBeUndefined();
+test('handleGetMessagesSnapshot returns rich shape per message with .message and .swipes', async () => {
+  const api = makeChatApi(makeMessages([
+    { content: 'greeting', swipes: ['greeting', 'alt1', 'alt2'], swipeId: 0 },
+    { content: 'user line', isUser: true },
+    { content: 'assistant reply', swipes: ['assistant reply'], swipeId: 0, extra: { reason: 'ok' } },
+  ]));
+  const snap = await handleGetMessagesSnapshot('chat-1', api.chat);
+  expect(snap.length).toBe(3);
+  expect(snap[0]).toEqual({
+    message_id: 0,
+    name: 'char',
+    role: 'assistant',
+    is_hidden: false,
+    message: 'greeting',
+    swipe_id: 0,
+    swipes: ['greeting', 'alt1', 'alt2'],
+    data: {},
+    extra: {},
+  });
+  expect(snap[1].role).toBe('user');
+  expect(snap[1].name).toBe('user');
+  expect(snap[2].extra).toEqual({ reason: 'ok' });
 });
 
-test('getChatMessages with include_swipe returns swipes array', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'g1', swipes: ['g1', 'g2', 'g3'], swipeId: 0 }]));
-  const out = (await handleGetChatMessages(
-    { range: '0', opts: { include_swipe: true } },
-    'chat-1',
-    0,
-    api.chat,
-  )) as Array<Record<string, unknown>>;
-  expect(out[0].swipes).toEqual(['g1', 'g2', 'g3']);
-  expect(out[0].swipe_id).toBe(0);
-  expect((out[0] as { message?: unknown }).message).toBeUndefined();
+test('handleGetMessagesSnapshot fills swipes with [content] when message has no swipes array', async () => {
+  const api = makeChatApi(makeMessages([{ content: 'solo' }]));
+  // Simulate a row whose .swipes is empty (some old chats).
+  (api.getMessages()[0] as { swipes: string[] }).swipes = [];
+  const snap = await handleGetMessagesSnapshot('chat-1', api.chat);
+  expect(snap[0].swipes).toEqual(['solo']);
 });
 
-test('getChatMessages with include_swipes (plural) also returns swipes', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'x', swipes: ['x', 'y'] }]));
-  const out = (await handleGetChatMessages(
-    { range: 0, opts: { include_swipes: true } },
-    'chat-1',
-    0,
-    api.chat,
-  )) as Array<Record<string, unknown>>;
-  expect(out[0].swipes).toEqual(['x', 'y']);
-});
-
-test('getChatMessages numeric range', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'a' }, { content: 'b' }, { content: 'c' }]));
-  const out = (await handleGetChatMessages({ range: 2, opts: {} }, 'chat-1', 0, api.chat)) as Array<Record<string, unknown>>;
-  expect(out[0].message).toBe('c');
-});
-
-test('getChatMessages "latest" returns last', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'a' }, { content: 'b' }]));
-  const out = (await handleGetChatMessages({ range: 'latest', opts: {} }, 'chat-1', 0, api.chat)) as Array<Record<string, unknown>>;
-  expect(out[0].message).toBe('b');
-});
-
-test('getChatMessages negative index counts from end', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'a' }, { content: 'b' }, { content: 'c' }]));
-  const out = (await handleGetChatMessages({ range: -1, opts: {} }, 'chat-1', 0, api.chat)) as Array<Record<string, unknown>>;
-  expect(out[0].message).toBe('c');
-});
-
-test('getChatMessages out-of-range returns []', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'a' }]));
-  const out = await handleGetChatMessages({ range: 5, opts: {} }, 'chat-1', 0, api.chat);
-  expect(out).toEqual([]);
-});
-
-test('getChatMessages on empty chat returns []', async () => {
+test('handleGetMessagesSnapshot on empty chat returns []', async () => {
   const api = makeChatApi(makeMessages([]));
-  const out = await handleGetChatMessages({ range: '0', opts: {} }, 'chat-1', 0, api.chat);
-  expect(out).toEqual([]);
+  const snap = await handleGetMessagesSnapshot('chat-1', api.chat);
+  expect(snap).toEqual([]);
 });
 
-test('getChatMessages "this" uses currentMessageIndex', async () => {
-  const api = makeChatApi(makeMessages([{ content: 'a' }, { content: 'b' }, { content: 'c' }]));
-  const out = (await handleGetChatMessages({ range: 'this', opts: {} }, 'chat-1', 1, api.chat)) as Array<Record<string, unknown>>;
-  expect(out[0].message).toBe('b');
-});
-
-test('getChatMessages unsupported range returns []', async () => {
-  const restoreDebug = console.debug;
-  console.debug = mock(() => {});
-  try {
-    const api = makeChatApi(makeMessages([{ content: 'a' }]));
-    const out = await handleGetChatMessages({ range: { weird: true }, opts: {} }, 'chat-1', 0, api.chat);
-    expect(out).toEqual([]);
-  } finally {
-    console.debug = restoreDebug;
-  }
-});
-
-test('setChatMessage writes content patch via updateMessage', async () => {
+test('handleSetChatMessage writes content patch via updateMessage', async () => {
   const api = makeChatApi(makeMessages([{ content: 'orig', swipes: ['orig', 'alt'], swipeId: 0 }]));
   await handleSetChatMessage(
     { fieldValues: { message: 'new' }, messageId: 0, opts: { swipe_id: 1 } },
@@ -142,7 +99,7 @@ test('setChatMessage writes content patch via updateMessage', async () => {
   ]);
 });
 
-test('setChatMessage without swipe_id omits it from patch', async () => {
+test('handleSetChatMessage without swipe_id omits it from patch', async () => {
   const api = makeChatApi(makeMessages([{ content: 'a' }]));
   await handleSetChatMessage(
     { fieldValues: { message: 'b' }, messageId: 0, opts: {} },
@@ -153,7 +110,7 @@ test('setChatMessage without swipe_id omits it from patch', async () => {
   expect(api.updates[0].patch).toEqual({ content: 'b' });
 });
 
-test('setChatMessage ignores write when message missing', async () => {
+test('handleSetChatMessage ignores write when message field missing', async () => {
   const restoreWarn = console.warn;
   console.warn = mock(() => {});
   try {
@@ -170,7 +127,7 @@ test('setChatMessage ignores write when message missing', async () => {
   }
 });
 
-test('setChatMessage ignores write on out-of-range message id', async () => {
+test('handleSetChatMessage ignores write on out-of-range message id', async () => {
   const restoreWarn = console.warn;
   console.warn = mock(() => {});
   try {
@@ -187,7 +144,7 @@ test('setChatMessage ignores write on out-of-range message id', async () => {
   }
 });
 
-test('setChatMessage skips entirely on empty chat', async () => {
+test('handleSetChatMessage skips on empty chat', async () => {
   const restoreWarn = console.warn;
   console.warn = mock(() => {});
   try {
@@ -202,4 +159,26 @@ test('setChatMessage skips entirely on empty chat', async () => {
   } finally {
     console.warn = restoreWarn;
   }
+});
+
+test('handleSetChatMessage resolves messageId="0" string to first message', async () => {
+  const api = makeChatApi(makeMessages([{ content: 'orig' }]));
+  await handleSetChatMessage(
+    { fieldValues: { message: 'new' }, messageId: '0', opts: {} },
+    'chat-1',
+    0,
+    api.chat,
+  );
+  expect(api.updates[0].messageId).toBe('msg-0');
+});
+
+test('handleSetChatMessage with negative messageId counts from end', async () => {
+  const api = makeChatApi(makeMessages([{ content: 'a' }, { content: 'b' }, { content: 'c' }]));
+  await handleSetChatMessage(
+    { fieldValues: { message: 'new' }, messageId: -1, opts: {} },
+    'chat-1',
+    0,
+    api.chat,
+  );
+  expect(api.updates[0].messageId).toBe('msg-2');
 });
