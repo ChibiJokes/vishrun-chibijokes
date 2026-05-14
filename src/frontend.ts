@@ -3,10 +3,12 @@ import { fetchCharacter, extractRegexScripts } from './lumiverse/fetch-character
 import { setActiveCard, clearActiveCard, getActiveCard } from './state/active-card';
 import { installMessageHooks } from './hooks/message-rendered';
 import { rebuildCapturesFromContent } from './hooks/tag-interceptor';
+import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 
 interface ChatChangedPayload {
   chatId?: string | null;
   characterId?: string | null;
+  changedFields?: string[];
 }
 
 interface MessageEventPayload {
@@ -72,6 +74,8 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubChatChanged = ctx.events.on('CHAT_CHANGED', (payload: unknown) => {
     const p = (payload || {}) as ChatChangedPayload;
+    console.log('[VISHRUN_LISTENER_A]', JSON.stringify({ characterId: p.characterId, changedFields: p.changedFields })); // VISHRUN_DEBUG_INSTRUMENTATION
+    if (!shouldRescanForChangedFields(p.changedFields)) return;
     void loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
   });
 

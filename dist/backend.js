@@ -99,6 +99,7 @@ function unmaskInvalidMacros(text, masks) {
 }
 var SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/g;
 var NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
+var chatSetvarMutex = new Map;
 async function applyAndStripSetvars(template, chatId, userId, vars = api.variables) {
   const matches = [];
   for (const m of template.matchAll(SETVAR_RE)) {
@@ -107,13 +108,48 @@ async function applyAndStripSetvars(template, chatId, userId, vars = api.variabl
   }
   if (matches.length === 0)
     return template;
+  const prev = chatSetvarMutex.get(chatId) ?? Promise.resolve();
+  const work = prev.then(() => runApplyAndStripSetvars(template, chatId, userId, vars, matches));
+  chatSetvarMutex.set(chatId, work.catch(() => {
+    return;
+  }));
+  return work;
+}
+async function runApplyAndStripSetvars(template, chatId, userId, vars, matches) {
+  let localBag = null;
+  let chatBag = null;
+  const needLocal = matches.some((m) => m.kind === "setvar" && NAME_RE.test(m.name));
+  const needChat = matches.some((m) => m.kind === "setchatvar" && NAME_RE.test(m.name));
+  if (needLocal) {
+    try {
+      localBag = await vars.local.list(chatId);
+    } catch {
+      localBag = null;
+    }
+  }
+  if (needChat) {
+    try {
+      chatBag = await vars.chat.list(chatId);
+    } catch {
+      chatBag = null;
+    }
+  }
+  console.log("[VISHRUN_SETVAR_WRITE]", JSON.stringify({ count: matches.length, names: matches.map((m) => `${m.kind}::${m.name}`) }));
   const stripFlags = new Array(matches.length).fill(false);
   for (let i = 0;i < matches.length; i++) {
     const { kind, name, value } = matches[i];
     if (!NAME_RE.test(name))
       continue;
+    const currentBag = kind === "setvar" ? localBag : kind === "setchatvar" ? chatBag : null;
+    if (currentBag && currentBag[name] === value) {
+      console.log("[VISHRUN_SETVAR_SKIP]", JSON.stringify({ kind, name, reason: "idempotent" }));
+      stripFlags[i] = true;
+      continue;
+    }
     try {
       stripFlags[i] = await applySetvarOp({ kind, name, value }, chatId, userId, vars);
+      if (stripFlags[i] && currentBag)
+        currentBag[name] = value;
     } catch (err) {
       varsLog.warn("setvar persist failed:", { kind, name, err: err instanceof Error ? err.message : String(err) });
     }

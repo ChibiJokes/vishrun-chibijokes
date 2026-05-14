@@ -81,13 +81,19 @@ function unmaskInvalidMacros(text: string, masks: string[]): string {
 const SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/g;
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
+// Per-chat promise queue. Serializes applyAndStripSetvars across concurrent
+// resolve_macros requests so each invocation's bag.list() reflects all
+// prior writes to the same chat.
+const chatSetvarMutex = new Map<string, Promise<unknown>>();
+
+interface SetvarMatch { start: number; end: number; kind: string; name: string; value: string }
+
 export async function applyAndStripSetvars(
   template: string,
   chatId: string,
   userId: string,
   vars: VarsApi = api.variables,
 ): Promise<string> {
-  interface SetvarMatch { start: number; end: number; kind: string; name: string; value: string }
   const matches: SetvarMatch[] = [];
   for (const m of template.matchAll(SETVAR_RE)) {
     const [match, kind, name, value] = m;
@@ -95,12 +101,46 @@ export async function applyAndStripSetvars(
   }
   if (matches.length === 0) return template;
 
+  const prev = chatSetvarMutex.get(chatId) ?? Promise.resolve();
+  const work = prev.then(() => runApplyAndStripSetvars(template, chatId, userId, vars, matches));
+  chatSetvarMutex.set(chatId, work.catch(() => undefined));
+  return work;
+}
+
+async function runApplyAndStripSetvars(
+  template: string,
+  chatId: string,
+  userId: string,
+  vars: VarsApi,
+  matches: SetvarMatch[],
+): Promise<string> {
+  // Read current bags once per scope so we can skip idempotent writes.
+  // Failure → null map → all writes proceed (safe fallback).
+  let localBag: Record<string, string> | null = null;
+  let chatBag: Record<string, string> | null = null;
+  const needLocal = matches.some((m) => m.kind === 'setvar' && NAME_RE.test(m.name));
+  const needChat = matches.some((m) => m.kind === 'setchatvar' && NAME_RE.test(m.name));
+  if (needLocal) {
+    try { localBag = await vars.local.list(chatId); } catch { localBag = null; }
+  }
+  if (needChat) {
+    try { chatBag = await vars.chat.list(chatId); } catch { chatBag = null; }
+  }
+
+  console.log('[VISHRUN_SETVAR_WRITE]', JSON.stringify({ count: matches.length, names: matches.map((m) => `${m.kind}::${m.name}`) })); // VISHRUN_DEBUG_INSTRUMENTATION
   const stripFlags = new Array(matches.length).fill(false);
   for (let i = 0; i < matches.length; i++) {
     const { kind, name, value } = matches[i];
     if (!NAME_RE.test(name)) continue;
+    const currentBag = kind === 'setvar' ? localBag : kind === 'setchatvar' ? chatBag : null;
+    if (currentBag && currentBag[name] === value) {
+      console.log('[VISHRUN_SETVAR_SKIP]', JSON.stringify({ kind, name, reason: 'idempotent' })); // VISHRUN_DEBUG_INSTRUMENTATION
+      stripFlags[i] = true;
+      continue;
+    }
     try {
       stripFlags[i] = await applySetvarOp({ kind: kind as SetvarKind, name, value }, chatId, userId, vars);
+      if (stripFlags[i] && currentBag) currentBag[name] = value;
     } catch (err) {
       varsLog.warn('setvar persist failed:', { kind, name, err: err instanceof Error ? err.message : String(err) });
     }
