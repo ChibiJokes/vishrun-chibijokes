@@ -16,6 +16,11 @@ if (typeof (globalThis as { document?: unknown }).document === 'undefined') {
   registerMessageContentProcessor: () => {},
   macros: { resolve: async () => ({ text: '', diagnostics: [] }) },
   cors: { fetch: async () => ({ status: 200, headers: {}, body: '' }) },
-  chat: { onMessageContent: () => () => {}, appendMessage: async () => ({ id: 'stub' }) },
+  chat: {
+    onMessageContent: () => () => {},
+    appendMessage: async () => ({ id: 'stub' }),
+    getMessages: async () => [],
+    updateMessage: async () => {},
+  },
   variables: { local: { set: async () => {} }, chat: { set: async () => {} }, global: { set: async () => {} } },
 };

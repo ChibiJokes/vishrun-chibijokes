@@ -764,6 +764,200 @@ function handleHostAlert(payload, deps = {}) {
   }
 }
 
+// src/core/widget-environment.ts
+var SCRIPT_BODY_RE = /<script\b[^>]*>([\s\S]*?)<\/script>/gi;
+var MVU_TOKENS = [
+  /\bMvu\b/,
+  /\bstat_data\b/,
+  /\ball_variables\b/,
+  /\bwaitGlobalInitialized\s*\(/,
+  /\bgetAllVariables\s*\(/,
+  /\berrorCatched\s*\(/,
+  /\beventOn(?:ce)?\s*\(/,
+  /\beventEmit\s*\(/
+];
+var LODASH_TOKEN = /(?:^|[^a-zA-Z_$.\w])_\s*\.[a-zA-Z]/;
+var JQUERY_TOKEN = /(?:^|[^a-zA-Z_$.\w])\$\s*\(/;
+var JQUERY_NAMED_TOKEN = /\bjQuery\s*[(.]/;
+var HELPERS_LIGHT_TOKENS = [
+  /\bgetChatMessages\s*\(/,
+  /\bsetChatMessage\s*\(/,
+  /\bgetCurrentMessageId\s*\(/,
+  /\bgetChatId\s*\(/
+];
+var SLASH_TOKEN = /\btriggerSlash\s*\(/;
+function extractScriptBodies(html) {
+  if (!html)
+    return "";
+  let combined = "";
+  SCRIPT_BODY_RE.lastIndex = 0;
+  let m;
+  while ((m = SCRIPT_BODY_RE.exec(html)) !== null) {
+    combined += m[1] + `
+`;
+  }
+  return combined;
+}
+var cache = new WeakMap;
+var stringCache = new Map;
+var STRING_CACHE_MAX = 256;
+function classifyWidgetEnvironment(html) {
+  if (!html)
+    return "static";
+  const cached = stringCache.get(html);
+  if (cached !== undefined)
+    return cached;
+  const result = classifyImpl(html);
+  if (stringCache.size >= STRING_CACHE_MAX)
+    stringCache.clear();
+  stringCache.set(html, result);
+  return result;
+}
+function classifyImpl(html) {
+  const body = extractScriptBodies(html);
+  if (!body)
+    return "static";
+  const hasMvu = MVU_TOKENS.some((re) => re.test(body));
+  const hasLodash = LODASH_TOKEN.test(body);
+  if (hasMvu || hasLodash)
+    return "tavern-mvu";
+  const hasJq = JQUERY_TOKEN.test(body) || JQUERY_NAMED_TOKEN.test(body);
+  if (hasJq)
+    return "tavern-jq";
+  const hasSlash = SLASH_TOKEN.test(body);
+  if (hasSlash)
+    return "tavern-slash";
+  const hasHelpers = HELPERS_LIGHT_TOKENS.some((re) => re.test(body));
+  if (hasHelpers)
+    return "tavern-helpers-light";
+  return "static";
+}
+function shouldInjectThHelpersShim(env) {
+  return env === "tavern-helpers-light" || env === "tavern-jq" || env === "tavern-mvu";
+}
+
+// src/render/th-helpers-shim.ts
+function thHelpersShim(consts) {
+  const constsJson = JSON.stringify({
+    currentMessageIndex: consts.currentMessageIndex,
+    currentMessageId: consts.currentMessageId,
+    chatId: consts.chatId
+  });
+  return `<script>(function(){
+var THC = ${constsJson};
+var pending = {};
+var nextId = 0;
+function makeRequestId(){ nextId = (nextId + 1) | 0; return 'th-' + Date.now().toString(36) + '-' + nextId.toString(36); }
+function setup(){
+  if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
+  window.spindleSandbox.onMessage(function(payload){
+    if (!payload || typeof payload !== 'object') return;
+    if (payload.kind !== 'th-response') return;
+    var rid = payload.requestId;
+    var slot = pending[rid];
+    if (!slot) return;
+    delete pending[rid];
+    if (payload.ok) slot.resolve(payload.result);
+    else slot.reject(new Error(String(payload.error || 'th-helpers backend error')));
+  });
+}
+setup();
+function postRequest(kind, body){
+  return new Promise(function(resolve, reject){
+    if (!window.spindleSandbox || typeof window.spindleSandbox.postMessage !== 'function') {
+      reject(new Error('spindleSandbox.postMessage unavailable'));
+      return;
+    }
+    var rid = makeRequestId();
+    pending[rid] = { resolve: resolve, reject: reject };
+    try {
+      window.spindleSandbox.postMessage({ kind: 'th-request', requestId: rid, op: kind, body: body });
+    } catch (e) {
+      delete pending[rid];
+      reject(e);
+    }
+  });
+}
+window.getCurrentMessageId = function(){ return THC.currentMessageIndex; };
+window.getChatId = function(){ return THC.chatId; };
+window.getChatMessages = function(range, opts){
+  return postRequest('th-get-chat-messages', { range: range, opts: opts || {} });
+};
+window.setChatMessage = function(fieldValues, messageId, opts){
+  var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
+  return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
+};
+})();</script>`;
+}
+
+// src/render/th-helpers-bridge.ts
+var TH_TIMEOUT_MS = 5000;
+function isThHelpersResponse(p, requestId) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.type === "th_helpers_response" && r.requestId === requestId && typeof r.ok === "boolean";
+}
+function isThRequest(p) {
+  if (!p || typeof p !== "object")
+    return false;
+  const r = p;
+  return r.kind === "th-request" && typeof r.requestId === "string" && typeof r.op === "string" && !!r.body && typeof r.body === "object";
+}
+function dispatchThRequest(frame, request, context, ctx) {
+  const { requestId, op, body } = request;
+  let settled = false;
+  let unsub = null;
+  let timer = null;
+  const respond = (resp) => {
+    if (settled)
+      return;
+    settled = true;
+    if (timer !== null) {
+      clearTimeout(timer);
+      timer = null;
+    }
+    if (unsub) {
+      try {
+        unsub();
+      } catch {}
+      unsub = null;
+    }
+    try {
+      frame.postMessage({ kind: "th-response", requestId, ok: resp.ok, result: resp.result, error: resp.error });
+    } catch {}
+  };
+  unsub = ctx.onBackendMessage((payload) => {
+    if (!isThHelpersResponse(payload, requestId))
+      return;
+    respond({ ok: payload.ok, result: payload.result, error: payload.error });
+  });
+  timer = setTimeout(() => {
+    respond({ ok: false, error: "th-helpers backend timeout" });
+  }, TH_TIMEOUT_MS);
+  try {
+    ctx.sendToBackend({
+      type: "th_helpers_request",
+      requestId,
+      op,
+      chatId: context.chatId,
+      currentMessageId: context.currentMessageId,
+      currentMessageIndex: context.currentMessageIndex,
+      body
+    });
+  } catch (err) {
+    respond({ ok: false, error: err instanceof Error ? err.message : String(err) });
+  }
+}
+function computeMessageIndexInChat(messageId, doc = document) {
+  const all = doc.querySelectorAll("[data-message-id]");
+  for (let i = 0;i < all.length; i++) {
+    if (all[i].getAttribute("data-message-id") === messageId)
+      return i;
+  }
+  return -1;
+}
+
 // src/render/widget-iframe.ts
 var widgetFrameDestroyers = new WeakMap;
 var iframeRegistry = new Map;
@@ -824,7 +1018,16 @@ function destroyRegisteredWidgetsFor(messageId, scriptId) {
   }
 }
 async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
-  const srcdoc = await injectShimsAndSizeReporter(html, ctx);
+  const env = classifyWidgetEnvironment(html);
+  const active = ctx.getActiveChat();
+  const chatId = active.chatId ?? "";
+  const currentMessageIndex = computeMessageIndexInChat(messageId);
+  const srcdoc = await injectShimsAndSizeReporter(html, ctx, {
+    env,
+    chatId,
+    messageId,
+    currentMessageIndex
+  });
   const frame = ctx.dom.createSandboxFrame({
     html: srcdoc,
     autoResize: false,
@@ -833,7 +1036,7 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     initialHeight: 1
   });
   frame.onMessage((payload) => {
-    routeChildMessage(frame, payload, ctx);
+    routeChildMessage(frame, payload, ctx, { chatId, messageId, currentMessageIndex });
   });
   const iframe = frame.element;
   iframe.setAttribute("data-vishrun-widget", scriptName);
@@ -869,11 +1072,11 @@ function containsInlineEventHandler(html) {
 function widgetNeedsIsolation(html) {
   return containsScriptTag(html) || containsInlineEventHandler(html);
 }
-async function injectShimsAndSizeReporter(html, ctx) {
+async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const withExternalScripts = await transformHtmlForExternalScripts(html, ctx);
   const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
   const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withFonts));
-  const head = buildHeadInjection();
+  const head = buildHeadInjection(iframeCtx);
   const withHead = injectIntoHead(stripped, head);
   const shell = sizeReporterShell();
   const closeBody = withHead.lastIndexOf("</body>");
@@ -894,8 +1097,13 @@ function rewriteCssExternalUrls(html) {
     return `url("${VISHRUN_CSS_SENTINEL_PREFIX}${encoded}")`;
   });
 }
-function buildHeadInjection() {
-  return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper();
+function buildHeadInjection(iframeCtx) {
+  const thHelpers = shouldInjectThHelpersShim(iframeCtx.env) ? thHelpersShim({
+    currentMessageIndex: iframeCtx.currentMessageIndex,
+    currentMessageId: iframeCtx.messageId,
+    chatId: iframeCtx.chatId
+  }) : "";
+  return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + thHelpers;
 }
 function viewportHeightShim() {
   return "<style>" + ".min-h-screen,.min-h-\\[100vh\\],.min-h-\\[100dvh\\]{min-height:0 !important}" + ".h-screen,.h-\\[100vh\\],.h-\\[100dvh\\]{height:auto !important}" + "</style>";
@@ -1354,7 +1562,7 @@ function sizeReporterShell() {
 })();
 </script>`;
 }
-function routeChildMessage(frame, payload, ctx) {
+function routeChildMessage(frame, payload, ctx, iframeCtx) {
   if (!payload || typeof payload !== "object")
     return;
   const p = payload;
@@ -1364,6 +1572,12 @@ function routeChildMessage(frame, payload, ctx) {
     handleClipboardWriteText(p.payload, ctx);
   } else if (p.kind === "alert") {
     handleHostAlert(p.payload);
+  } else if (isThRequest(payload)) {
+    dispatchThRequest(frame, payload, {
+      chatId: iframeCtx.chatId,
+      currentMessageId: iframeCtx.messageId,
+      currentMessageIndex: iframeCtx.currentMessageIndex
+    }, ctx);
   }
 }
 async function handleSetChatMessages(iframe, payload, ctx) {
@@ -1683,19 +1897,19 @@ function linearizeBubble(root) {
     text = text.slice(0, -1);
   return { text, offsetMap };
 }
-var cache = new WeakMap;
+var cache2 = new WeakMap;
 function getLinearizedBubble(root) {
   const tc = root.textContent ?? "";
   const hash = quickHash(tc);
-  const cached = cache.get(root);
+  const cached = cache2.get(root);
   if (cached && cached.hash === hash)
     return cached.result;
   const result = linearizeBubble(root);
-  cache.set(root, { hash, result });
+  cache2.set(root, { hash, result });
   return result;
 }
 function invalidateLinearizedBubble(root) {
-  cache.delete(root);
+  cache2.delete(root);
 }
 function quickHash(s) {
   let h = 2166136261;
