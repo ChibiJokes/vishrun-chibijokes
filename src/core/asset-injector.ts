@@ -58,7 +58,7 @@ function nextRequestId(): string {
  * Unsubscribes its `onBackendMessage` handler on every settle path so nothing
  * leaks.
  */
-function fetchViaBackend(
+export function fetchViaBackend(
   url: string,
   ctx: SpindleFrontendContext,
   timeoutMs = 30000,

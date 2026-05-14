@@ -478,6 +478,164 @@ async function transformHtmlForExternalScripts(html, ctx) {
   return transformHtmlForReactBabel(withTailwind, ctx);
 }
 
+// src/core/font-proxy.ts
+var FONT_LINK_RE = /<link\b[^>]*\bhref\s*=\s*["'](https?:\/\/fonts\.googleapis\.com\/[^"']+)["'][^>]*>/gi;
+var FONT_STYLE_BLOCK_RE = /<style\b[^>]*>([\s\S]*?)<\/style>/gi;
+var FONT_IMPORT_RE = /@import\s+url\(\s*(['"]?)(https?:\/\/fonts\.googleapis\.com\/[^'")\s]+)\1\s*\)\s*;?/gi;
+var FONT_FACE_BLOCK_RE = /@font-face\s*\{([^}]+)\}/gi;
+var FONT_FACE_URL_RE = /src\s*:[^;]*url\(\s*['"]?(https?:\/\/[^'")\s]+)['"]?\s*\)/i;
+var FONT_FACE_FAMILY_RE = /font-family\s*:\s*['"]?([^;'"]+?)['"]?\s*;/i;
+var FONT_FACE_WEIGHT_RE = /font-weight\s*:\s*([^;]+?)\s*;/i;
+var FONT_FACE_STYLE_RE = /font-style\s*:\s*([^;]+?)\s*;/i;
+var FONT_FACE_DISPLAY_RE = /font-display\s*:\s*([^;]+?)\s*;/i;
+var fontEntriesCache = new Map;
+function parseFontFaceRules(css) {
+  if (css.indexOf("@font-face") === -1)
+    return [];
+  const out = [];
+  FONT_FACE_BLOCK_RE.lastIndex = 0;
+  let m;
+  while ((m = FONT_FACE_BLOCK_RE.exec(css)) !== null) {
+    const body = m[1];
+    const urlMatch = body.match(FONT_FACE_URL_RE);
+    const familyMatch = body.match(FONT_FACE_FAMILY_RE);
+    if (!urlMatch || !familyMatch)
+      continue;
+    const entry = {
+      family: familyMatch[1].trim(),
+      url: urlMatch[1]
+    };
+    const w = body.match(FONT_FACE_WEIGHT_RE);
+    const s = body.match(FONT_FACE_STYLE_RE);
+    const d = body.match(FONT_FACE_DISPLAY_RE);
+    if (w)
+      entry.weight = w[1].trim();
+    if (s)
+      entry.style = s[1].trim();
+    if (d)
+      entry.display = d[1].trim();
+    out.push(entry);
+  }
+  return out;
+}
+function extractGoogleFontsLinks(html) {
+  if (html.indexOf("fonts.googleapis.com") === -1)
+    return [];
+  const out = [];
+  const seen = new Set;
+  FONT_LINK_RE.lastIndex = 0;
+  let m;
+  while ((m = FONT_LINK_RE.exec(html)) !== null) {
+    const fullTag = m[0];
+    const url = decodeHtmlEntities(m[1]);
+    if (!seen.has(fullTag)) {
+      seen.add(fullTag);
+      out.push({ fullTag, url });
+    }
+  }
+  return out;
+}
+function extractGoogleFontsImports(html) {
+  if (html.indexOf("fonts.googleapis.com") === -1)
+    return [];
+  if (html.indexOf("@import") === -1)
+    return [];
+  const out = [];
+  const seenBlocks = new Set;
+  FONT_STYLE_BLOCK_RE.lastIndex = 0;
+  let m;
+  while ((m = FONT_STYLE_BLOCK_RE.exec(html)) !== null) {
+    const fullStyleBlock = m[0];
+    const cssContent = m[1];
+    if (cssContent.indexOf("@import") === -1)
+      continue;
+    if (cssContent.indexOf("fonts.googleapis.com") === -1)
+      continue;
+    if (seenBlocks.has(fullStyleBlock))
+      continue;
+    seenBlocks.add(fullStyleBlock);
+    const imports = [];
+    FONT_IMPORT_RE.lastIndex = 0;
+    let im;
+    while ((im = FONT_IMPORT_RE.exec(cssContent)) !== null) {
+      imports.push({ raw: im[0], url: im[2] });
+    }
+    if (imports.length > 0)
+      out.push({ fullStyleBlock, imports });
+  }
+  return out;
+}
+function decodeHtmlEntities(s) {
+  return s.replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&quot;/g, '"').replace(/&#39;/g, "'");
+}
+function getFontEntries(url, ctx) {
+  const cached = fontEntriesCache.get(url);
+  if (cached)
+    return cached;
+  const pending = (async () => {
+    const raw = await fetchViaBackend(url, ctx);
+    return parseFontFaceRules(raw);
+  })();
+  fontEntriesCache.set(url, pending);
+  pending.catch(() => {
+    if (fontEntriesCache.get(url) === pending)
+      fontEntriesCache.delete(url);
+  });
+  return pending;
+}
+function htmlSafeJsonStringify(value) {
+  return JSON.stringify(value).replace(/</g, "\\u003c");
+}
+function buildFontConfigScript(entries) {
+  return `<script type="application/vishrun-font-config" data-vishrun-fonts>${htmlSafeJsonStringify(entries)}</script>`;
+}
+async function transformHtmlForGoogleFonts(html, ctx) {
+  const links = extractGoogleFontsLinks(html);
+  const importBlocks = extractGoogleFontsImports(html);
+  if (links.length === 0 && importBlocks.length === 0)
+    return html;
+  const allUrls = new Set;
+  for (const l of links)
+    allUrls.add(l.url);
+  for (const ib of importBlocks)
+    for (const im of ib.imports)
+      allUrls.add(im.url);
+  const entriesByUrl = new Map;
+  const failed = new Set;
+  await Promise.all(Array.from(allUrls).map(async (u) => {
+    try {
+      entriesByUrl.set(u, await getFontEntries(u, ctx));
+    } catch (err) {
+      failed.add(u);
+      console.warn("[vishrun] Google Fonts fetch failed:", u, err instanceof Error ? err.message : String(err));
+    }
+  }));
+  let out = html;
+  for (const l of links) {
+    if (failed.has(l.url))
+      continue;
+    const entries = entriesByUrl.get(l.url) ?? [];
+    const replacement = entries.length === 0 ? "" : buildFontConfigScript(entries);
+    out = out.split(l.fullTag).join(replacement);
+  }
+  for (const ib of importBlocks) {
+    let stripped = ib.fullStyleBlock;
+    const scripts = [];
+    for (const imp of ib.imports) {
+      if (failed.has(imp.url))
+        continue;
+      stripped = stripped.split(imp.raw).join("");
+      const entries = entriesByUrl.get(imp.url) ?? [];
+      if (entries.length > 0)
+        scripts.push(buildFontConfigScript(entries));
+    }
+    if (stripped === ib.fullStyleBlock && scripts.length === 0)
+      continue;
+    out = out.split(ib.fullStyleBlock).join(scripts.join("") + stripped);
+  }
+  return out;
+}
+
 // src/core/dispatch-slash.ts
 function isDispatchSlashResponse(p, requestId) {
   if (!p || typeof p !== "object")
@@ -713,7 +871,8 @@ function widgetNeedsIsolation(html) {
 }
 async function injectShimsAndSizeReporter(html, ctx) {
   const withExternalScripts = await transformHtmlForExternalScripts(html, ctx);
-  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withExternalScripts));
+  const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
+  const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withFonts));
   const head = buildHeadInjection();
   const withHead = injectIntoHead(stripped, head);
   const shell = sizeReporterShell();
@@ -736,7 +895,7 @@ function rewriteCssExternalUrls(html) {
   });
 }
 function buildHeadInjection() {
-  return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper();
+  return viewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper();
 }
 function viewportHeightShim() {
   return "<style>" + ".min-h-screen,.min-h-\\[100vh\\],.min-h-\\[100dvh\\]{min-height:0 !important}" + ".h-screen,.h-\\[100vh\\],.h-\\[100dvh\\]{height:auto !important}" + "</style>";
@@ -1052,6 +1211,67 @@ function externalImageProxyHelper() {
         attributeFilter: [KEY],
       });
     } catch (e) { /* ignore */ }
+  }
+
+  if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', init, { once: true });
+  } else {
+    init();
+  }
+})();
+</script>`;
+}
+function fontFaceHelper() {
+  return `<script>
+(function(){
+  var loadedFontUrls = {};
+
+  function loadOneVishrunFont(entry) {
+    if (!window.spindleSandbox || typeof window.spindleSandbox.fetchFont !== 'function') return;
+    if (!entry || !entry.url || !entry.family) return;
+    if (typeof FontFace === 'undefined' || !document.fonts || typeof document.fonts.add !== 'function') return;
+    var key = entry.url;
+    if (loadedFontUrls[key]) return;
+    loadedFontUrls[key] = true;
+    window.spindleSandbox.fetchFont(entry.url).then(function(resource) {
+      if (!resource || !resource.url) {
+        loadedFontUrls[key] = false;
+        return;
+      }
+      try {
+        var face = new FontFace(entry.family, 'url(' + resource.url + ')', {
+          weight: entry.weight || '400',
+          style: entry.style || 'normal',
+          display: entry.display || 'swap'
+        });
+        return face.load().then(function() { document.fonts.add(face); });
+      } catch (e) {
+        loadedFontUrls[key] = false;
+        console.warn('[vishrun] FontFace construct failed for', entry.url, e);
+      }
+    }).catch(function(err) {
+      loadedFontUrls[key] = false;
+      console.warn('[vishrun] fetchFont failed for', entry.url, err);
+    });
+  }
+
+  function processVishrunFonts() {
+    var scripts = document.querySelectorAll('script[data-vishrun-fonts]');
+    for (var s = 0; s < scripts.length; s++) {
+      var entries;
+      try { entries = JSON.parse(scripts[s].textContent || '[]'); }
+      catch (e) { continue; }
+      if (!entries || typeof entries.length !== 'number') continue;
+      for (var i = 0; i < entries.length; i++) loadOneVishrunFont(entries[i]);
+    }
+  }
+
+  function init() {
+    processVishrunFonts();
+    try {
+      var mo = new MutationObserver(function() { processVishrunFonts(); });
+      mo.observe(document.documentElement || document, { childList: true, subtree: true });
+    } catch (e) {}
   }
 
   if (document.readyState === 'loading') {
