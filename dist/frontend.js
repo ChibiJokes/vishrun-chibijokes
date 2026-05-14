@@ -1896,6 +1896,45 @@ function shouldRescanForChangedFields(changedFields) {
   return changedFields.some((f) => !VAR_PATH_RE.test(f));
 }
 
+// src/render/self-mutation.ts
+var WIDGET_ATTR = "data-vishrun-widget";
+var WIDGET_SEL = "[data-vishrun-widget]";
+function isOrContainsWidget(node) {
+  if (node.nodeType !== 1)
+    return false;
+  const el = node;
+  if (el.hasAttribute(WIDGET_ATTR))
+    return true;
+  return !!el.querySelector?.(WIDGET_SEL);
+}
+function isInsideWidget(node) {
+  let cur = node.parentNode;
+  while (cur) {
+    if (cur.nodeType === 1 && cur.hasAttribute?.(WIDGET_ATTR))
+      return true;
+    cur = cur.parentNode;
+  }
+  return false;
+}
+function isSelfMutation(record) {
+  if (record.type === "characterData")
+    return isInsideWidget(record.target);
+  if (record.addedNodes.length === 0)
+    return false;
+  for (let i = 0;i < record.addedNodes.length; i++) {
+    if (isOrContainsWidget(record.addedNodes[i]))
+      return true;
+  }
+  return false;
+}
+function allSelf(records) {
+  for (let i = 0;i < records.length; i++) {
+    if (!isSelfMutation(records[i]))
+      return false;
+  }
+  return true;
+}
+
 // src/hooks/message-rendered.ts
 var MAX_RAF_RETRIES = 3;
 var MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
@@ -1903,7 +1942,9 @@ function installMessageHooks(ctx) {
   let observer = null;
   let observedTarget = null;
   let pendingFrame = 0;
+  let pendingRecords = [];
   let bodyWatcher = null;
+  const OBSERVE_OPTS = { childList: true, subtree: true, characterData: true };
   function compiledForActiveCard() {
     const card = getActiveCard();
     if (!card)
@@ -1933,22 +1974,39 @@ function installMessageHooks(ctx) {
       requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
     }
   }
-  function scanAllNow(compiled) {
-    const nodes = document.querySelectorAll("[data-message-id]");
-    nodes.forEach((n) => {
-      processNode(n, compiled, ctx);
-    });
+  async function scanAllNow(compiled) {
+    const wasObserving = observer !== null && observedTarget !== null;
+    if (wasObserving)
+      observer.disconnect();
+    try {
+      const nodes = document.querySelectorAll("[data-message-id]");
+      const tasks = [];
+      nodes.forEach((n) => {
+        tasks.push(processNode(n, compiled, ctx).catch(() => {}));
+      });
+      await Promise.all(tasks);
+    } finally {
+      if (wasObserving && observedTarget && document.contains(observedTarget)) {
+        observer.observe(observedTarget, OBSERVE_OPTS);
+      }
+    }
   }
-  function handleMutations() {
+  function handleMutations(records) {
+    if (records.length > 0)
+      pendingRecords.push(...records);
     if (pendingFrame)
       return;
     pendingFrame = requestAnimationFrame(() => {
       pendingFrame = 0;
+      const batch = pendingRecords;
+      pendingRecords = [];
       const compiled = compiledForActiveCard();
       if (!compiled) {
         detachObserver();
         return;
       }
+      if (allSelf(batch))
+        return;
       scanAllNow(compiled);
     });
   }
@@ -1970,7 +2028,7 @@ function installMessageHooks(ctx) {
     if (observer)
       observer.disconnect();
     observer = new MutationObserver(handleMutations);
-    observer.observe(target, { childList: true, subtree: true, characterData: true });
+    observer.observe(target, OBSERVE_OPTS);
     observedTarget = target;
   }
   function ensureBodyWatcher() {
@@ -2013,6 +2071,7 @@ function installMessageHooks(ctx) {
       cancelAnimationFrame(pendingFrame);
       pendingFrame = 0;
     }
+    pendingRecords = [];
     if (bodyWatcher) {
       bodyWatcher.disconnect();
       bodyWatcher = null;

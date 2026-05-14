@@ -4,6 +4,7 @@ import { processNode } from '../render/inject-into-message';
 import { getActiveCard } from '../state/active-card';
 import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
+import { allSelf } from '../render/self-mutation';
 
 const MAX_RAF_RETRIES = 3;
 const MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
@@ -63,11 +64,13 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   let observer: MutationObserver | null = null;
   let observedTarget: Element | null = null;
   let pendingFrame = 0;
+  let pendingRecords: MutationRecord[] = [];
   // Watcher used when MessageList isn't yet in the DOM at attach time —
   // e.g. user navigated directly into a chat from the characters page,
   // and the SPA is still mounting the chat view. Auto-disconnects as
   // soon as MessageList appears.
   let bodyWatcher: MutationObserver | null = null;
+  const OBSERVE_OPTS: MutationObserverInit = { childList: true, subtree: true, characterData: true };
 
   function compiledForActiveCard(): CompiledScript[] | null {
     const card = getActiveCard();
@@ -100,23 +103,40 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     }
   }
 
-  function scanAllNow(compiled: CompiledScript[]): void {
-    const nodes = document.querySelectorAll('[data-message-id]');
-    // processNode is async and fire-and-forget (see processMessageById).
-    nodes.forEach((n) => { void processNode(n as HTMLElement, compiled, ctx); });
+  async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
+    // Pause the observer for the full window where Vishrun mutates the DOM.
+    // processNode is async (widget builds may await Tailwind bundle fetch);
+    // re-attach only after every promise settles so the observer never sees
+    // its own injections.
+    const wasObserving = observer !== null && observedTarget !== null;
+    if (wasObserving) observer!.disconnect();
+    try {
+      const nodes = document.querySelectorAll('[data-message-id]');
+      const tasks: Promise<unknown>[] = [];
+      nodes.forEach((n) => { tasks.push(processNode(n as HTMLElement, compiled, ctx).catch(() => {})); });
+      await Promise.all(tasks);
+    } finally {
+      if (wasObserving && observedTarget && document.contains(observedTarget)) {
+        observer!.observe(observedTarget, OBSERVE_OPTS);
+      }
+    }
   }
 
-  function handleMutations(): void {
+  function handleMutations(records: MutationRecord[]): void {
+    if (records.length > 0) pendingRecords.push(...records);
     if (pendingFrame) return;
     pendingFrame = requestAnimationFrame(() => {
       pendingFrame = 0;
+      const batch = pendingRecords;
+      pendingRecords = [];
       const compiled = compiledForActiveCard();
       if (!compiled) {
         // Card cleared between mutation and frame — observer should be off.
         detachObserver();
         return;
       }
-      scanAllNow(compiled);
+      if (allSelf(batch)) return;
+      void scanAllNow(compiled);
     });
   }
 
@@ -147,7 +167,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     // Watch-item: characterData also fires per token during streaming —
     // if testing surfaces flicker or perf issues, drop characterData and
     // rely on the childList/subtree mutations React fires at end-of-stream.
-    observer.observe(target, { childList: true, subtree: true, characterData: true });
+    observer.observe(target, OBSERVE_OPTS);
     observedTarget = target;
   }
 
@@ -182,7 +202,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       const compiled = compiledForActiveCard();
       if (!compiled) return; // card was cleared between insert and now
       attachObserver();
-      scanAllNow(compiled);
+      void scanAllNow(compiled);
     });
     bodyWatcher.observe(document.body, { childList: true, subtree: true });
   }
@@ -192,6 +212,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
       cancelAnimationFrame(pendingFrame);
       pendingFrame = 0;
     }
+    pendingRecords = [];
     if (bodyWatcher) {
       bodyWatcher.disconnect();
       bodyWatcher = null;
@@ -224,7 +245,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
         return;
       }
       attachObserver();
-      scanAllNow(compiled);
+      void scanAllNow(compiled);
     }));
   }
 
