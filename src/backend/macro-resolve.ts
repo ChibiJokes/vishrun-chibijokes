@@ -127,14 +127,12 @@ async function runApplyAndStripSetvars(
     try { chatBag = await vars.chat.list(chatId); } catch { chatBag = null; }
   }
 
-  console.log('[VISHRUN_SETVAR_WRITE]', JSON.stringify({ count: matches.length, names: matches.map((m) => `${m.kind}::${m.name}`) })); // VISHRUN_DEBUG_INSTRUMENTATION
   const stripFlags = new Array(matches.length).fill(false);
   for (let i = 0; i < matches.length; i++) {
     const { kind, name, value } = matches[i];
     if (!NAME_RE.test(name)) continue;
     const currentBag = kind === 'setvar' ? localBag : kind === 'setchatvar' ? chatBag : null;
     if (currentBag && currentBag[name] === value) {
-      console.log('[VISHRUN_SETVAR_SKIP]', JSON.stringify({ kind, name, reason: 'idempotent' })); // VISHRUN_DEBUG_INSTRUMENTATION
       stripFlags[i] = true;
       continue;
     }

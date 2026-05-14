@@ -1490,7 +1490,6 @@ function quickHash(s) {
 var resolutionCache = new Map;
 async function processNode(root, scripts, ctx) {
   const messageId = root.getAttribute("data-message-id") || undefined;
-  console.log("[VISHRUN_PROCESS_NODE]", JSON.stringify({ messageId }));
   if (!messageId) {
     return 0;
   }
@@ -1515,7 +1514,6 @@ async function processNode(root, scripts, ctx) {
   return total;
 }
 async function resolveMacrosForMessage(root, scripts, messageId, ctx) {
-  console.log("[VISHRUN_RESOLVE_MACROS_ENTER]", JSON.stringify({ messageId }));
   const map = new Map;
   if (!scripts.some((s) => s.replaceString.includes("{{")))
     return map;
@@ -1527,7 +1525,6 @@ async function resolveMacrosForMessage(root, scripts, messageId, ctx) {
     console.warn("[vishrun:variables] no active chatId; widget macros left unresolved");
     return map;
   }
-  console.log("[VISHRUN_RESOLVE_MACROS]", JSON.stringify({ messageId, templateCount: templates.length }));
   try {
     const resolved = await resolveMacrosBatch(ctx, chatId, characterId, templates);
     templates.forEach((t, i) => {
@@ -2027,7 +2024,6 @@ function installMessageHooks(ctx) {
     }
   }
   function rescanAll() {
-    console.log("[VISHRUN_RESCAN_ALL]");
     const compiledNow = compiledForActiveCard();
     if (compiledNow) {
       syncTagInterceptors(ctx, compiledNow);
@@ -2056,7 +2052,6 @@ function installMessageHooks(ctx) {
   });
   const unsubChatChanged = ctx.events.on("CHAT_CHANGED", (payload) => {
     const p = payload || {};
-    console.log("[VISHRUN_LISTENER_B]", JSON.stringify({ changedFields: p.changedFields }));
     if (!shouldRescanForChangedFields(p.changedFields))
       return;
     rescanAll();
@@ -2121,7 +2116,6 @@ function setup(ctx) {
   }
   const unsubChatChanged = ctx.events.on("CHAT_CHANGED", (payload) => {
     const p = payload || {};
-    console.log("[VISHRUN_LISTENER_A]", JSON.stringify({ characterId: p.characterId, changedFields: p.changedFields }));
     if (!shouldRescanForChangedFields(p.changedFields))
       return;
     loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);

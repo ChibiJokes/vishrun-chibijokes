@@ -134,7 +134,6 @@ async function runApplyAndStripSetvars(template, chatId, userId, vars, matches) 
       chatBag = null;
     }
   }
-  console.log("[VISHRUN_SETVAR_WRITE]", JSON.stringify({ count: matches.length, names: matches.map((m) => `${m.kind}::${m.name}`) }));
   const stripFlags = new Array(matches.length).fill(false);
   for (let i = 0;i < matches.length; i++) {
     const { kind, name, value } = matches[i];
@@ -142,7 +141,6 @@ async function runApplyAndStripSetvars(template, chatId, userId, vars, matches) 
       continue;
     const currentBag = kind === "setvar" ? localBag : kind === "setchatvar" ? chatBag : null;
     if (currentBag && currentBag[name] === value) {
-      console.log("[VISHRUN_SETVAR_SKIP]", JSON.stringify({ kind, name, reason: "idempotent" }));
       stripFlags[i] = true;
       continue;
     }

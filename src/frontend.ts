@@ -74,7 +74,6 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubChatChanged = ctx.events.on('CHAT_CHANGED', (payload: unknown) => {
     const p = (payload || {}) as ChatChangedPayload;
-    console.log('[VISHRUN_LISTENER_A]', JSON.stringify({ characterId: p.characterId, changedFields: p.changedFields })); // VISHRUN_DEBUG_INSTRUMENTATION
     if (!shouldRescanForChangedFields(p.changedFields)) return;
     void loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
   });

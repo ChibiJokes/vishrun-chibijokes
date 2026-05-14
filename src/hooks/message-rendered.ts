@@ -204,7 +204,6 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   }
 
   function rescanAll(): void {
-    console.log('[VISHRUN_RESCAN_ALL]'); // VISHRUN_DEBUG_INSTRUMENTATION
     // Tag-interceptor sync runs synchronously: registerTagInterceptor
     // mutates a frontend module's state and needs to be in place BEFORE
     // MessageContent's next render so the interceptor handler fires for
@@ -239,7 +238,6 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
 
   const unsubChatChanged = ctx.events.on('CHAT_CHANGED', (payload: unknown) => {
     const p = (payload || {}) as { changedFields?: string[] };
-    console.log('[VISHRUN_LISTENER_B]', JSON.stringify({ changedFields: p.changedFields })); // VISHRUN_DEBUG_INSTRUMENTATION
     if (!shouldRescanForChangedFields(p.changedFields)) return;
     // Active-card load is async (REST fetch). The frontend bootstrap calls
     // rescanAll() explicitly after setActiveCard(). This handler is a
