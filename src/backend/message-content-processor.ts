@@ -1,41 +1,83 @@
+import type {
+  MessageContentProcessorCtxDTO,
+  MessageContentProcessorResultDTO,
+} from 'lumiverse-spindle-types';
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
-import { applySetvarOp } from './setvar-ops';
+import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
 
-// Shown when a user message was nothing but setvar-family commands — an empty
-// string is accepted by the route but gives a blank bubble and an empty LLM
-// turn (some providers reject that).
+// Shown when a user message was nothing but setvar-family commands — an
+// empty string is accepted by the route but gives a blank bubble and an
+// empty LLM turn (some providers reject that).
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
-// Consumes SillyTavern setvar-family chains from user messages: writes the
-// values via applySetvarOp (routes setvar→local, setchatvar→chat, gvars→skip)
-// and strips the commands from the stored message + LLM prompt. MVU proper
-// (Queen Bee) would add an `<UpdateVariable>` parser here too.
-export function installMessageContentProcessor(): void {
-  api.registerMessageContentProcessor(async (ctx) => {
-    // Auto-emitted greetings never carry a user-typed setvar.
-    if (ctx.extra?.greeting === true) return;
-    // `render` is a per-paint, non-persisting pass — fires twice per visible
-    // message — and the stored content was already stripped at create time.
-    if (ctx.origin === 'render') return;
-    if (!/\/(setvar|setchatvar|setgvar|setglobalvar)\b/i.test(ctx.content)) return;
+const SETVAR_RE = /\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
 
-    const parsed = parseSetvarChain(ctx.content);
-    if (!parsed) return; // unparseable — leave the message untouched, don't break send.
+// Self-closing custom tags → paired form. Lumiverse's tag interceptor only
+// handles paired tags (<TAG>...</TAG>); DOMPurify strips unknown self-closing
+// elements. Expanding here (before Lumiverse renders) lets the interceptor
+// pipeline work without modifying Lumiverse.
+const SELF_CLOSING_CUSTOM_RE = /<([A-Z][a-zA-Z0-9_-]*)(\s[^>]*)?\s*\/>/g;
+export function expandSelfClosingTags(content: string): string {
+  return content.replace(SELF_CLOSING_CUSTOM_RE, (_m, tag: string, attrs: string | undefined) => {
+    const a = attrs ? attrs.trimEnd() : '';
+    return `<${tag}${a}></${tag}>`;
+  });
+}
 
-    // Sequential: each `set` does a read-modify-write of the whole vars map
-    // host-side, so concurrent sets would clobber each other.
+export interface ContentProcessorDeps {
+  applySetvarOp?: typeof applySetvarOpDefault;
+}
+
+// Pure handler — exported for unit testing. The host wraps it in
+// installMessageContentProcessor() with priority 50.
+//
+// Important invariant: this processor MUST NOT strip <UpdateVariable>
+// blocks from the stored content. The MVU snapshot is computed by replaying
+// chat messages through computeVariablesSnapshot, which needs the blocks
+// intact in the DB row. Visual stripping is done at render time by a tag
+// interceptor with removeFromMessage:true (see frontend setup).
+export async function processMessageContent(
+  ctx: MessageContentProcessorCtxDTO,
+  deps: ContentProcessorDeps = {},
+): Promise<MessageContentProcessorResultDTO | void> {
+  const applySetvar = deps.applySetvarOp ?? applySetvarOpDefault;
+
+  // Expand self-closing custom tags on every origin. Pure, idempotent.
+  const workingContent = expandSelfClosingTags(ctx.content);
+  const selfCloseChanged = workingContent !== ctx.content;
+
+  // Render is non-persisting and must not run /setvar (which writes to
+  // backend state). Return display-only expansion if anything changed.
+  if (ctx.origin === 'render') {
+    return selfCloseChanged ? { content: workingContent } : undefined;
+  }
+
+  if (!SETVAR_RE.test(workingContent)) {
+    return selfCloseChanged ? { content: workingContent } : undefined;
+  }
+
+  let content = workingContent;
+  const parsed = parseSetvarChain(content);
+  if (parsed) {
     for (const { kind, key, value } of parsed.pairs) {
       try {
-        await applySetvarOp({ kind, name: key, value }, ctx.chatId, ctx.userId);
+        await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
       } catch (err) {
-        varsLog.warn(`setvar failed for "${kind}::${key}":`, err instanceof Error ? err.message : String(err));
-        // Keep going — a partial set is still better than none, and we still
-        // strip so the user doesn't see the raw command in their bubble.
+        varsLog.warn(
+          `setvar failed for "${kind}::${key}":`,
+          err instanceof Error ? err.message : String(err),
+        );
       }
     }
+    content = parsed.strippedContent;
+  }
 
-    const stripped = parsed.strippedContent.trim();
-    return { content: stripped.length > 0 ? stripped : EMPTY_REPLACEMENT };
-  }, 50);
+  if (content === ctx.content) return;
+  const stripped = content.trim();
+  return { content: stripped.length > 0 ? stripped : EMPTY_REPLACEMENT };
+}
+
+export function installMessageContentProcessor(): void {
+  api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
 }

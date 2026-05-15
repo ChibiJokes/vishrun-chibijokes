@@ -72,18 +72,29 @@ export function mergeFlags(userFlags: string): string {
   return Array.from(set).join('');
 }
 
+// Self-closing tag detection on raw findRegex source string.
+// Matches `<TAG/>`, `<TAG />`, `<TAG attr="val"/>` where TAG starts uppercase.
+const SELF_CLOSING_RE = /^<([A-Z][a-zA-Z0-9_-]*)(\s[^>]*)?\s*\/>$/;
+
+// Rewrite self-closing findRegex to paired form so the compiled regex
+// matches content after backend expansion (see expandSelfClosingTags).
+export function rewriteSelfClosingToPaired(src: string): string | null {
+  const m = src.match(SELF_CLOSING_RE);
+  if (!m) return null;
+  const attrs = m[2] ? m[2].trimEnd() : '';
+  return `<${m[1]}${attrs}></${m[1]}>`;
+}
+
 /**
  * Compile raw regex_scripts into a usable form.
  *  - Drops disabled scripts.
+ *  - Drops `promptOnly` scripts. Those belong to SillyTavern's prompt
+ *    pipeline (what reaches the LLM), not the display pipeline that
+ *    Vishrun owns.
  *  - Drops scripts whose `placement` is set and excludes 2 (render-side).
- *    Scripts with no placement are kept (treat as "applies anywhere").
- *  - Builds findRe with `new RegExp(pattern, flags)`. Pattern/flags come
- *    from `parseRegexLiteral` which strips `/.../flags` delimiters when
- *    the card authored them (ts-edition cards do; older Lumi cards don't).
- *    Default flags `gs` are always merged in: `g` for matchAll scanning,
- *    `s` (dotAll) so paired-tag scripts whose inner content spans lines
- *    (e.g. Xiao Gu's 12 pipe-separated groups when the AI breaks them
- *    across lines) still match.
+ *  - Rewrites self-closing tag findRegex (`<TAG/>`) to paired form
+ *    (`<TAG></TAG>`) so the tag interceptor pipeline can handle it.
+ *  - Builds findRe with `new RegExp(pattern, flags)`.
  *  - Strips markdown code fence around replaceString.
  *  - Drops scripts whose findRegex fails to compile (with debug log).
  */
@@ -92,12 +103,14 @@ export function compileScripts(rawScripts: RawRegexScript[]): CompiledScript[] {
   for (let i = 0; i < rawScripts.length; i++) {
     const s = rawScripts[i];
     if (s.disabled) continue;
+    if (s.promptOnly) continue;
     if (Array.isArray(s.placement) && !s.placement.includes(2)) continue;
     const src = s.findRegex;
     if (!src || typeof src !== 'string') continue;
     const replace = stripCodeFence(s.replaceString ?? '');
 
-    const { pattern, flags } = parseRegexLiteral(src);
+    const effectiveSrc = rewriteSelfClosingToPaired(src) ?? src;
+    const { pattern, flags } = parseRegexLiteral(effectiveSrc);
     let re: RegExp;
     try {
       re = new RegExp(pattern, mergeFlags(flags));

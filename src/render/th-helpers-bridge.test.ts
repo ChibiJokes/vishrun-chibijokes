@@ -4,6 +4,7 @@ import {
   isThRequest,
   dispatchThRequest,
   fetchMessagesSnapshot,
+  fetchVariablesSnapshot,
 } from './th-helpers-bridge';
 
 beforeEach(() => {
@@ -215,6 +216,78 @@ test('fetchMessagesSnapshot times out and resolves with [] (short timeout)', asy
       20,
     );
     expect(snap).toEqual([]);
+  } finally {
+    console.warn = restoreWarn;
+  }
+});
+
+test('fetchVariablesSnapshot sends th-get-variables-snapshot and resolves on response', async () => {
+  const ctx = makeFakeCtx();
+  const p = fetchVariablesSnapshot(
+    { chatId: 'chat-1', currentMessageId: 'mid', currentMessageIndex: 0 },
+    ctx as unknown as Parameters<typeof fetchVariablesSnapshot>[1],
+  );
+  expect(ctx.sent.length).toBe(1);
+  const sent = ctx.sent[0] as Record<string, unknown>;
+  expect(sent.op).toBe('th-get-variables-snapshot');
+  const requestId = sent.requestId as string;
+  ctx.listeners[0]({
+    type: 'th_helpers_response',
+    requestId,
+    ok: true,
+    result: { stat_data: { foo: 'bar' } },
+  });
+  const snap = await p;
+  expect(snap).toEqual({ stat_data: { foo: 'bar' } });
+});
+
+test('fetchVariablesSnapshot falls back to empty MvuData on backend error', async () => {
+  const restoreWarn = console.warn;
+  console.warn = mock(() => {});
+  try {
+    const ctx = makeFakeCtx();
+    const p = fetchVariablesSnapshot(
+      { chatId: 'chat-1', currentMessageId: 'mid', currentMessageIndex: 0 },
+      ctx as unknown as Parameters<typeof fetchVariablesSnapshot>[1],
+    );
+    const requestId = (ctx.sent[0] as Record<string, unknown>).requestId as string;
+    ctx.listeners[0]({ type: 'th_helpers_response', requestId, ok: false, error: 'db down' });
+    const snap = await p;
+    expect(snap).toEqual({ stat_data: {} });
+  } finally {
+    console.warn = restoreWarn;
+  }
+});
+
+test('fetchVariablesSnapshot rejects malformed result (no stat_data) and falls back', async () => {
+  const restoreWarn = console.warn;
+  console.warn = mock(() => {});
+  try {
+    const ctx = makeFakeCtx();
+    const p = fetchVariablesSnapshot(
+      { chatId: 'chat-1', currentMessageId: 'mid', currentMessageIndex: 0 },
+      ctx as unknown as Parameters<typeof fetchVariablesSnapshot>[1],
+    );
+    const requestId = (ctx.sent[0] as Record<string, unknown>).requestId as string;
+    ctx.listeners[0]({ type: 'th_helpers_response', requestId, ok: true, result: { wrong: 1 } });
+    const snap = await p;
+    expect(snap).toEqual({ stat_data: {} });
+  } finally {
+    console.warn = restoreWarn;
+  }
+});
+
+test('fetchVariablesSnapshot times out and resolves with empty MvuData', async () => {
+  const restoreWarn = console.warn;
+  console.warn = mock(() => {});
+  try {
+    const ctx = makeFakeCtx();
+    const snap = await fetchVariablesSnapshot(
+      { chatId: 'chat-1', currentMessageId: 'mid', currentMessageIndex: 0 },
+      ctx as unknown as Parameters<typeof fetchVariablesSnapshot>[1],
+      20,
+    );
+    expect(snap).toEqual({ stat_data: {} });
   } finally {
     console.warn = restoreWarn;
   }

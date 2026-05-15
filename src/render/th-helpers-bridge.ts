@@ -1,5 +1,6 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import type { SnapshotMessage } from '../backend/th-helpers';
+import { emptyMvuData, type MvuData } from '../backend/mvu-parser';
 
 const TH_TIMEOUT_MS = 5000;
 
@@ -171,6 +172,82 @@ export function fetchMessagesSnapshot(
         err instanceof Error ? err.message : String(err),
       );
       finish([]);
+    }
+  });
+}
+
+// Companion to fetchMessagesSnapshot for tavern-mvu iframes: reads the
+// chat-scoped MVU blob and resolves with the {stat_data, ...} shape the
+// shim bakes as `window.getAllVariables()`. Same fallback contract as
+// fetchMessagesSnapshot — empty MvuData if backend fails / times out,
+// so iframes still load with `getAllVariables()` returning an empty
+// stat_data rather than throwing.
+export function fetchVariablesSnapshot(
+  context: {
+    chatId: string;
+    currentMessageId: string;
+    currentMessageIndex: number;
+  },
+  ctx: SpindleFrontendContext,
+  timeoutMs: number = TH_TIMEOUT_MS,
+): Promise<MvuData> {
+  return new Promise((resolve) => {
+    const requestId = nextBackendRequestId();
+    let settled = false;
+    let unsub: (() => void) | null = null;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const finish = (value: MvuData): void => {
+      if (settled) return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try { unsub(); } catch { /* ignore */ }
+        unsub = null;
+      }
+      resolve(value);
+    };
+
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isThHelpersResponse(payload, requestId)) return;
+      if (payload.ok && payload.result && typeof payload.result === 'object' && !Array.isArray(payload.result)) {
+        const r = payload.result as MvuData;
+        if (r.stat_data && typeof r.stat_data === 'object') {
+          finish(r);
+          return;
+        }
+      }
+      console.warn(
+        '[vishrun:th-helpers] variables snapshot fetch failed:',
+        payload.ok ? 'malformed result' : payload.error || 'unknown error',
+      );
+      finish(emptyMvuData());
+    });
+
+    timer = setTimeout(() => {
+      console.warn('[vishrun:th-helpers] variables snapshot fetch timed out');
+      finish(emptyMvuData());
+    }, timeoutMs);
+
+    try {
+      ctx.sendToBackend({
+        type: 'th_helpers_request',
+        requestId,
+        op: 'th-get-variables-snapshot',
+        chatId: context.chatId,
+        currentMessageId: context.currentMessageId,
+        currentMessageIndex: context.currentMessageIndex,
+        body: {},
+      });
+    } catch (err) {
+      console.warn(
+        '[vishrun:th-helpers] sendToBackend threw:',
+        err instanceof Error ? err.message : String(err),
+      );
+      finish(emptyMvuData());
     }
   });
 }

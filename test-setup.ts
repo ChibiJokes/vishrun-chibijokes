@@ -23,4 +23,10 @@ if (typeof (globalThis as { document?: unknown }).document === 'undefined') {
     updateMessage: async () => {},
   },
   variables: { local: { set: async () => {} }, chat: { set: async () => {} }, global: { set: async () => {} } },
+  chats: {
+    get: async () => null,
+  },
+  characters: {
+    get: async () => null,
+  },
 };

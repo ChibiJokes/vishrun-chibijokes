@@ -8,6 +8,7 @@ function noopBridge() {
 
 function makeSnapshot(rows: Array<Partial<SnapshotMessage>>): SnapshotMessage[] {
   return rows.map((r, i) => ({
+    id: r.id ?? `msg-${i}`,
     message_id: r.message_id ?? i,
     name: r.name ?? (r.role === 'user' ? 'user' : 'char'),
     role: r.role ?? 'assistant',

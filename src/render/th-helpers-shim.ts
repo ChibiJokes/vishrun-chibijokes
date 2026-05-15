@@ -1,10 +1,9 @@
 import type { SnapshotMessage } from '../backend/th-helpers';
 
-// TS twin of the ES5 shim string that lives below as `thHelpersShim()`.
-// Mirror the logic in both — the twin is testable with happy-dom, the
-// string runs inside the sandbox iframe. getChatMessages and the two
-// id helpers are sync per the JSR contract (cards call them without
-// await); setChatMessage stays async via the backend round-trip.
+// TS twin of the ES5 shim string in thHelpersShim() below. The twin is
+// testable with happy-dom; the string runs in the sandbox iframe.
+// getChatMessages and the two id helpers are sync per the JSR contract;
+// setChatMessage stays async via the backend round-trip.
 
 export interface ThHelpersBridge {
   postRequest(kind: string, payload: Record<string, unknown>): Promise<unknown>;

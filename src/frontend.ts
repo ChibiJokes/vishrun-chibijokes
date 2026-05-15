@@ -3,6 +3,9 @@ import { fetchCharacter, extractRegexScripts } from './lumiverse/fetch-character
 import { setActiveCard, clearActiveCard, getActiveCard } from './state/active-card';
 import { installMessageHooks } from './hooks/message-rendered';
 import { rebuildCapturesFromContent } from './hooks/tag-interceptor';
+import { registerMvuDisplayStrip } from './hooks/mvu-display-strip';
+import { installStatusBarInjectHook } from './hooks/status-bar-inject';
+import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 
 interface ChatChangedPayload {
@@ -16,16 +19,19 @@ interface MessageEventPayload {
   message?: { id?: string; content?: string };
   action?: string;
   swipeId?: number;
+  previousSwipeId?: number;
 }
 
 export function setup(ctx: SpindleFrontendContext) {
   const hooks = installMessageHooks(ctx);
-  // Iframe → host postMessage routing is per-frame now: each call to
-  // buildWidgetIframe registers a frame.onMessage handler scoped to its
-  // own contentWindow. The single-listener installIframeBridge that
-  // pre-d157784 vishrun used is gone — host bridge keying on contentWindow
-  // makes it unnecessary.
-
+  // System-wide: hide <UpdateVariable> blocks from the chat UI without
+  // mutating the stored content. The backend MVU replay needs the blocks
+  // in the DB row.
+  const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
+  // System-wide: append <StatusPlaceHolderImpl/> to LLM responses that
+  // lack the trigger so the Status Bar widget mounts on assistant
+  // messages too (greeting already carries the placeholder in the card).
+  const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
   let inflightCharacterId: string | null = null;
@@ -92,22 +98,37 @@ export function setup(ctx: SpindleFrontendContext) {
   // for swipe, similar for edit), so re-running each paired-tag script's
   // findRe against that string lets us reconstruct what the captures
   // *should* be without depending on the interceptor firing.
-  function handleMessageMutation(payload: unknown): void {
+  function handleMessageMutation(eventName: 'MESSAGE_EDITED' | 'MESSAGE_SWIPED', payload: unknown): void {
     const p = (payload || {}) as MessageEventPayload;
     const msg = p.message;
     if (!msg || typeof msg.id !== 'string' || typeof msg.content !== 'string') return;
     const active = ctx.getActiveChat();
     if (active.chatId && p.chatId && active.chatId !== p.chatId) return;
+
+    // Force-rebuild every widget iframe in the affected message. The
+    // iframe registry keys on (messageId, scriptId, fullMatchHash); for
+    // static paired tags like <StatusPlaceHolderImpl> the fullMatch is
+    // identical across alternate greetings, so the idempotency check in
+    // renderPairedTagCaptures would reuse the existing iframe with its
+    // STALE baked-in variables snapshot. Wiping the registry here forces
+    // the next processNode pass to rebuild with a fresh snapshot.
+    const destroyReason = eventName === 'MESSAGE_EDITED' ? 'message-edited' : 'message-swiped';
+    destroyAllRegisteredWidgetsForMessage(msg.id, destroyReason);
+
     const compiled = hooks.compiledForActiveCard();
     if (!compiled) return;
-    const changed = rebuildCapturesFromContent(msg.id, msg.content, compiled);
-    if (changed) {
-      hooks.processMessageById(msg.id);
-    }
+    // rebuildCapturesFromContent updates capturesByMessage so phase-1
+    // cleanup in renderPairedTagCaptures has a fresh capture list to
+    // compare against. processMessageById then forces processNode to run
+    // even if rebuildCapturesFromContent reported no semantic change
+    // (which happens when the paired-tag content didn't change across
+    // greetings — the case that motivated the destroyAll above).
+    rebuildCapturesFromContent(msg.id, msg.content, compiled, eventName);
+    hooks.processMessageById(msg.id);
   }
 
-  const unsubMessageSwiped = ctx.events.on('MESSAGE_SWIPED', handleMessageMutation);
-  const unsubMessageEdited = ctx.events.on('MESSAGE_EDITED', handleMessageMutation);
+  const unsubMessageSwiped = ctx.events.on('MESSAGE_SWIPED', (p) => handleMessageMutation('MESSAGE_SWIPED', p));
+  const unsubMessageEdited = ctx.events.on('MESSAGE_EDITED', (p) => handleMessageMutation('MESSAGE_EDITED', p));
 
   // Cold-load from /characters: Lumiverse's SPA hydrates activeChatId /
   // activeCharacterId AFTER spindle setup() runs. CHAT_CHANGED only fires
@@ -137,6 +158,8 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubSettingsUpdated();
     unsubMessageSwiped();
     unsubMessageEdited();
+    unsubMvuDisplayStrip();
+    unsubStatusBarInject();
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();

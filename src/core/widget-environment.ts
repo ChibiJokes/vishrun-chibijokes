@@ -1,8 +1,7 @@
 // Classify a widget's <script> body into one of 5 tiers. Decides which
-// shim layer widget-iframe.ts injects into the iframe head. Detection is
-// regex over the concatenated <script> bodies (HTML around them is
-// ignored to avoid false positives from comment/attribute text — see
-// docs/claude-code-response.md Lote 0 report for the methodology).
+// shim layer widget-iframe.ts injects into the iframe head. Detection
+// runs over concatenated <script> bodies; HTML around them is ignored
+// to avoid false positives from comment/attribute text.
 
 export type WidgetEnvironment =
   | 'static'
@@ -103,6 +102,14 @@ export function shouldInjectThHelpersShim(env: WidgetEnvironment): boolean {
 
 export function shouldInjectJQuery(env: WidgetEnvironment): boolean {
   return env === 'tavern-jq' || env === 'tavern-mvu';
+}
+
+export function shouldInjectLodash(env: WidgetEnvironment): boolean {
+  return env === 'tavern-mvu';
+}
+
+export function shouldInjectMvuShim(env: WidgetEnvironment): boolean {
+  return env === 'tavern-mvu';
 }
 
 export function __resetWidgetEnvironmentCacheForTests(): void {

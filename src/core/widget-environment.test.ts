@@ -3,6 +3,8 @@ import {
   classifyWidgetEnvironment,
   shouldInjectThHelpersShim,
   shouldInjectJQuery,
+  shouldInjectLodash,
+  shouldInjectMvuShim,
   extractScriptBodies,
   __resetWidgetEnvironmentCacheForTests,
 } from './widget-environment';
@@ -155,6 +157,22 @@ test('shouldInjectJQuery activates for jq/mvu only', () => {
   expect(shouldInjectJQuery('tavern-jq')).toBe(true);
   expect(shouldInjectJQuery('tavern-mvu')).toBe(true);
   expect(shouldInjectJQuery('tavern-slash')).toBe(false);
+});
+
+test('shouldInjectLodash activates for mvu only', () => {
+  expect(shouldInjectLodash('static')).toBe(false);
+  expect(shouldInjectLodash('tavern-helpers-light')).toBe(false);
+  expect(shouldInjectLodash('tavern-jq')).toBe(false);
+  expect(shouldInjectLodash('tavern-mvu')).toBe(true);
+  expect(shouldInjectLodash('tavern-slash')).toBe(false);
+});
+
+test('shouldInjectMvuShim activates for mvu only', () => {
+  expect(shouldInjectMvuShim('static')).toBe(false);
+  expect(shouldInjectMvuShim('tavern-helpers-light')).toBe(false);
+  expect(shouldInjectMvuShim('tavern-jq')).toBe(false);
+  expect(shouldInjectMvuShim('tavern-mvu')).toBe(true);
+  expect(shouldInjectMvuShim('tavern-slash')).toBe(false);
 });
 
 test('dollar sign in CSS selector strings (not call) does NOT escalate', () => {

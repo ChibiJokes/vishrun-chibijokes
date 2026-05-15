@@ -15,6 +15,7 @@ import { getCapturesForMessage } from '../hooks/tag-interceptor';
 import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
 import { getLinearizedBubble, invalidateLinearizedBubble, type OffsetMapEntry } from './linearize-bubble';
+import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
 
 // Expanded widget HTML → macro-resolved HTML, for one processNode pass.
 type ResolvedMap = Map<string, string>;
@@ -265,8 +266,15 @@ async function replaceMultiLineMatches(
     const placed = replaceLinearRange(bubble, linear.offsetMap, start, end, widget);
     if (placed) {
       count++;
-    } else if (widget.tagName === 'IFRAME') {
-      destroyWidgetIframe(widget as HTMLIFrameElement);
+    } else {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: script.id, reason: 'replaceLinearRange-failed',
+        }));
+      }
+      if (widget.tagName === 'IFRAME') {
+        destroyWidgetIframe(widget as HTMLIFrameElement);
+      }
     }
   }
 
@@ -411,7 +419,14 @@ async function replacePlaceholderMatches(
     const parent = tn.parentNode;
     // Stale text node: a React subtree rebuild during an earlier iteration's
     // await detached `tn` (or its parent). Skip — a later scan re-collects.
-    if (!parent || !parent.isConnected) continue;
+    if (!parent || !parent.isConnected) {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: script.id, reason: 'parent-disconnected-pre-build',
+        }));
+      }
+      continue;
+    }
 
     const frag = document.createDocumentFragment();
     let cursor = 0;
@@ -451,6 +466,11 @@ async function replacePlaceholderMatches(
     if (tn.parentNode === parent && parent.isConnected) {
       parent.replaceChild(frag, tn);
     } else {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: script.id, reason: 'parent-displaced-post-await',
+        }));
+      }
       frag.querySelectorAll('iframe[data-vishrun-widget]').forEach((el) =>
         destroyWidgetIframe(el as HTMLIFrameElement),
       );
@@ -520,6 +540,11 @@ async function renderPairedTagCaptures(
     cap.findRe.lastIndex = 0;
     const m = cap.findRe.exec(cap.fullMatch);
     if (!m) {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: cap.scriptId, reason: 'paired-findRe-failed-rematch',
+        }));
+      }
       // Card's regex doesn't match its own fullMatch. Should be rare —
       // the tag interceptor already confirmed the tag is present — but a
       // mis-authored findRegex (extra anchors, lookarounds that miss) can
@@ -551,11 +576,9 @@ async function renderPairedTagCaptures(
     const fromMap = resolvedMap.get(expanded);
     const fromCache = fromMap ?? resolutionCache.get(expanded);
     const finalHtml = fromCache ?? expanded;
-    // Paired-tag widgets always go through the iframe path. Vavesta
-    // Court Ledger contains <script>, and even for hypothetical
-    // script-free paired widgets the isolation is cheap insurance.
-    // await: buildWidgetIframe → injectShimsAndSizeReporter may fetch the
-    // Tailwind bundle (cached after the first use).
+    // Paired-tag widgets always go through the iframe path (some cards
+    // ship <script>). await: buildWidgetIframe may fetch the Tailwind
+    // bundle on first use (cached thereafter).
     const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     // Re-validate after the await: another scan may have inserted this
@@ -563,6 +586,12 @@ async function renderPairedTagCaptures(
     // either case drop the just-built iframe (releasing its host record) and
     // skip — a later scan re-renders into the current DOM.
     if (!target.isConnected || target.querySelector(sel)) {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: cap.scriptId,
+          reason: !target.isConnected ? 'target-disconnected-post-await' : 'sibling-mounted-during-await',
+        }));
+      }
       destroyWidgetIframe(iframe);
       continue;
     }

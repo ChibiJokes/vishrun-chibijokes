@@ -2,9 +2,9 @@
  * Trigger classification — four buckets:
  *
  *   - `placeholder` → trigger is a literal-ish marker that isn't shaped like
- *     an HTML tag and has no capture groups (e.g. `【VAVESTA_HOME】`,
- *     `<StatusPlaceHolderImpl/>`). Renders via the post-DOMPurify text-node
- *     scan in `replacePlaceholderMatches`.
+ *     an HTML tag and has no capture groups (e.g. `【VAVESTA_HOME】`).
+ *     Renders via the post-DOMPurify text-node scan in
+ *     `replacePlaceholderMatches`.
  *
  *   - `pairedTag` → trigger has `<TAGNAME>...</TAGNAME>` shape regardless of
  *     whether it carries capture groups. Pacifica University is the canonical

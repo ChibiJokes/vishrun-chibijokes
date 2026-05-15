@@ -1,5 +1,6 @@
 import type { ChatMessageDTO, SpindleAPI } from 'lumiverse-spindle-types';
 import { api } from './common';
+import { computeVariablesSnapshot, emptyMvuData, type MvuData } from './mvu-parser';
 
 const LOG_PREFIX = '[vishrun:th-helpers]';
 const log = {
@@ -10,7 +11,7 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-messages-snapshot' | 'th-set-chat-message';
+  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -65,6 +66,13 @@ function resolveRangeToIndex(
 // so the iframe-side shim can shape the JSR ChatMessage vs ChatMessageSwiped
 // variants synchronously without round-tripping back to the backend.
 export interface SnapshotMessage {
+  /** Host UUID for the message row. Used by the widget-iframe build to
+   * resolve the current iframe's hosting message to a snapshot array
+   * position via id match — avoids the DOM-vs-DB index drift caused by
+   * phantom DOM elements / hidden system rows / virtual-scroll
+   * placeholders. The shim's `getCurrentMessageId()` does NOT expose
+   * this UUID to cards; it returns the resolved numeric array index. */
+  id: string;
   message_id: number;
   name: string;
   role: 'system' | 'user' | 'assistant';
@@ -88,6 +96,7 @@ function shapeSnapshotMessage(
   const swipes =
     Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
   return {
+    id: msg.id,
     message_id: msg.index_in_chat,
     name: msg.name,
     role,
@@ -108,6 +117,57 @@ export async function handleGetMessagesSnapshot(
 ): Promise<SnapshotMessage[]> {
   const messages = await chat.getMessages(chatId);
   return messages.map((m) => shapeSnapshotMessage(m as ChatMessageDTO));
+}
+
+type ChatsApi = SpindleAPI['chats'];
+type CharactersApi = SpindleAPI['characters'];
+
+// Variables snapshot is computed by replaying all chat messages through
+// the recognizer pipeline. Pure function of chat content — no persistence
+// layer, swipe and edit fall out for free.
+//
+// We pass the raw DTOs (which include `swipes`, `swipe_id`) straight in;
+// computeVariablesSnapshot resolves each message's active swipe via
+// resolveActiveContent so swiping greeting 0 → greeting N is followed.
+//
+// Recovery: if message 0's active content has no <UpdateVariable> block
+// (existing chat stripped under buggy code, imported chat, edited
+// content), the lazy fetcher reads the card's greetings and lets the
+// replay match by stripped-content hash.
+export async function handleGetVariablesSnapshot(
+  chatId: string,
+  chat: ChatApi = api.chat,
+  chats: ChatsApi = api.chats,
+  characters: CharactersApi = api.characters,
+): Promise<MvuData> {
+  try {
+    const messages = await chat.getMessages(chatId);
+    return await computeVariablesSnapshot(messages, async () => {
+      // Resolve character id. Group-chat greetings carry their own
+      // character_id on msg.extra; single-character chats fall back to
+      // the chat row.
+      const msg0 = messages[0] as ChatMessageDTO & { extra?: Record<string, unknown> } | undefined;
+      let charId: string | null = null;
+      const fromExtra = msg0?.extra?.character_id;
+      if (typeof fromExtra === 'string' && fromExtra.length > 0) {
+        charId = fromExtra;
+      } else {
+        const chatDto = await chats.get(chatId);
+        if (chatDto && typeof chatDto.character_id === 'string') {
+          charId = chatDto.character_id;
+        }
+      }
+      if (!charId) return [];
+      const card = await characters.get(charId);
+      if (!card) return [];
+      const first = typeof card.first_mes === 'string' ? card.first_mes : '';
+      const alt = Array.isArray(card.alternate_greetings) ? card.alternate_greetings : [];
+      return [first, ...alt];
+    });
+  } catch (err) {
+    log.warn('getVariablesSnapshot failed:', err instanceof Error ? err.message : String(err));
+    return emptyMvuData();
+  }
 }
 
 export async function handleSetChatMessage(
@@ -157,6 +217,9 @@ export function installThHelpersHandler(): void {
       try {
         if (op === 'th-get-messages-snapshot') {
           const result = await handleGetMessagesSnapshot(chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-get-variables-snapshot') {
+          const result = await handleGetVariablesSnapshot(chatId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

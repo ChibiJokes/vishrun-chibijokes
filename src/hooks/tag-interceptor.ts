@@ -2,30 +2,14 @@ import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import type { CompiledScript } from '../core/parse-regex-script';
 
 /**
- * Paired-tag pipeline (kept deliberately separate from the placeholder
- * pipeline — they have different triggering mechanisms and the user
- * required not to unify them).
+ * Paired-tag pipeline. ctx.messages.registerTagInterceptor fires during
+ * MessageContent's render; the handler stores captures keyed by messageId
+ * in `capturesByMessage`. The MutationObserver-driven processNode reads
+ * this map and renders captures that don't yet have a widget in the DOM.
  *
- * Trigger:  ctx.messages.registerTagInterceptor fires synchronously
- *           inside MessageContent's useMemo on every render.
- * Coordination: handler stores the captured data into capturesByMessage,
- *           keyed by messageId. The MutationObserver-driven processNode
- *           reads this map and renders any captures that don't yet have
- *           a corresponding [data-vishrun-widget] in the message DOM.
- *
- * Why a coordinator map and not direct DOM injection from the handler:
- *  - The handler runs during render — DOM commit hasn't happened yet.
- *  - More importantly, Lumiverse's stripAndDispatchMessageTags dedupes
- *    by extensionId::messageId::tagName::fullMatch in a session-lifetime
- *    Set (`delivered`), so the handler fires AT MOST ONCE per unique
- *    fullMatch per page load. If React rebuilds the message subtree
- *    later (e.g. greeting switch back to a previously-seen content),
- *    the handler does NOT re-fire — but the observer scan does, and
- *    finding the capture in this map lets us re-inject.
- *
- * Handles both placeholder-with-script (routed elsewhere — this module
- * only deals with paired tags) and paired-tag widgets uniformly through
- * the same captures map → processNode coordinator.
+ * The handler fires at most once per unique fullMatch per page load
+ * (Lumiverse dedupes via a session-lifetime Set), so subsequent
+ * re-renders of the same content rely on the map, not the handler.
  */
 
 export interface CapturedTag {
@@ -131,41 +115,35 @@ export function teardownTagInterceptors(): void {
 }
 
 /**
- * Recompute capturesByMessage[messageId] from a raw message content
- * string, without going through Lumiverse's tag interceptor pipeline.
+ * Recompute capturesByMessage[messageId] from a raw message content string,
+ * bypassing the host tag interceptor.
  *
- * Workaround for upstream issue: the host's `delivered` Set in
- * `Lumiverse/frontend/src/lib/spindle/message-interceptors.ts:21` dedupes
- * tag intercept dispatches by `(extensionId, messageId, isStreaming,
- * tagName, fullMatch)` and never clears. Swiping back to a previously-
- * seen swipe (or undoing an edit) doesn't re-fire the interceptor, so
- * onCapture never updates capturesByMessage and the widget keeps showing
- * stale content from the last swipe whose handler did fire.
+ * Workaround: Lumiverse's `delivered` Set in
+ * frontend/src/lib/spindle/message-interceptors.ts dedupes interceptor fires
+ * by (extensionId, messageId, isStreaming, tagName, fullMatch) and never
+ * clears. Swiping back to a previously-seen swipe doesn't re-fire the
+ * interceptor, so capturesByMessage would hold stale content from the last
+ * fired swipe. MESSAGE_SWIPED / MESSAGE_EDITED handlers call this with the
+ * fresh content from the WS payload instead.
  *
- * Frontend's MESSAGE_SWIPED / MESSAGE_EDITED handlers call this with the
- * fresh content from the WS event payload, bypassing the host pipeline
- * entirely. Scripts are scanned in `compiled` order (= host registration
- * order) against an accumulatively-stripped working copy: once a paired-tag
- * script claims a region, later scripts don't see it — mirrors the host's
- * stripMessageTags, so a nested script (e.g. <role_npc> inside
- * <status_bottom_npc>) doesn't double-capture (the parent expands it via the
- * nested pipeline instead). Per script: last match wins (onCapture's "latest
- * fullMatch is canonical" rule). Scripts that don't match drop their capture
- * for this messageId — that's how widgets disappear when a swipe drops the tag.
+ * Scripts run in compiled order against an accumulatively-stripped working
+ * copy (mirrors the host's stripMessageTags), so a nested script doesn't
+ * double-capture. Per script: last match wins. Scripts that don't match
+ * drop their capture — that's how widgets disappear when a swipe omits the tag.
  *
  * Returns true if capturesByMessage[messageId] changed, signalling the
- * caller to trigger processMessageById so phase 1 / phase 2 run with
- * the fresh captures.
+ * caller to trigger processMessageById.
  */
 export function rebuildCapturesFromContent(
   messageId: string,
   content: string,
   compiled: CompiledScript[],
+  _eventName?: string,
 ): boolean {
   const newList: CapturedTag[] = [];
 
-  // compileScripts always merges `g` into paired-tag regexes (mergeFlags), so
-  // `working.replace(findRe, '')` strips every occurrence of the tag.
+  // compileScripts merges `g` into paired-tag regexes, so `replace(findRe, '')`
+  // strips every occurrence.
   let working = content;
   for (const script of compiled) {
     if (script.kind !== 'pairedTag') continue;
@@ -183,16 +161,11 @@ export function rebuildCapturesFromContent(
         replaceString: script.replaceString,
         findRe: script.findRe,
         fullMatch: lastMatch[0],
-        // attrs aren't needed downstream (renderPairedTagCaptures re-runs
-        // findRe on fullMatch to recover capture groups), but the field
-        // exists on CapturedTag — populate empty rather than parse the
-        // tag's attrs from raw HTML.
         attrs: {},
       });
     }
     // Strip this tag's matches before the next script scans — accumulative,
-    // like the host. Whether or not we captured: a malformed instance the
-    // strict findRe missed shouldn't leak into a later script either way.
+    // like the host's stripMessageTags.
     script.findRe.lastIndex = 0;
     working = working.replace(script.findRe, '');
     script.findRe.lastIndex = 0;
@@ -221,24 +194,13 @@ export function rebuildCapturesFromContent(
 }
 
 function onCapture(payload: InterceptorPayload, script: CompiledScript): void {
-  // No streaming guard: Lumiverse's `delivered` Set dedupes by fullMatch,
-  // and a paired tag's regex doesn't match until the close tag streams in
-  // — by which point the captured inner is final. Rendering a widget
-  // mid-stream the moment the close tag arrives is the desired UX.
-  // (CONTEXT.md previously suggested guarding on isStreaming, but that
-  // would race against `delivered` and silently drop the only fire.)
-
+  // No streaming guard: the paired-tag regex doesn't match until the close
+  // tag arrives, by which point the captured inner is final.
   if (!payload.messageId) return;
 
-  // Drop any prior capture for this scriptId in this message — only the
-  // latest fullMatch is canonical. This is what makes greeting switch /
-  // message edit / regen converge correctly: a new fullMatch for the
-  // same (messageId, scriptId) ejects the stale capture, and
-  // renderPairedTagCaptures' phase-1 cleanup removes the corresponding
-  // stale widget. Trade-off: the same paired tag emitted multiple times
-  // in a single message renders only the last instance — no card in
-  // scope hits this; documented in CONTEXT.md "Known issues" with the
-  // migration path (REST-fetch-and-rematch on content-hash change).
+  // Drop any prior capture for this scriptId — only the latest fullMatch
+  // is canonical. Trade-off: the same paired tag emitted multiple times
+  // in one message renders only the last instance (no card in scope hits this).
   const existing = capturesByMessage.get(payload.messageId) || [];
   const list = existing.filter((c) => c.scriptId !== script.id);
 
