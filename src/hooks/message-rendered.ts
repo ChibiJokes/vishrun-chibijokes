@@ -1,6 +1,6 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { compileScripts, type CompiledScript } from '../core/parse-regex-script';
-import { processNode } from '../render/inject-into-message';
+import { processNode, clearEditingMessageIds } from '../render/inject-into-message';
 import { getActiveCard } from '../state/active-card';
 import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
@@ -274,6 +274,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     dispose: () => {
       detachObserver();
       teardownTagInterceptors();
+      clearEditingMessageIds();
       unsubGenEnded();
       unsubChatChanged();
     },

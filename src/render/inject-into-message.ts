@@ -6,6 +6,7 @@ import { applyNestedPipeline } from '../core/nested-pipeline';
 import {
   buildWidgetIframe,
   cleanupOrphansForMessage,
+  destroyAllRegisteredWidgetsForMessage,
   destroyRegisteredWidgetsFor,
   destroyWidgetIframe,
   hasRegisteredWidgetsFor,
@@ -34,6 +35,54 @@ type ResolvedMap = Map<string, string>;
 // value. A browser refresh clears the cache. Acceptable for the current use
 // case (variables are set up front, rarely mutate).
 const resolutionCache = new Map<string, string>();
+
+// Module-scoped tracker for which messageIds are currently observed in edit
+// mode. Lumiverse emits no event for the edit enter/exit transition (pure
+// React state, see BubbleMessageDefault.tsx:270-293), so we infer transitions
+// by diffing the DOM signal against this Set on each processNode pass. The
+// Set is load-bearing: enter → tear down widgets and short-circuit; still
+// → short-circuit; exit → fall through to the rebuild pipeline.
+const editingMessageIds = new Set<string>();
+
+export type EditTransition = 'enter' | 'still' | 'exit' | 'idle';
+
+/**
+ * Diff the message's current DOM state against the editing Set to detect an
+ * edit-mode transition edge. Mutates `editingSet` on 'enter' and 'exit' so
+ * the next call sees the new steady state. DOM signal established by prior
+ * investigation: textarea present AND no [data-component="MessageContent"].
+ */
+export function computeEditModeTransition(
+  root: HTMLElement,
+  messageId: string,
+  editingSet: Set<string>,
+): EditTransition {
+  const hasTextarea = !!root.querySelector('textarea');
+  const hasMessageContent = !!root.querySelector('[data-component="MessageContent"]');
+  const inEditMode = hasTextarea && !hasMessageContent;
+  const wasEditing = editingSet.has(messageId);
+  if (inEditMode && !wasEditing) {
+    editingSet.add(messageId);
+    return 'enter';
+  }
+  if (inEditMode && wasEditing) return 'still';
+  if (!inEditMode && wasEditing) {
+    editingSet.delete(messageId);
+    return 'exit';
+  }
+  return 'idle';
+}
+
+/** Reset the module's edit-mode tracker. Called from installMessageHooks
+ *  dispose() so the Set doesn't outlive a spindle reload / chat teardown. */
+export function clearEditingMessageIds(): void {
+  editingMessageIds.clear();
+}
+
+/** Test-only inspection of the module's edit-mode Set. */
+export function getEditingMessageIdsForTest(): ReadonlySet<string> {
+  return editingMessageIds;
+}
 
 /**
  * Process a single message DOM. Two pipelines, kept separate per the
@@ -72,6 +121,35 @@ export async function processNode(
     // processNode for `[data-message-id]` nodes anyway.
     return 0;
   }
+
+  // Edit-mode gate. Lumiverse replaces MessageContent with MessageEditArea
+  // (textarea) when editingMessageId === message.id; no event fires for the
+  // transition, so we diff the DOM signal against the editing Set every pass.
+  //   enter → destroy registered widgets (so the iframe doesn't sit next to
+  //           the textarea via findContentRoot's fallback) and short-circuit.
+  //   still → short-circuit every observer tick while the textarea is open.
+  //   exit  → fall through; MessageContent is back, findContentRoot resolves,
+  //           and the pipeline rebuilds from the (possibly edited) content.
+  //   idle  → normal path, unchanged.
+  const transition = computeEditModeTransition(root, messageId, editingMessageIds);
+  if (VSH_VISHRUN_DIAG) {
+    if (transition === 'enter') {
+      console.log('[vishrun:edit-mode] transition', {
+        messageId,
+        phase: 'enter',
+        signal: 'textarea-without-MessageContent',
+      });
+    } else if (transition === 'exit') {
+      console.log('[vishrun:edit-mode] transition', { messageId, phase: 'exit' });
+    }
+  }
+  if (transition === 'enter') {
+    // Reuse the teardown path the MESSAGE_EDITED rebuild uses. Idempotent
+    // when nothing's registered for this id.
+    destroyAllRegisteredWidgetsForMessage(messageId, 'edit-mode-enter');
+    return 0;
+  }
+  if (transition === 'still') return 0;
 
   // Global pre-pipeline cleanup: destroy any registered iframes for this
   // messageId that aren't currently inside the expected MessageContent.

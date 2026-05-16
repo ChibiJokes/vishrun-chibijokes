@@ -2427,11 +2427,50 @@ function quickHash(s) {
 
 // src/render/inject-into-message.ts
 var resolutionCache = new Map;
+var editingMessageIds = new Set;
+function computeEditModeTransition(root, messageId, editingSet) {
+  const hasTextarea = !!root.querySelector("textarea");
+  const hasMessageContent = !!root.querySelector('[data-component="MessageContent"]');
+  const inEditMode = hasTextarea && !hasMessageContent;
+  const wasEditing = editingSet.has(messageId);
+  if (inEditMode && !wasEditing) {
+    editingSet.add(messageId);
+    return "enter";
+  }
+  if (inEditMode && wasEditing)
+    return "still";
+  if (!inEditMode && wasEditing) {
+    editingSet.delete(messageId);
+    return "exit";
+  }
+  return "idle";
+}
+function clearEditingMessageIds() {
+  editingMessageIds.clear();
+}
 async function processNode(root, scripts, ctx) {
   const messageId = root.getAttribute("data-message-id") || undefined;
   if (!messageId) {
     return 0;
   }
+  const transition = computeEditModeTransition(root, messageId, editingMessageIds);
+  if (VSH_VISHRUN_DIAG) {
+    if (transition === "enter") {
+      console.log("[vishrun:edit-mode] transition", {
+        messageId,
+        phase: "enter",
+        signal: "textarea-without-MessageContent"
+      });
+    } else if (transition === "exit") {
+      console.log("[vishrun:edit-mode] transition", { messageId, phase: "exit" });
+    }
+  }
+  if (transition === "enter") {
+    destroyAllRegisteredWidgetsForMessage(messageId, "edit-mode-enter");
+    return 0;
+  }
+  if (transition === "still")
+    return 0;
   const target = findContentRoot(root);
   cleanupOrphansForMessage(messageId, target);
   const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
@@ -3099,6 +3138,7 @@ function installMessageHooks(ctx) {
     dispose: () => {
       detachObserver();
       teardownTagInterceptors();
+      clearEditingMessageIds();
       unsubGenEnded();
       unsubChatChanged();
     }
