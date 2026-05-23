@@ -90,19 +90,55 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     return active === chatId;
   }
 
-  function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
-    const compiled = compiledForActiveCard();
-    if (!compiled) return;
-    const sel = buildMessageSelector(messageId);
-    const node = document.querySelector(sel) as HTMLElement | null;
-    if (node) {
-      void processNode(node, compiled, ctx);
+function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
+  const compiled = compiledForActiveCard(); //
+  if (!compiled) return; //
+  
+  const sel = buildMessageSelector(messageId); //
+  const node = document.querySelector(sel) as HTMLElement | null; //
+  
+  if (node) {
+    // 1. Defensively verify the inner Content layer has fully hydrated in the React layout tree
+    if (!node.querySelector('[data-component="MessageContent"]')) {
+      if (retriesLeft > 0) {
+        requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
+      }
       return;
     }
-    if (retriesLeft > 0) {
-      requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
-    }
+
+    // 2. Grab all nodes to accurately deduce this specific message node's depth index offset
+    const allNodes = Array.from(document.querySelectorAll('[data-message-id]'));
+    const nodeIndex = allNodes.indexOf(node);
+    
+    // If the node isn't found in the current viewport list tracking loop, abort safely
+    if (nodeIndex === -1) return;
+    
+    const depthFromLatest = allNodes.length - 1 - nodeIndex;
+
+    // 3. Mirror the exact bulletproof filter conditions used in scanAllNow
+    const scriptsForMessage = compiled.filter((s) => {
+      // Safe harbor sandbox isolation for active profile tracking
+      if (s.maxDepth === 0 && s.minDepth === 0) {
+        return messageId === latestMessageId;
+      }
+      
+      // Enforce clean, standard bounds handling for every alternative configuration choice
+      if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
+      if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
+      return true;
+    });
+
+    if (scriptsForMessage.length === 0) return;
+
+    // 4. Safely execute the contextual scripts explicitly tailored for this message node's location
+    void processNode(node, scriptsForMessage, ctx); //
+    return;
   }
+  
+  if (retriesLeft > 0) {
+    requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1)); //
+  }
+}
 
   async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
