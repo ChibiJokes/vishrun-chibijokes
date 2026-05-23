@@ -113,6 +113,7 @@ async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
       nodes.forEach((n, i) => {
         const depthFromLatest = total - 1 - i;
         const scriptsForMessage = compiled.filter(s => {
+          if (s.maxDepth === 0) return false;
           if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
           if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
           return true;
