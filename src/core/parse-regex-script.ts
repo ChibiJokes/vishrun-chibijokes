@@ -6,6 +6,8 @@ export interface CompiledScript {
   scriptName: string;
   findRe: RegExp;
   replaceString: string;
+  minDepth: number | null;
+  maxDepth: number | null;
   /**
    * Trigger classification — drives pipeline routing in inject-into-message
    * and tag-interceptor. See `classify-trigger.ts` for what each kind means
@@ -134,6 +136,8 @@ export function compileScripts(rawScripts: RawRegexScript[]): CompiledScript[] {
       replaceString: replace,
       kind,
       sourceIndex: i,
+      minDepth: s.minDepth ?? null,
+      maxDepth: s.maxDepth ?? null,
     });
   }
   return out;
