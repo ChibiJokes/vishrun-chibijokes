@@ -86,22 +86,28 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     return active === chatId;
   }
 
-  function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
-    const compiled = compiledForActiveCard();
-    if (!compiled) return;
-    const sel = buildMessageSelector(messageId);
-    const node = document.querySelector(sel) as HTMLElement | null;
-    if (node) {
-      // processNode is async (widget builds may fetch the Tailwind bundle on
-      // first use). Fire-and-forget — it swallows its own render errors, and
-      // a later observer-driven scan re-runs idempotently if needed.
-      void processNode(node, compiled, ctx);
-      return;
-    }
-    if (retriesLeft > 0) {
-      requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
-    }
+function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
+  const compiled = compiledForActiveCard();
+  if (!compiled) return;
+  const sel = buildMessageSelector(messageId);
+  const node = document.querySelector(sel) as HTMLElement | null;
+  if (node) {
+    const nodes = Array.from(document.querySelectorAll('[data-message-id]'));
+    const total = nodes.length;
+    const idx = nodes.indexOf(node);
+    const depthFromLatest = total - 1 - idx;
+    const scriptsForMessage = compiled.filter(s => {
+      if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
+      if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
+      return true;
+    });
+    void processNode(node, scriptsForMessage, ctx);
+    return;
   }
+  if (retriesLeft > 0) {
+    requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
+  }
+}
 
 async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
