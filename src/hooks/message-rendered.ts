@@ -70,6 +70,10 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   // and the SPA is still mounting the chat view. Auto-disconnects as
   // soon as MessageList appears.
   let bodyWatcher: MutationObserver | null = null;
+  // Tracks the most recently completed generation's message ID.
+  // Used to anchor depth-0 scripts to a stable identity rather than
+  // a DOM position that shifts as Lumi loads/unloads messages on scroll.
+  let latestMessageId: string | null = null;
   const OBSERVE_OPTS: MutationObserverInit = { childList: true, subtree: true, characterData: true };
 
   function compiledForActiveCard(): CompiledScript[] | null {
@@ -86,30 +90,21 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     return active === chatId;
   }
 
-function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
-  const compiled = compiledForActiveCard();
-  if (!compiled) return;
-  const sel = buildMessageSelector(messageId);
-  const node = document.querySelector(sel) as HTMLElement | null;
-  if (node) {
-    const nodes = Array.from(document.querySelectorAll('[data-message-id]'));
-    const total = nodes.length;
-    const idx = nodes.indexOf(node);
-    const depthFromLatest = total - 1 - idx;
-    const scriptsForMessage = compiled.filter(s => {
-      if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
-      if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
-      return true;
-    });
-    void processNode(node, scriptsForMessage, ctx);
-    return;
+  function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
+    const compiled = compiledForActiveCard();
+    if (!compiled) return;
+    const sel = buildMessageSelector(messageId);
+    const node = document.querySelector(sel) as HTMLElement | null;
+    if (node) {
+      void processNode(node, compiled, ctx);
+      return;
+    }
+    if (retriesLeft > 0) {
+      requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
+    }
   }
-  if (retriesLeft > 0) {
-    requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
-  }
-}
 
-async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
+  async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving) observer!.disconnect();
     try {
@@ -118,7 +113,11 @@ async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
       const tasks: Promise<unknown>[] = [];
       nodes.forEach((n, i) => {
         const depthFromLatest = total - 1 - i;
-        const scriptsForMessage = compiled.filter(s => {
+        const nodeMessageId = n.getAttribute('data-message-id');
+        const scriptsForMessage = compiled.filter((s) => {
+          if (s.maxDepth === 0) {
+            return nodeMessageId !== null && nodeMessageId === latestMessageId;
+          }
           if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
           if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
           return true;
@@ -266,6 +265,7 @@ async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     if (p.error) return;
     if (!isActiveChat(p.chatId)) return;
     if (!p.messageId) return;
+    latestMessageId = p.messageId;
     processMessageById(p.messageId, MAX_RAF_RETRIES);
   });
 
