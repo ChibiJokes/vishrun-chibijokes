@@ -103,17 +103,23 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     }
   }
 
-  async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
-    // Pause the observer for the full window where Vishrun mutates the DOM.
-    // processNode is async (widget builds may await Tailwind bundle fetch);
-    // re-attach only after every promise settles so the observer never sees
-    // its own injections.
+async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving) observer!.disconnect();
     try {
-      const nodes = document.querySelectorAll('[data-message-id]');
+      const nodes = Array.from(document.querySelectorAll('[data-message-id]'));
+      const total = nodes.length;
       const tasks: Promise<unknown>[] = [];
-      nodes.forEach((n) => { tasks.push(processNode(n as HTMLElement, compiled, ctx).catch(() => {})); });
+      nodes.forEach((n, i) => {
+        const depthFromLatest = total - 1 - i;
+        const scriptsForMessage = compiled.filter(s => {
+          if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
+          if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
+          return true;
+        });
+        if (scriptsForMessage.length === 0) return;
+        tasks.push(processNode(n as HTMLElement, scriptsForMessage, ctx).catch(() => {}));
+      });
       await Promise.all(tasks);
     } finally {
       if (wasObserving && observedTarget && document.contains(observedTarget)) {
