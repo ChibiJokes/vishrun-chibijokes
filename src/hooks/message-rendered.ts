@@ -115,7 +115,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
         const depthFromLatest = total - 1 - i;
         const nodeMessageId = n.getAttribute('data-message-id');
         const scriptsForMessage = compiled.filter((s) => {
-          if (s.maxDepth === 0) {
+          if (s.maxDepth === 0 && s.minDepth === 0) {
             return nodeMessageId !== null && nodeMessageId === latestMessageId;
           }
           if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
