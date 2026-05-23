@@ -90,19 +90,25 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     return active === chatId;
   }
 
-  function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
-    const compiled = compiledForActiveCard();
-    if (!compiled) return;
-    const sel = buildMessageSelector(messageId);
-    const node = document.querySelector(sel) as HTMLElement | null;
-    if (node) {
-      void processNode(node, compiled, ctx);
-      return;
-    }
-    if (retriesLeft > 0) {
-      requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
-    }
+function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
+  const compiled = compiledForActiveCard();
+  if (!compiled) return;
+  const sel = buildMessageSelector(messageId);
+  const node = document.querySelector(sel) as HTMLElement | null;
+  if (node) {
+    const scriptsForMessage = compiled.filter((s) => {
+      if (s.maxDepth === 0) {
+        return messageId === latestMessageId;
+      }
+      return true;
+    });
+    void processNode(node, scriptsForMessage, ctx);
+    return;
   }
+  if (retriesLeft > 0) {
+    requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
+  }
+}
 
   async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
