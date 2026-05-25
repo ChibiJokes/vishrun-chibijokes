@@ -706,7 +706,7 @@ async function buildWidget(
   // Match the iframe path's vertical breathing room (12px in widget-iframe.ts).
   // Without this, no-isolation widgets (innerHTML+div path) render flush
   // against adjacent message text and feel cramped — Step 6 user feedback.
-  wrapper.style.margin = '12px 0';
+  wrapper.style.margin = '0px 0';
   wrapper.innerHTML = html;
   return wrapper;
 }
