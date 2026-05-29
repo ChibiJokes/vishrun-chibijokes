@@ -432,67 +432,70 @@ async function transformHtmlForTailwind(html, ctx) {
   const textColorOverride = detectCardColorScheme(html) === null ? "<style>:root{color:#000 !important}</style>" : "";
   return textColorOverride + inline + stripped;
 }
-var UNPKG_SCRIPT_RE = /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/unpkg\.com(?=[/?#"']|\s)[^"']*)["'][^>]*>\s*<\/script>/gi;
-function classifyUnpkgUrl(url) {
-  const m = url.match(/^https?:\/\/unpkg\.com(\/[^"'?#]*)/i);
-  if (!m)
-    return null;
-  const path = m[1];
-  if (/^\/(?:@babel\/standalone|babel-standalone)(?:@[^/]*)?(?:\/|$)/i.test(path))
-    return "babel";
-  if (/^\/react-dom(?:@[^/]*)?(?:\/|$)/i.test(path))
-    return "reactDom";
-  if (/^\/react(?:@[^/]*)?(?:\/|$)/i.test(path))
-    return "react";
-  return null;
+var CDN_SCRIPT_HOSTS = new Set([
+  "unpkg.com",
+  "cdn.jsdelivr.net",
+  "cdnjs.cloudflare.com",
+  "esm.sh",
+  "esm.run",
+  "cdn.skypack.dev"
+]);
+var CDN_SCRIPT_RE = /<script\b[^>]*\bsrc\s*=\s*["'](https?:\/\/[^"']+)["'][^>]*>\s*<\/script>/gi;
+function isCdnScriptUrl(url) {
+  let host;
+  try {
+    host = new URL(url).host.toLowerCase();
+  } catch {
+    return false;
+  }
+  return CDN_SCRIPT_HOSTS.has(host);
 }
-var REACT_BABEL_ORDER = ["react", "reactDom", "babel"];
-function extractReactBabelUrls(html) {
-  if (html.indexOf("unpkg.com") === -1)
-    return {};
-  const out = {};
-  UNPKG_SCRIPT_RE.lastIndex = 0;
+function escapeScriptBody(body) {
+  return body.replace(/<\/script\b/gi, "<\\/script").replace(/<!--/g, "<\\!--");
+}
+function inlineScriptTag(originalTag, body) {
+  const type = originalTag.match(/\btype\s*=\s*["']([^"']+)["']/i);
+  return `<script${type ? ` type="${type[1]}"` : ""}>${escapeScriptBody(body)}</script>`;
+}
+function extractCdnScriptUrls(html) {
+  if (html.indexOf("<script") === -1)
+    return [];
+  const out = [];
+  const seen = new Set;
+  CDN_SCRIPT_RE.lastIndex = 0;
   let m;
-  while ((m = UNPKG_SCRIPT_RE.exec(html)) !== null) {
+  while ((m = CDN_SCRIPT_RE.exec(html)) !== null) {
     const url = m[1];
-    const slot = classifyUnpkgUrl(url);
-    if (slot && out[slot] === undefined)
-      out[slot] = url;
+    if (isCdnScriptUrl(url) && !seen.has(url)) {
+      seen.add(url);
+      out.push(url);
+    }
   }
   return out;
 }
-function escapeRegExp(s) {
-  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-}
-function stripScriptTagBySrc(html, url) {
-  return html.replace(new RegExp(`<script\\b[^>]*\\bsrc\\s*=\\s*["']${escapeRegExp(url)}["'][^>]*>\\s*</script>`, "gi"), "");
-}
-async function transformHtmlForReactBabel(html, ctx) {
-  const urls = extractReactBabelUrls(html);
-  const slots = REACT_BABEL_ORDER.filter((slot) => urls[slot] !== undefined);
-  if (slots.length === 0)
+async function transformHtmlForCdnScripts(html, ctx) {
+  const urls = extractCdnScriptUrls(html);
+  if (urls.length === 0)
     return html;
-  const fetched = await Promise.all(slots.map(async (slot) => {
-    const url = urls[slot];
+  const bodyByUrl = new Map;
+  await Promise.all(urls.map(async (url) => {
     try {
-      return { url, body: await getCachedBundle(url, ctx) };
+      bodyByUrl.set(url, await getCachedBundle(url, ctx));
     } catch (err) {
-      console.warn("[vishrun] React/Babel fetch failed:", url, err instanceof Error ? err.message : String(err));
-      return { url, body: "" };
+      console.warn("[vishrun] CDN script fetch failed:", url, err instanceof Error ? err.message : String(err));
     }
   }));
-  const ok = fetched.filter((f) => f.body !== "");
-  if (ok.length === 0)
+  if (bodyByUrl.size === 0)
     return html;
-  let stripped = html;
-  for (const f of ok)
-    stripped = stripScriptTagBySrc(stripped, f.url);
-  const inline = ok.map((f) => `<script>${f.body}</script>`).join("");
-  return inline + stripped;
+  CDN_SCRIPT_RE.lastIndex = 0;
+  return html.replace(CDN_SCRIPT_RE, (full, url) => {
+    const body = bodyByUrl.get(url);
+    return body !== undefined ? inlineScriptTag(full, body) : full;
+  });
 }
 async function transformHtmlForExternalScripts(html, ctx) {
   const withTailwind = await transformHtmlForTailwind(html, ctx);
-  return transformHtmlForReactBabel(withTailwind, ctx);
+  return transformHtmlForCdnScripts(withTailwind, ctx);
 }
 
 // src/core/font-proxy.ts
@@ -1634,7 +1637,8 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     autoResize: false,
     minHeight: 1,
     maxHeight: 4000,
-    initialHeight: 1
+    initialHeight: 1,
+    allowEval: true
   });
   frame.onMessage((payload) => {
     routeChildMessage(frame, payload, ctx, { chatId, messageId, currentMessageIndex });
@@ -2234,17 +2238,27 @@ function getCapturesForMessage(messageId) {
 }
 var activeUnsubs = [];
 var activeTagNames = new Set;
-function syncTagInterceptors(ctx, compiled) {
+function syncTagInterceptors(ctx, compiled, recovery) {
   const desired = new Map;
   for (const s of compiled) {
     if (s.kind !== "pairedTag")
       continue;
-    const tagName = extractTagName(s.findRe.source);
-    if (!tagName) {
-      console.debug(`[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` + `extractTagName failed — skipping. findRegex source: ${s.findRe.source}`);
+    const tags = extractAllTagNames(s.findRe.source);
+    if (tags.length === 0) {
+      console.debug(`[vishrun] paired-tag script "${s.scriptName}" classified as pairedTag but ` + `no tag name extractable — skipping. findRegex source: ${s.findRe.source}`);
       continue;
     }
-    desired.set(tagName.toLowerCase(), s);
+    desired.set(tags[0].toLowerCase(), { script: s, role: "capture" });
+  }
+  for (const s of compiled) {
+    if (s.kind !== "pairedTag")
+      continue;
+    const tags = extractAllTagNames(s.findRe.source);
+    for (let i = 1;i < tags.length; i++) {
+      const key = tags[i].toLowerCase();
+      if (!desired.has(key))
+        desired.set(key, { script: s, role: "strip" });
+    }
   }
   if (desired.size === activeTagNames.size && [...desired.keys()].every((t) => activeTagNames.has(t))) {
     return;
@@ -2256,8 +2270,9 @@ function syncTagInterceptors(ctx, compiled) {
   });
   activeUnsubs = [];
   activeTagNames = new Set(desired.keys());
-  for (const [tagName, script] of desired) {
-    const unsub = ctx.messages.registerTagInterceptor({ tagName, removeFromMessage: true }, (payload) => onCapture(payload, script));
+  for (const [tagName, reg] of desired) {
+    const handler = reg.role === "capture" ? (payload) => onCapture(payload, reg.script, recovery) : () => {};
+    const unsub = ctx.messages.registerTagInterceptor({ tagName, removeFromMessage: true }, handler);
     activeUnsubs.push(unsub);
   }
 }
@@ -2318,24 +2333,73 @@ function rebuildCapturesFromContent(messageId, content, compiled, _eventName) {
   }
   return changed;
 }
-function onCapture(payload, script) {
+var recoveryInFlight = new Set;
+function onCapture(payload, script, recovery) {
   if (!payload.messageId)
     return;
-  const existing = capturesByMessage.get(payload.messageId) || [];
+  script.findRe.lastIndex = 0;
+  const selfMatches = script.findRe.test(payload.fullMatch);
+  script.findRe.lastIndex = 0;
+  if (selfMatches) {
+    storeCapture(payload.messageId, script, payload.fullMatch, payload.attrs);
+    return;
+  }
+  if (!recovery || !payload.chatId) {
+    storeCapture(payload.messageId, script, payload.fullMatch, payload.attrs);
+    return;
+  }
+  recoverFullCapture(payload.messageId, payload.chatId, script, payload, recovery);
+}
+function storeCapture(messageId, script, fullMatch, attrs) {
+  const existing = capturesByMessage.get(messageId) || [];
   const list = existing.filter((c) => c.scriptId !== script.id);
   list.push({
     scriptId: script.id,
     scriptName: script.scriptName,
     replaceString: script.replaceString,
     findRe: script.findRe,
-    fullMatch: payload.fullMatch,
-    attrs: payload.attrs
+    fullMatch,
+    attrs
   });
-  capturesByMessage.set(payload.messageId, list);
+  capturesByMessage.set(messageId, list);
 }
-function extractTagName(reSource) {
-  const m = reSource.match(/^<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/);
-  return m ? m[1] : null;
+async function recoverFullCapture(messageId, chatId, script, payload, recovery) {
+  if (recoveryInFlight.has(messageId))
+    return;
+  recoveryInFlight.add(messageId);
+  try {
+    let content = null;
+    try {
+      content = await recovery.fetchContent(chatId, messageId);
+    } catch {
+      content = null;
+    }
+    if (content == null) {
+      storeCapture(messageId, script, payload.fullMatch, payload.attrs);
+      recovery.reprocess(messageId);
+      return;
+    }
+    const changed = rebuildCapturesFromContent(messageId, content, recovery.compiled);
+    if (changed)
+      recovery.reprocess(messageId);
+  } finally {
+    recoveryInFlight.delete(messageId);
+  }
+}
+var OPEN_TAG_RE = /<(?:\\s\*|\s)*([a-zA-Z_][a-zA-Z0-9_-]*)/g;
+function extractAllTagNames(reSource) {
+  OPEN_TAG_RE.lastIndex = 0;
+  const names = [];
+  const seen = new Set;
+  let m;
+  while ((m = OPEN_TAG_RE.exec(reSource)) !== null) {
+    const lower = m[1].toLowerCase();
+    if (seen.has(lower))
+      continue;
+    seen.add(lower);
+    names.push(m[1]);
+  }
+  return names;
 }
 
 // src/core/macro-detection.ts
@@ -2985,6 +3049,24 @@ function hashKey(s) {
   return (h >>> 0).toString(36);
 }
 
+// src/lumiverse/fetch-message.ts
+function parseMessagesResponse(json) {
+  if (Array.isArray(json))
+    return json;
+  if (json && typeof json === "object" && Array.isArray(json.data)) {
+    return json.data;
+  }
+  return [];
+}
+async function fetchMessageContentById(chatId, messageId) {
+  const r = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}/messages`, { credentials: "same-origin" });
+  if (!r.ok)
+    throw new Error(`messages fetch failed: HTTP ${r.status}`);
+  const json = await r.json();
+  const m = parseMessagesResponse(json).find((mm) => mm.id === messageId);
+  return m ? m.content : null;
+}
+
 // src/core/chat-changed-filter.ts
 var VAR_PATH_RE = /^metadata\.(macro_variables|chat_variables)(\.|$)/;
 function shouldRescanForChangedFields(changedFields) {
@@ -3184,7 +3266,11 @@ function installMessageHooks(ctx) {
   function rescanAll() {
     const compiledNow = compiledForActiveCard();
     if (compiledNow) {
-      syncTagInterceptors(ctx, compiledNow);
+      syncTagInterceptors(ctx, compiledNow, {
+        compiled: compiledNow,
+        fetchContent: fetchMessageContentById,
+        reprocess: (id) => processMessageById(id)
+      });
     } else {
       teardownTagInterceptors();
     }
@@ -3289,14 +3375,6 @@ async function maybeInjectStatusPlaceholder(chatId, messageId, io) {
     logInjectError(messageId, err);
     return "error";
   }
-}
-function parseMessagesResponse(json) {
-  if (Array.isArray(json))
-    return json;
-  if (json && typeof json === "object" && Array.isArray(json.data)) {
-    return json.data;
-  }
-  return [];
 }
 function defaultIO() {
   return {
