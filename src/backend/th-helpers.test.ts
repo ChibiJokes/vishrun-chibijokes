@@ -192,7 +192,9 @@ test('handleGetMessagesSnapshot leaves non-initial messages unchanged when deriv
   expect(snap[1].swipes).toEqual(['reply']);
 });
 
-test('handleSetChatMessage writes content patch via updateMessage', async () => {
+test('handleSetChatMessage with swipe_id ignores it and sends content-only patch', async () => {
+  // opts.swipe_id is intentionally ignored so the native selector and
+  // this extension both write slot 0 without corrupting other slots.
   const api = makeChatApi(makeMessages([{ content: 'orig', swipes: ['orig', 'alt'], swipeId: 0 }]));
   await handleSetChatMessage(
     { fieldValues: { message: 'new' }, messageId: 0, opts: { swipe_id: 1 } },
@@ -201,8 +203,51 @@ test('handleSetChatMessage writes content patch via updateMessage', async () => 
     api.chat,
   );
   expect(api.updates).toEqual([
-    { chatId: 'chat-1', messageId: 'msg-0', patch: { content: 'new', swipe_id: 1 } },
+    { chatId: 'chat-1', messageId: 'msg-0', patch: { content: 'new' } },
   ]);
+});
+
+test('handleSetChatMessage with mid-array swipe_id still sends content-only patch', async () => {
+  const api = makeChatApi(makeMessages([{ content: 'a', swipes: ['a', 'b', 'c', 'd', 'e'], swipeId: 0 }]));
+  await handleSetChatMessage(
+    { fieldValues: { message: 'X' }, messageId: 0, opts: { swipe_id: 2 } },
+    'chat-1',
+    0,
+    api.chat,
+  );
+  expect(api.updates[0].patch).toEqual({ content: 'X' });
+});
+
+test('handleSetChatMessage with swipe_id past end still sends content-only patch', async () => {
+  const api = makeChatApi(makeMessages([{ content: 'a', swipes: ['a', 'b', 'c'], swipeId: 0 }]));
+  await handleSetChatMessage(
+    { fieldValues: { message: 'X' }, messageId: 0, opts: { swipe_id: 5 } },
+    'chat-1',
+    0,
+    api.chat,
+  );
+  expect(api.updates[0].patch).toEqual({ content: 'X' });
+});
+
+test('handleSetChatMessage when target.swipes is not an array still sends content-only patch', async () => {
+  // target.swipes shape is irrelevant; the patch is always { content }.
+  // Test stays to confirm no crash on malformed rows.
+  const messages = makeMessages([{ content: 'a' }]);
+  (messages[0] as { swipes: unknown }).swipes = undefined;
+  const updates: Array<{ chatId: string; messageId: string; patch: unknown }> = [];
+  const chat = {
+    getMessages: async () => messages,
+    updateMessage: async (chatId: string, messageId: string, patch: unknown) => {
+      updates.push({ chatId, messageId, patch });
+    },
+  } as unknown as import('lumiverse-spindle-types').SpindleAPI['chat'];
+  await handleSetChatMessage(
+    { fieldValues: { message: 'X' }, messageId: 0, opts: { swipe_id: 2 } },
+    'chat-1',
+    0,
+    chat,
+  );
+  expect(updates[0].patch).toEqual({ content: 'X' });
 });
 
 test('handleSetChatMessage without swipe_id omits it from patch', async () => {

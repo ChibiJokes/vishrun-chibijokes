@@ -221,7 +221,6 @@ export async function handleSetChatMessage(
   chat: ChatApi = api.chat,
 ): Promise<void> {
   const fieldValues = (body.fieldValues as Record<string, unknown> | undefined) ?? {};
-  const opts = (body.opts as Record<string, unknown> | undefined) ?? {};
   const messageRange = body.messageId;
 
   const messages = await chat.getMessages(chatId);
@@ -243,13 +242,11 @@ export async function handleSetChatMessage(
     return;
   }
 
-  const patch: { content: string; swipe_id?: number } = { content };
-  const optsSwipeId = opts.swipe_id;
-  if (typeof optsSwipeId === 'number') {
-    patch.swipe_id = optsSwipeId;
-  }
-
-  await chat.updateMessage(chatId, target.id, patch);
+  // Send { content } only and ignore opts.swipe_id. The native greeting
+  // selector also writes { content } without swipe_id, so the host
+  // overwrites swipes[existing.swipe_id]. Keeping swipe_id at 0 lets
+  // both writers cooperate on slot 0 without corrupting other slots.
+  await chat.updateMessage(chatId, target.id, { content });
 }
 
 export function installThHelpersHandler(): void {

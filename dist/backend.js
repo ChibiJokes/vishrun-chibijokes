@@ -869,7 +869,6 @@ async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats
 }
 async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = api.chat) {
   const fieldValues = body.fieldValues ?? {};
-  const opts = body.opts ?? {};
   const messageRange = body.messageId;
   const messages = await chat.getMessages(chatId);
   if (messages.length === 0) {
@@ -887,12 +886,7 @@ async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = ap
     log.warn("setChatMessage: no message string in fieldValues, ignoring");
     return;
   }
-  const patch = { content };
-  const optsSwipeId = opts.swipe_id;
-  if (typeof optsSwipeId === "number") {
-    patch.swipe_id = optsSwipeId;
-  }
-  await chat.updateMessage(chatId, target.id, patch);
+  await chat.updateMessage(chatId, target.id, { content });
 }
 function installThHelpersHandler() {
   api.onFrontendMessage((payload, userId) => {
