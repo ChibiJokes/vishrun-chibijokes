@@ -45,7 +45,7 @@ export function setup(ctx: SpindleFrontendContext) {
       console.warn('[vishrun:diag] reloadRunner early-exit: no enabled scripts');
       return;
     }
-    await runner.run(enabledScripts, active.chatId ?? null);
+    await runner.reloadAll(enabledScripts, active.chatId ?? null);
   }
 
   // ── Script settings panel (Settings → Extensions) ──────────────────
