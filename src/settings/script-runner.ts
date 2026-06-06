@@ -51,6 +51,8 @@ window.alert=function(msg){
 try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}
 };
 })()</script>`;
+
+const BRIDGED_EVENTS = [
   'CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT',
   'GENERATION_STARTED','GENERATION_ENDED','GENERATION_STOPPED',
   'CHARACTER_MESSAGE_RENDERED','USER_MESSAGE_RENDERED',
