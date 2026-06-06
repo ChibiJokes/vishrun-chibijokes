@@ -64,9 +64,6 @@ export function setup(ctx: SpindleFrontendContext) {
       clearActiveCard();
       lastLoadedCharacterId = null;
       scriptsPanel?.onCharacterChanged(null);
-      // Pass an empty list — runner.run() will tear down character frames
-      // (no longer in the incoming list) while leaving globals/presets untouched
-      // since they aren't in the frame map under any characterId key.
       const enabledScripts = await loadEnabledScripts(null);
       await runner.run(enabledScripts, null);
       hooks.rescanAll();
@@ -77,15 +74,15 @@ export function setup(ctx: SpindleFrontendContext) {
       return;
     }
     if (lastLoadedCharacterId === characterId && getActiveCard()?.characterId === characterId) {
-      // Same character, card already cached — skip the REST fetch.
-      // runner.run() will reconcile by content hash; if nothing changed,
-      // no frames are touched at all (same as JSLR on a chat switch).
-      console.warn('[vishrun:diag] loadFor: same character, re-using cached card');
+      // Same character, different chat — skip the REST fetch but force-relaunch
+      // character frames so scripts reinitialise with the new chatId.
+      // Global/preset frames survive untouched via hash reconciliation.
+      console.warn('[vishrun:diag] loadFor: same character, force-relaunching character frames for new chat');
       hooks.rescanAll();
       const chatId = ctx.getActiveChat().chatId ?? null;
       const enabledScripts = await loadEnabledScripts(characterId);
-      console.log('[vishrun:diag] loadFor(cache-hit) reconciling', enabledScripts.length, 'scripts, chatId:', chatId);
-      await runner.run(enabledScripts, chatId);
+      console.log('[vishrun:diag] loadFor(cache-hit) relaunching', enabledScripts.length, 'scripts, chatId:', chatId);
+      await runner.runCharacterOnly(enabledScripts, chatId);
       return;
     }
     inflightCharacterId = characterId;
