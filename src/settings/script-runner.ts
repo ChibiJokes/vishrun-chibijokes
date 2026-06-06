@@ -33,7 +33,16 @@ window.eventSource={
 };
 if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
   window.spindleSandbox.onMessage(function(msg){
-    if(!msg||msg.type!=='vsh_event')return;
+    if(!msg)return;
+    if(msg.type==='vsh_teardown'){
+      // Dispatch synthetic pagehide so scripts that listen on pagehide
+      // (e.g. quill.js triggerNuke) clean up their DOM artifacts before
+      // we actually remove the iframe. Without this, the nuke never fires
+      // reliably on programmatic iframe removal across browsers.
+      try{window.dispatchEvent(new Event('pagehide'));}catch(e){}
+      return;
+    }
+    if(msg.type!=='vsh_event')return;
     window.eventSource.emit(msg.event,msg.data);
   });
 }
@@ -82,12 +91,8 @@ export class ScriptRunner {
     this.teardownAll();
     if (scripts.length === 0) return;
 
-    // Brief delay so old iframes can receive pagehide and run their DOM
-    // cleanup (e.g. removing #qm-persistent-btn) before the new frame's
-    // script increments the generation counter and finds the button gone.
-    await new Promise<void>(r => setTimeout(r, 80));
-
-    // chatId used for getChatMessages snapshot. Use '' when no chat is open —
+    // chatId used for getChatMessages snapshot.
+    // (teardownAll already waited for frames to self-clean via vsh_teardown) Use '' when no chat is open —
     // scripts that don't call getChatMessages still run fine.
     const effectiveChatId = chatId ?? '';
 
@@ -109,7 +114,7 @@ export class ScriptRunner {
   }
 
   destroy(): void {
-    this.teardownAll();
+    void this.teardownAll();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }
@@ -187,13 +192,25 @@ export class ScriptRunner {
     }
   }
 
-  private teardownAll(): void {
+  private async teardownAll(): Promise<void> {
+    if (this.frames.size === 0) return;
+    console.log(`[vishrun:script-runner] tearing down ${this.frames.size} script frame(s)`);
+
+    // Step 1: signal each frame to clean up its own DOM artifacts.
+    // The vsh_teardown handler in EVENT_BRIDGE_SHIM dispatches a synthetic
+    // pagehide so scripts like quill.js run triggerNuke() and remove buttons
+    // they added to the parent document — before we destroy the frames.
+    for (const frame of this.frames.values()) {
+      try { frame.handle.postMessage({ type: 'vsh_teardown' }); } catch { /* no-op */ }
+    }
+
+    // Step 2: give frames ~60ms to process the message and run their cleanup.
+    await new Promise<void>(r => setTimeout(r, 60));
+
+    // Step 3: now actually remove the frames.
     for (const frame of this.frames.values()) {
       try { frame.handle.destroy?.(); } catch { /* no-op */ }
       try { frame.container.remove(); } catch { /* no-op */ }
-    }
-    if (this.frames.size > 0) {
-      console.log(`[vishrun:script-runner] tore down ${this.frames.size} script frame(s)`);
     }
     this.frames.clear();
   }
