@@ -16,7 +16,7 @@
  */
 
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
-import { ScriptStorageClient } from './script-storage';
+import { ScriptStorageClient, getPresetName } from './script-storage';
 import {
   type Script,
   type ScriptFolder,
@@ -187,39 +187,6 @@ const CSS = `
   flex-direction: column;
   gap: 8px;
 }
-.vsh-editor[hidden] { display: none !important; }
-.vsh-code-toggle {
-  flex-shrink: 0;
-  padding: 2px 6px;
-  background: transparent;
-  border: 1px solid var(--lumiverse-border);
-  border-radius: var(--lumiverse-radius);
-  color: var(--lumiverse-text-muted);
-  font-size: 11px;
-  cursor: pointer;
-  font-family: monospace;
-  line-height: 1.4;
-  transition: var(--lumiverse-transition-fast);
-}
-.vsh-code-toggle:hover {
-  border-color: var(--lumiverse-accent);
-  color: var(--lumiverse-accent);
-}
-.vsh-name-input {
-  flex: 1;
-  min-width: 0;
-  padding: 2px 5px;
-  background: transparent;
-  border: 1px solid transparent;
-  border-radius: var(--lumiverse-radius);
-  color: var(--lumiverse-text);
-  font-size: 12px;
-  font-family: inherit;
-  transition: border-color var(--lumiverse-transition-fast);
-}
-.vsh-name-input:hover { border-color: var(--lumiverse-border); }
-.vsh-name-input:focus { outline: none; border-color: var(--lumiverse-accent); background: var(--lumiverse-fill-subtle); }
-.vsh-name-input.vsh-disabled { color: var(--lumiverse-text-dim); text-decoration: line-through; }
 .vsh-field {
   display: flex;
   flex-direction: column;
@@ -288,6 +255,7 @@ type Target = 'global' | 'character' | 'preset';
 
 export interface ScriptsPanel {
   onCharacterChanged(characterId: string | null): void;
+  onPresetChanged(presetId: string | null): void;
   /** Called after fetchCharacter to show a badge when the card has JSLR scripts. */
   setHasTavernHelperScripts(has: boolean): void;
   destroy(): void;
@@ -308,6 +276,8 @@ export function createScriptsPanel(
   let charScripts: ScriptTree[] = [];
   let presetScripts: ScriptTree[] = [];
   let currentCharId: string | null = null;
+  let currentPresetId: string | null = null;
+  let currentPresetName: string | null = null;
   const saveTimers = new Map<Target, ReturnType<typeof setTimeout>>();
 
   // ── Root container (direct child of the host card) ─────────────────
@@ -336,7 +306,7 @@ export function createScriptsPanel(
 
   const globalSec = makeSection('Global Scripts', '🌐 Available in every chat');
   const charSec = makeSection('Character Scripts', getCharSubtitle());
-  const presetSec = makeSection('Preset Scripts', '⚙️ Bound to the current preset');
+  const presetSec = makeSection('Preset Scripts', getPresetSubtitle());
 
   globalSec.addBtn.addEventListener('click', () => addScript('global'));
   charSec.addBtn.addEventListener('click', () => addScript('character'));
@@ -382,6 +352,12 @@ export function createScriptsPanel(
     return '🎭 Load a character to view character scripts';
   }
 
+  function getPresetSubtitle(): string {
+    if (currentPresetName) return `⚙️ Bound to: ${currentPresetName}`;
+    if (currentPresetId) return `⚙️ Bound to current loom`;
+    return '⚙️ Load a loom to view preset scripts';
+  }
+
   // ── Render ─────────────────────────────────────────────────────────
   function renderList(listEl: HTMLElement, scripts: ScriptTree[], target: Target) {
     listEl.innerHTML = '';
@@ -407,7 +383,11 @@ export function createScriptsPanel(
     charSec.addBtn.disabled = !currentCharId;
     renderList(charSec.list, charScripts, 'character');
   }
-  function renderPreset() { renderList(presetSec.list, presetScripts, 'preset'); }
+  function renderPreset() {
+    presetSec.subEl.textContent = getPresetSubtitle();
+    presetSec.addBtn.disabled = !currentPresetId;
+    renderList(presetSec.list, presetScripts, 'preset');
+  }
 
   // ── Script item ────────────────────────────────────────────────────
   function buildScriptItem(
@@ -421,7 +401,6 @@ export function createScriptsPanel(
     const row = document.createElement('div');
     row.className = 'vsh-script-row';
 
-    // Enable toggle
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
     toggle.className = 'vsh-enable-toggle';
@@ -429,64 +408,65 @@ export function createScriptsPanel(
     toggle.title = 'Enable / disable';
     toggle.addEventListener('change', () => {
       script.enabled = toggle.checked;
-      nameInput.classList.toggle('vsh-disabled', !script.enabled);
+      nameEl.classList.toggle('vsh-disabled', !script.enabled);
       saveTarget(target);
     });
 
-    // Name — always visible and editable inline, like JSLR
-    const nameInput = document.createElement('input');
-    nameInput.type = 'text';
-    nameInput.className = 'vsh-name-input' + (script.enabled ? '' : ' vsh-disabled');
-    nameInput.value = script.name;
-    nameInput.placeholder = '(unnamed)';
-    nameInput.addEventListener('input', () => {
-      script.name = nameInput.value;
-      debouncedSave(target);
-    });
-    // Prevent row click from toggling editor when typing in name
-    nameInput.addEventListener('click', (e) => e.stopPropagation());
+    const nameEl = document.createElement('span');
+    nameEl.className = 'vsh-script-name' + (script.enabled ? '' : ' vsh-disabled');
+    nameEl.textContent = script.name || '(unnamed)';
 
-    // Code toggle — ▸ collapsed, ▾ expanded
-    const codeBtn = document.createElement('button');
-    codeBtn.className = 'vsh-code-toggle';
-    codeBtn.textContent = '▸';
-    codeBtn.title = 'Show / hide script code';
+    const editBtn = document.createElement('button');
+    editBtn.className = 'vsh-btn';
+    editBtn.textContent = 'Edit';
 
     const delBtn = document.createElement('button');
     delBtn.className = 'vsh-btn vsh-btn-delete';
     delBtn.textContent = '✕';
     delBtn.title = 'Delete script';
-    delBtn.addEventListener('click', (e) => {
-      e.stopPropagation();
+    delBtn.addEventListener('click', () => {
       const idx = parentList.indexOf(script);
       if (idx !== -1) parentList.splice(idx, 1);
       saveTarget(target);
       refreshTarget(target);
     });
 
-    row.append(toggle, nameInput, codeBtn, delBtn);
+    row.append(toggle, nameEl, editBtn, delBtn);
 
-    // Code editor — hidden by default (JSLR behaviour)
-    const editor = buildEditor(script, target);
+    const editor = buildEditor(script, target, (newName) => {
+      nameEl.textContent = newName || '(unnamed)';
+    });
     editor.hidden = true;
 
-    const toggleEditor = () => {
+    editBtn.addEventListener('click', () => {
       editor.hidden = !editor.hidden;
-      codeBtn.textContent = editor.hidden ? '▸' : '▾';
-    };
-    codeBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleEditor(); });
+      editBtn.textContent = editor.hidden ? 'Edit' : 'Done';
+    });
 
     item.append(row, editor);
     return item;
   }
 
-  // buildEditor: name is now in the row — only code and description live here.
   function buildEditor(
     script: Script,
     target: Target,
+    onNameChange: (name: string) => void,
   ): HTMLElement {
     const el = document.createElement('div');
     el.className = 'vsh-editor';
+
+    const nameField = makeField('Name');
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'vsh-input';
+    nameInput.value = script.name;
+    nameInput.placeholder = 'Script name...';
+    nameInput.addEventListener('input', () => {
+      script.name = nameInput.value;
+      onNameChange(nameInput.value);
+      debouncedSave(target);
+    });
+    nameField.appendChild(nameInput);
 
     const contentField = makeField('Script (JavaScript)');
     const contentArea = document.createElement('textarea');
@@ -512,7 +492,7 @@ export function createScriptsPanel(
     });
     infoField.appendChild(infoInput);
 
-    el.append(contentField, infoField);
+    el.append(nameField, contentField, infoField);
     return el;
   }
 
@@ -593,7 +573,7 @@ export function createScriptsPanel(
     } else if (target === 'character' && currentCharId) {
       storage.saveCharacter(currentCharId, charScripts).then(() => onScriptsSaved?.()).catch(console.error);
     } else if (target === 'preset') {
-      storage.savePreset(presetScripts).then(() => onScriptsSaved?.()).catch(console.error);
+      storage.savePreset(currentPresetId, presetScripts).then(() => onScriptsSaved?.()).catch(console.error);
     }
   }
 
@@ -610,7 +590,7 @@ export function createScriptsPanel(
 
     const [global, preset] = await Promise.all([
       storage.loadGlobal(),
-      storage.loadPreset(),
+      storage.loadPreset(currentPresetId),
     ]);
     globalScripts = global;
     presetScripts = preset;
@@ -649,6 +629,29 @@ export function createScriptsPanel(
           }
         })
         .catch(console.error);
+    },
+
+    onPresetChanged(presetId: string | null) {
+      currentPresetId = presetId;
+      clearTimeout(saveTimers.get('preset'));
+      if (!presetId) {
+        currentPresetName = null;
+        presetScripts = [];
+        renderPreset();
+        return;
+      }
+      presetScripts = [];
+      renderPreset();
+      Promise.all([
+        storage.loadPreset(presetId),
+        getPresetName(presetId),
+      ]).then(([scripts, name]) => {
+        if (currentPresetId === presetId) {
+          presetScripts = scripts;
+          currentPresetName = name;
+          renderPreset();
+        }
+      }).catch(console.error);
     },
 
     setHasTavernHelperScripts(has: boolean) {
