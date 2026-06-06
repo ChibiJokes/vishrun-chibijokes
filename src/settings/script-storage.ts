@@ -124,3 +124,22 @@ export async function loadEnabledScripts(characterId: string | null): Promise<Sc
     ...flattenEnabled(preset),
   ];
 }
+
+// ── First-run initialisation ─────────────────────────────────────────────────
+// Pre-creates the global and preset settings keys so subsequent GETs return
+// 200 + empty arrays instead of 404. Call once during extension setup.
+// Uses PUT-if-missing: fetches first; only writes if the key isn't there yet.
+
+export async function initScriptStorage(): Promise<void> {
+  const storage = new ScriptStorageClient();
+
+  const [global, preset] = await Promise.all([
+    fetch(`${BASE}/settings/${GLOBAL_KEY}`, { credentials: 'same-origin' }),
+    fetch(`${BASE}/settings/${PRESET_KEY}`, { credentials: 'same-origin' }),
+  ]);
+
+  await Promise.all([
+    global.ok ? Promise.resolve() : storage.saveGlobal([]),
+    preset.ok ? Promise.resolve() : storage.savePreset([]),
+  ]);
+}
