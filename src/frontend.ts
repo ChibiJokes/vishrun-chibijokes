@@ -165,7 +165,9 @@ export function setup(ctx: SpindleFrontendContext) {
   if (active.characterId) {
     void loadFor(active.characterId);
   } else {
-    console.warn('[vishrun:diag] setup(): no active characterId at startup, waiting for events');
+    // No active character yet, but global/preset scripts should still run at startup.
+    console.warn('[vishrun:diag] setup(): no active characterId at startup, running global scripts');
+    void reloadRunner();
   }
 
   return () => {
