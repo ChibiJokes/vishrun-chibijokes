@@ -78,6 +78,7 @@ const BRIDGED_EVENTS = [
 interface LiveFrame {
   scriptId: string;
   scriptName: string;
+  contentHash: number;
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
 }
@@ -85,28 +86,43 @@ interface LiveFrame {
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
   private eventUnsubs: Array<() => void> = [];
-  private runGeneration = 0;
-  private runGeneration = 0;
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     this.installEventBridge();
   }
 
+  /**
+   * Diff the new script set against currently running frames — JSLR style.
+   * Frames whose script id + content hash hasn't changed are kept alive.
+   * Only added/changed scripts get new frames; only removed scripts get torn down.
+   *
+   * This means switching to the same character in a different chat never
+   * touches the frames at all — no pagehide, button stays, exactly like JSLR's
+   * keyed v-for where the key = script.source + script.id + script.reload_memo.
+   */
   async run(scripts: Script[], chatId: string | null): Promise<void> {
-    // Bump the generation counter. If a newer run() call arrives before this
-    // one finishes teardown, the guard below will bail out and let the newer
-    // call create the frames instead.
-    const myGen = ++this.runGeneration;
-
-    await this.teardownAll();
-
-    if (myGen !== this.runGeneration) return; // superseded — newer run() already tearing down
-
-    if (scripts.length === 0) return;
-
-    // chatId used for getChatMessages snapshot. Use '' when no chat is open —
-    // scripts that don't call getChatMessages still run fine.
     const effectiveChatId = chatId ?? '';
+
+    // Build a key for each incoming script (id + content hash).
+    // If the key matches a running frame, keep it. Otherwise rebuild.
+    const incoming = new Map<string, Script>();
+    for (const s of scripts) {
+      incoming.set(s.id + '::' + this.hashContent(s.content), s);
+    }
+
+    // Tear down frames that are no longer in the incoming set.
+    const toRemove: LiveFrame[] = [];
+    for (const [key, frame] of this.frames) {
+      if (!incoming.has(key)) toRemove.push(frame);
+    }
+    for (const frame of toRemove) {
+      this.frames.delete(this.frameKey(frame));
+      await this.destroyFrame(frame);
+    }
+
+    // Fetch snapshot once for any new frames that need launching.
+    const needsLaunch = [...incoming.entries()].filter(([key]) => !this.frames.has(key));
+    if (needsLaunch.length === 0) return;
 
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
     if (effectiveChatId) {
@@ -118,10 +134,8 @@ export class ScriptRunner {
       } catch { /* non-fatal */ }
     }
 
-    console.log(`[vishrun:script-runner] launching ${scripts.length} script(s)`, scripts.map(s => s.name));
-
-    for (const script of scripts) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot);
+    for (const [key, script] of needsLaunch) {
+      this.launchFrame(script, effectiveChatId, messagesSnapshot, key);
     }
   }
 
@@ -131,10 +145,38 @@ export class ScriptRunner {
     this.eventUnsubs = [];
   }
 
+  private frameKey(frame: LiveFrame): string {
+    return frame.scriptId + '::' + frame.contentHash;
+  }
+
+  private hashContent(content: string): number {
+    // Simple but fast djb2-style hash — good enough for change detection.
+    let h = 5381;
+    for (let i = 0; i < content.length; i++) {
+      h = ((h << 5) + h) ^ content.charCodeAt(i);
+      h = h >>> 0; // keep uint32
+    }
+    return h;
+  }
+
+  private async destroyFrame(frame: LiveFrame): Promise<void> {
+    try { frame.handle.postMessage({ type: 'vsh_teardown' }); } catch { /* no-op */ }
+    await new Promise<void>(r => setTimeout(r, 60));
+    try { frame.handle.destroy?.(); } catch { /* no-op */ }
+    try { frame.container.remove(); } catch { /* no-op */ }
+  }
+
+  private async teardownAll(): Promise<void> {
+    const all = [...this.frames.values()];
+    this.frames.clear();
+    for (const frame of all) await this.destroyFrame(frame);
+  }
+
   private launchFrame(
     script: Script,
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
+    frameKey: string,
   ): void {
     try {
       const shim = thHelpersShim({
@@ -197,7 +239,8 @@ export class ScriptRunner {
         }
       });
 
-      this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, handle, container });
+      const contentHash = this.hashContent(script.content);
+      this.frames.set(frameKey, { scriptId: script.id, scriptName: script.name, contentHash, handle, container });
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error('[vishrun:script-runner] failed to launch:', script.name, err);
