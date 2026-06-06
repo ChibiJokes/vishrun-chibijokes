@@ -108,6 +108,12 @@ export class ScriptRunner {
     }
   }
 
+  /** Tear down all frames and relaunch — used when script content has changed. */
+  async reloadAll(scripts: Script[], chatId: string | null): Promise<void> {
+    this.teardownAll();
+    await this.run(scripts, chatId);
+  }
+
   /** Like run() but only tears down character-scoped frames, leaving global/preset alive. */
   async runCharacterOnly(scripts: Script[], chatId: string | null): Promise<void> {
     for (const [id, frame] of this.frames) {
