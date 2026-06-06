@@ -34,16 +34,11 @@ export function setup(ctx: SpindleFrontendContext) {
   const runner = new ScriptRunner(ctx);
 
   // Called by the panel after any save — reloads runner with updated script list.
+  // Runs global scripts even without a character loaded.
   async function reloadRunner(): Promise<void> {
     const active = ctx.getActiveChat();
-    console.log('[vishrun:diag] reloadRunner called, characterId:', active.characterId, 'chatId:', active.chatId);
-    if (!active.characterId || !active.chatId) {
-      console.warn('[vishrun:diag] reloadRunner early-exit: missing characterId or chatId');
-      return;
-    }
-    const enabledScripts = await loadEnabledScripts(active.characterId);
-    console.log('[vishrun:diag] reloadRunner enabledScripts count:', enabledScripts.length);
-    await runner.run(enabledScripts, active.chatId);
+    const enabledScripts = await loadEnabledScripts(active.characterId ?? null);
+    await runner.run(enabledScripts, active.chatId ?? null);
   }
 
   // ── Script settings panel (Settings → Extensions) ──────────────────
@@ -150,11 +145,11 @@ export function setup(ctx: SpindleFrontendContext) {
   });
 
   const active = ctx.getActiveChat();
-  console.log('[vishrun:diag] setup() initial state — characterId:', active.characterId, 'chatId:', active.chatId);
   if (active.characterId) {
     void loadFor(active.characterId);
   } else {
-    console.warn('[vishrun:diag] setup(): no active characterId at startup, waiting for events');
+    // No character yet — still run global scripts so they're live immediately.
+    void reloadRunner();
   }
 
   return () => {
