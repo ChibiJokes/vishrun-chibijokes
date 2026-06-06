@@ -333,6 +333,27 @@ const CSS = `
   cursor: pointer;
   user-select: none;
 }
+/* Drag handle */
+.vsh-drag-handle {
+  flex-shrink: 0;
+  cursor: grab;
+  color: var(--lumiverse-text-dim);
+  font-size: 11px;
+  padding: 0 3px;
+  user-select: none;
+  line-height: 1;
+}
+.vsh-drag-handle:active { cursor: grabbing; }
+/* Drag-over indicator */
+.vsh-drag-over {
+  outline: 2px dashed var(--lumiverse-accent);
+  outline-offset: -2px;
+}
+.vsh-drag-over-folder {
+  background: color-mix(in srgb, var(--lumiverse-accent) 8%, transparent);
+}
+/* Dragging opacity */
+[draggable=true].vsh-dragging { opacity: 0.4; }
 `;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -375,6 +396,9 @@ export function createScriptsPanel(
     preset:    localStorage.getItem(LS_KEY('preset'))    !== 'false',
   };
   let searchFilter = '';
+
+  // Drag state — shared across all lists
+  let dragSrc: { list: ScriptTree[]; idx: number } | null = null;
 
   // ── Root container (direct child of the host card) ─────────────────
   const container = document.createElement('div');
@@ -626,7 +650,64 @@ export function createScriptsPanel(
       refreshTarget(target);
     });
 
-    row.append(toggle, nameEl, editBtn, reloadBtn, delBtn);
+    // Drag handle
+    const dragHandle = document.createElement('span');
+    dragHandle.className = 'vsh-drag-handle';
+    dragHandle.textContent = '⠿';
+    dragHandle.title = 'Drag to reorder or move into a folder';
+
+    // Export button
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'vsh-btn';
+    exportBtn.textContent = '⬇';
+    exportBtn.title = 'Export this script as JSON';
+    exportBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const json = JSON.stringify([script], null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${script.name || 'script'}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    row.append(dragHandle, toggle, nameEl, editBtn, reloadBtn, exportBtn, delBtn);
+
+    // Native drag-and-drop for reorder / move-to-folder
+    item.draggable = true;
+    item.addEventListener('dragstart', (e) => {
+      const idx = parentList.indexOf(script);
+      if (idx === -1) return;
+      dragSrc = { list: parentList, idx };
+      item.classList.add('vsh-dragging');
+      e.dataTransfer!.effectAllowed = 'move';
+    });
+    item.addEventListener('dragend', () => {
+      item.classList.remove('vsh-dragging');
+      dragSrc = null;
+    });
+    item.addEventListener('dragover', (e) => {
+      if (!dragSrc) return;
+      e.preventDefault();
+      e.dataTransfer!.dropEffect = 'move';
+      item.classList.add('vsh-drag-over');
+    });
+    item.addEventListener('dragleave', () => item.classList.remove('vsh-drag-over'));
+    item.addEventListener('drop', (e) => {
+      e.preventDefault();
+      item.classList.remove('vsh-drag-over');
+      if (!dragSrc) return;
+      const destIdx = parentList.indexOf(script);
+      if (destIdx === -1) return;
+      if (dragSrc.list === parentList && dragSrc.idx === destIdx) return;
+      const [moved] = dragSrc.list.splice(dragSrc.idx, 1);
+      parentList.splice(destIdx, 0, moved);
+      dragSrc = null;
+      saveTarget(target);
+      refreshTarget(target);
+    });
 
     const editor = buildEditor(script, target, (newName) => {
       nameEl.textContent = newName || '(unnamed)';
@@ -796,11 +877,44 @@ export function createScriptsPanel(
       saveTarget(target);
     });
 
+    const dragHandle = document.createElement('span');
+    dragHandle.className = 'vsh-drag-handle';
+    dragHandle.textContent = '⠿';
+
     const nameEl = document.createElement('span');
     nameEl.className = 'vsh-script-name';
     nameEl.textContent = `📁 ${folder.name || '(unnamed folder)'}`;
 
-    header.append(toggle, nameEl);
+    // Export folder
+    const exportBtn = document.createElement('button');
+    exportBtn.className = 'vsh-btn';
+    exportBtn.textContent = '⬇';
+    exportBtn.title = 'Export folder as JSON';
+    exportBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const json = JSON.stringify([folder], null, 2);
+      const blob = new Blob([json], { type: 'application/json' });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `${folder.name || 'folder'}.json`;
+      a.click();
+      URL.revokeObjectURL(url);
+    });
+
+    const delFolderBtn = document.createElement('button');
+    delFolderBtn.className = 'vsh-btn vsh-btn-delete';
+    delFolderBtn.textContent = '✕';
+    delFolderBtn.title = 'Delete folder';
+    delFolderBtn.addEventListener('click', () => {
+      const list = getList(target);
+      const idx = list.indexOf(folder);
+      if (idx !== -1) list.splice(idx, 1);
+      saveTarget(target);
+      refreshTarget(target);
+    });
+
+    header.append(dragHandle, toggle, nameEl, exportBtn, delFolderBtn);
 
     const inner = document.createElement('div');
     inner.className = 'vsh-folder-scripts';
@@ -808,13 +922,51 @@ export function createScriptsPanel(
     if (folder.scripts.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'vsh-empty';
-      empty.textContent = 'Empty folder';
+      empty.textContent = 'Drag scripts here or click + Script';
       inner.appendChild(empty);
     } else {
       for (const script of folder.scripts) {
         inner.appendChild(buildScriptItem(script, folder.scripts, target));
       }
     }
+
+    // Folder is a drop target — scripts dragged onto it are moved inside
+    inner.addEventListener('dragover', (e) => {
+      if (!dragSrc) return;
+      e.preventDefault();
+      e.stopPropagation();
+      e.dataTransfer!.dropEffect = 'move';
+      inner.classList.add('vsh-drag-over-folder');
+    });
+    inner.addEventListener('dragleave', () => inner.classList.remove('vsh-drag-over-folder'));
+    inner.addEventListener('drop', (e) => {
+      e.preventDefault();
+      e.stopPropagation();
+      inner.classList.remove('vsh-drag-over-folder');
+      if (!dragSrc) return;
+      const [moved] = dragSrc.list.splice(dragSrc.idx, 1);
+      if (moved.type === 'folder') return; // can't nest folders
+      folder.scripts.push(moved as Script);
+      dragSrc = null;
+      saveTarget(target);
+      refreshTarget(target);
+    });
+
+    // Folder item itself is draggable for reordering
+    item.draggable = true;
+    item.addEventListener('dragstart', (e) => {
+      const list = getList(target);
+      const idx = list.indexOf(folder);
+      if (idx === -1) return;
+      dragSrc = { list, idx };
+      item.classList.add('vsh-dragging');
+      e.dataTransfer!.effectAllowed = 'move';
+      e.stopPropagation();
+    });
+    item.addEventListener('dragend', () => {
+      item.classList.remove('vsh-dragging');
+      dragSrc = null;
+    });
 
     item.append(header, inner);
     return item;
