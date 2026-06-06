@@ -61,21 +61,23 @@ export class ScriptRunner {
   }
 
   async run(scripts: Script[], chatId: string | null): Promise<void> {
-    // Diff incoming scripts against currently running frames.
-    // Scripts already running with the same ID are kept alive (e.g. global
-    // scripts shouldn't restart just because you opened a character).
-    // Only frames whose script is no longer in the incoming list get torn down.
+    // Tear down selectively:
+    // - Global/preset scripts are persistent — skip them if already running.
+    // - Character scripts always relaunch (new chat = new context/variables).
+    // - Any frame no longer in the incoming list always gets torn down.
     const incomingIds = new Set(scripts.map(s => s.id));
+    const persistentIds = new Set(scripts.filter(s => s.scope === 'global' || s.scope === 'preset').map(s => s.id));
+
     for (const [id, frame] of this.frames) {
-      if (!incomingIds.has(id)) {
+      if (!incomingIds.has(id) || !persistentIds.has(id)) {
         try { frame.handle.destroy?.(); } catch { /* no-op */ }
         try { frame.container.remove(); } catch { /* no-op */ }
         this.frames.delete(id);
-        console.log(`[vishrun:script-runner] tearing down removed script: ${id}`);
       }
     }
 
-    const scriptsToLaunch = scripts.filter(s => !this.frames.has(s.id));
+    // Only skip launching scripts that are persistent AND already running.
+    const scriptsToLaunch = scripts.filter(s => !(persistentIds.has(s.id) && this.frames.has(s.id)));
     if (scriptsToLaunch.length === 0) return;
 
     // Give Lumiverse one tick to finish updating its active-chat state before
