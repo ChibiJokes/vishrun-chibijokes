@@ -11,7 +11,7 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot';
+  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot' | 'th-set-variable';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -249,6 +249,33 @@ export async function handleSetChatMessage(
   await chat.updateMessage(chatId, target.id, { content });
 }
 
+export async function handleSetVariable(
+  body: Record<string, unknown>,
+  chatId: string,
+  chat: ChatApi = api.chat,
+): Promise<void> {
+  const key = body.key as string | undefined;
+  const value = body.value;
+  if (!key) {
+    log.warn('setVariable: no key provided, ignoring');
+    return;
+  }
+
+  const messages = await chat.getMessages(chatId);
+  if (messages.length === 0) {
+    log.warn('setVariable: empty chat, ignoring');
+    return;
+  }
+
+  // Write the variable into the latest non-system message's content
+  // by appending an UpdateVariable block, following MVU convention.
+  const latest = messages[messages.length - 1] as ChatMessageDTO;
+  const existing = (latest as Record<string, unknown>).content as string ?? '';
+  const varBlock = `\n<UpdateVariable>\n${key}: ${JSON.stringify(value)}\n</UpdateVariable>`;
+  await chat.updateMessage(chatId, latest.id, { content: existing + varBlock });
+  log.debug('setVariable: set', key, '=', value);
+}
+
 export function installThHelpersHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (!isThHelpersRequest(payload)) return;
@@ -264,6 +291,9 @@ export function installThHelpersHandler(): void {
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
+          response = { type: 'th_helpers_response', requestId, ok: true, result: undefined };
+        } else if (op === 'th-set-variable') {
+          await handleSetVariable(body, chatId);
           response = { type: 'th_helpers_response', requestId, ok: true, result: undefined };
         } else {
           response = {
