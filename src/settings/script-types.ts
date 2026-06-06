@@ -95,7 +95,7 @@ export function normalizeScriptTree(raw: unknown): ScriptTree | null {
 
   // Handles both type:'script' and legacy bare objects from older JSLR exports.
   return makeScript({
-    enabled: typeof r.enabled === 'boolean' ? r.enabled : false,
+    enabled: typeof r.enabled === 'boolean' ? r.enabled : true,
     name:
       typeof r.name === 'string'
         ? r.name
