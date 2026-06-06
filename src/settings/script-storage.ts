@@ -147,9 +147,13 @@ export async function initScriptStorage(): Promise<void> {
 
 // ── Loom helpers ──────────────────────────────────────────────────────────────
 
-/** Returns the currently active Loom preset ID, or null if none is set. */
+/**
+ * Returns the active style-loom ID, used as the preset-script key.
+ * Lumiverse's loom system stores the user's active loom in selectedLoomStyles
+ * (not activeLoomPresetId, which is always null for most users).
+ */
 export async function getActiveLoomPresetId(): Promise<string | null> {
-  const row = await getJson(`${BASE}/settings/activeLoomPresetId`) as { value?: unknown } | null;
+  const row = await getJson(`${BASE}/settings/selectedLoomStyles`) as { value?: unknown } | null;
   const id = row?.value;
   return typeof id === 'string' && id.length > 0 ? id : null;
 }
