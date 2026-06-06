@@ -85,17 +85,26 @@ interface LiveFrame {
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
   private eventUnsubs: Array<() => void> = [];
+  private runGeneration = 0;
+  private runGeneration = 0;
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     this.installEventBridge();
   }
 
   async run(scripts: Script[], chatId: string | null): Promise<void> {
-    this.teardownAll();
+    // Bump the generation counter. If a newer run() call arrives before this
+    // one finishes teardown, the guard below will bail out and let the newer
+    // call create the frames instead.
+    const myGen = ++this.runGeneration;
+
+    await this.teardownAll();
+
+    if (myGen !== this.runGeneration) return; // superseded — newer run() already tearing down
+
     if (scripts.length === 0) return;
 
-    // chatId used for getChatMessages snapshot.
-    // (teardownAll already waited for frames to self-clean via vsh_teardown) Use '' when no chat is open —
+    // chatId used for getChatMessages snapshot. Use '' when no chat is open —
     // scripts that don't call getChatMessages still run fine.
     const effectiveChatId = chatId ?? '';
 
