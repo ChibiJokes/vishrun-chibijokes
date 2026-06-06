@@ -156,15 +156,8 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
     console.log('[vishrun:diag] SETTINGS_UPDATED key:', p.key);
-    const isNavEvent = p.key === 'activeChatId' || p.key === 'activeCharacterId';
-    const isGlobalScriptSave = typeof p.key === 'string' && p.key.includes('scripts.global');
-    const isPresetScriptSave = typeof p.key === 'string' && p.key.includes('scripts.preset');
-    if (isNavEvent) {
-      void loadFor(ctx.getActiveChat().characterId ?? null);
-    } else if (isGlobalScriptSave || isPresetScriptSave) {
-      // Global/preset scripts changed — reload runner even without an active character
-      void reloadRunner();
-    }
+    if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
+    void loadFor(ctx.getActiveChat().characterId ?? null);
   });
 
   const active = ctx.getActiveChat();
