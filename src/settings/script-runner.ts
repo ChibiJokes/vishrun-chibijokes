@@ -49,8 +49,18 @@ interface LiveFrame {
   scriptId: string;
   scriptName: string;
   scope: Script['scope'];
+  contentHash: string;
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
+}
+
+/** Cheap non-cryptographic hash — same purpose as JSLR's getStringHash on content. */
+function hashContent(s: string): string {
+  let h = 0;
+  for (let i = 0; i < s.length; i++) {
+    h = Math.imul(31, h) + s.charCodeAt(i) | 0;
+  }
+  return h.toString(36);
 }
 
 export class ScriptRunner {
@@ -61,24 +71,35 @@ export class ScriptRunner {
     this.installEventBridge();
   }
 
+  /**
+   * Reconcile running frames against the incoming script list.
+   *
+   * - Scripts no longer in the list are torn down.
+   * - Scripts already running with identical content are left completely alone,
+   *   regardless of scope — same behaviour as JSLR's :key reconciliation.
+   * - Scripts that are new or whose content changed are (re)launched.
+   */
   async run(scripts: Script[], chatId: string | null): Promise<void> {
-    // Tear down selectively:
-    // - Global/preset scripts are persistent — skip them if already running.
-    // - Character scripts always relaunch (new chat = new context/variables).
-    // - Any frame no longer in the incoming list always gets torn down.
     const incomingIds = new Set(scripts.map(s => s.id));
-    const persistentIds = new Set(scripts.filter(s => s.scope === 'global' || s.scope === 'preset').map(s => s.id));
 
+    // Tear down frames that are no longer in the incoming list.
     for (const [id, frame] of this.frames) {
-      if (!incomingIds.has(id) || !persistentIds.has(id)) {
-        try { frame.handle.destroy?.(); } catch { /* no-op */ }
-        try { frame.container.remove(); } catch { /* no-op */ }
+      if (!incomingIds.has(id)) {
+        this.destroyFrame(frame);
         this.frames.delete(id);
       }
     }
 
-    // Only skip launching scripts that are persistent AND already running.
-    const scriptsToLaunch = scripts.filter(s => !(persistentIds.has(s.id) && this.frames.has(s.id)));
+    // Tear down frames whose content changed so they get relaunched below.
+    for (const script of scripts) {
+      const frame = this.frames.get(script.id);
+      if (frame && frame.contentHash !== hashContent(script.content)) {
+        this.destroyFrame(frame);
+        this.frames.delete(script.id);
+      }
+    }
+
+    const scriptsToLaunch = scripts.filter(s => !this.frames.has(s.id));
     if (scriptsToLaunch.length === 0) return;
 
     // Give Lumiverse one tick to finish updating its active-chat state before
@@ -108,30 +129,15 @@ export class ScriptRunner {
     }
   }
 
-  /** Tear down all frames and relaunch — used when script content has changed. */
-  async reloadAll(scripts: Script[], chatId: string | null): Promise<void> {
-    this.teardownAll();
-    await this.run(scripts, chatId);
-  }
-
-  /** Like run() but only tears down character-scoped frames, leaving global/preset alive. */
-  async runCharacterOnly(scripts: Script[], chatId: string | null): Promise<void> {
-    for (const [id, frame] of this.frames) {
-      const scope = frame.scope;
-      if (scope === 'global' || scope === 'preset') continue;
-      try { frame.handle.destroy?.(); } catch { /* no-op */ }
-      try { frame.container.remove(); } catch { /* no-op */ }
-      this.frames.delete(id);
-    }
-    if (scripts.length > 0) {
-      await this.run(scripts, chatId);
-    }
-  }
-
-    destroy(): void {
+  destroy(): void {
     this.teardownAll();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
+  }
+
+  private destroyFrame(frame: LiveFrame): void {
+    try { frame.handle.destroy?.(); } catch { /* no-op */ }
+    try { frame.container.remove(); } catch { /* no-op */ }
   }
 
   private launchFrame(
@@ -186,7 +192,14 @@ export class ScriptRunner {
       container.appendChild(handle.element);
       document.body.appendChild(container);
 
-      this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, scope: script.scope, handle, container });
+      this.frames.set(script.id, {
+        scriptId: script.id,
+        scriptName: script.name,
+        scope: script.scope,
+        contentHash: hashContent(script.content),
+        handle,
+        container,
+      });
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error('[vishrun:script-runner] failed to launch:', script.name, err);
@@ -195,8 +208,7 @@ export class ScriptRunner {
 
   private teardownAll(): void {
     for (const frame of this.frames.values()) {
-      try { frame.handle.destroy?.(); } catch { /* no-op */ }
-      try { frame.container.remove(); } catch { /* no-op */ }
+      this.destroyFrame(frame);
     }
     if (this.frames.size > 0) {
       console.log(`[vishrun:script-runner] tore down ${this.frames.size} script frame(s)`);
