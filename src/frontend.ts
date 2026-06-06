@@ -152,9 +152,25 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
-    console.log('[vishrun:diag] SETTINGS_UPDATED key:', p.key);
-    if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
-    void loadFor(ctx.getActiveChat().characterId ?? null);
+    if (p.key === 'activeChatId' || p.key === 'activeCharacterId') {
+      void loadFor(ctx.getActiveChat().characterId ?? null);
+      return;
+    }
+    // Bare WS SETTINGS_UPDATED (no key) fires when the user switches looms —
+    // selectedLoomStyles is batch-persisted and the server broadcasts the event
+    // without key info. Re-read and notify the panel if the loom changed.
+    if (p.key === undefined) {
+      void (async () => {
+        const newPresetId = await getActiveLoomPresetId();
+        if (newPresetId !== lastPresetId) {
+          lastPresetId = newPresetId;
+          scriptsPanel?.onPresetChanged(newPresetId);
+          const active = ctx.getActiveChat();
+          const enabledScripts = await loadEnabledScripts(active.characterId ?? null, newPresetId);
+          await runner.run(enabledScripts, active.chatId ?? null);
+        }
+      })();
+    }
   });
 
   const active = ctx.getActiveChat();
