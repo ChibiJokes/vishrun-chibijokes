@@ -9,7 +9,7 @@ import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { createScriptsPanel, type ScriptsPanel } from './settings/scripts-panel';
 import { ScriptRunner } from './settings/script-runner';
-import { loadEnabledScripts } from './settings/script-storage';
+import { loadEnabledScripts, initScriptStorage } from './settings/script-storage';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -46,6 +46,9 @@ export function setup(ctx: SpindleFrontendContext) {
   let scriptsPanel: ScriptsPanel | null = createScriptsPanel(settingsMount, ctx, () => {
     void reloadRunner();
   });
+
+  // Pre-create settings keys so subsequent GETs return 200 instead of 404.
+  void initScriptStorage();
 
   let inflightCharacterId: string | null = null;
   let lastLoadedCharacterId: string | null = null;
