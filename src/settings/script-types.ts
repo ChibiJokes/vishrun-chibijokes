@@ -32,6 +32,8 @@ export interface Script {
   };
   data: Record<string, unknown>;
   export_with: ScriptExportWith;
+  /** Set at load time — not persisted to storage. */
+  scope?: 'global' | 'character' | 'preset';
 }
 
 export interface ScriptFolder {
