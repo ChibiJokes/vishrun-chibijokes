@@ -35,12 +35,12 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
 
   // ── Script settings panel ──────────────────────────────────────────
-  // ctx.ui.mount('settings_extensions') injects into the Extensions tab
-  // of the host Settings modal (Settings → Extensions).
-  // The host wraps the returned root in a card with border + padding, so
-  // the panel renders as a named section alongside other extensions.
-  const settingsRoot = ctx.ui.mount('settings_extensions');
-  let scriptsPanel: ScriptsPanel | null = createScriptsPanel(settingsRoot, ctx);
+  const scriptTab = ctx.ui.registerDrawerTab({
+    id: 'scripts',
+    title: 'Scripts',
+    description: 'Global, character, and preset JavaScript scripts',
+  });
+  let scriptsPanel: ScriptsPanel | null = createScriptsPanel(scriptTab.root, ctx);
 
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
@@ -71,10 +71,10 @@ export function setup(ctx: SpindleFrontendContext) {
       if (scripts.length === 0) {
         clearActiveCard();
         lastLoadedCharacterId = characterId;
-        // Character has no regex widgets, but may still have tavern_helper
-        // scripts. Notify the panel so the Character Scripts section is current.
+        // Character has no regex widgets, but may still have tavern_helper scripts.
+        // Notify the panel so the Character Scripts section stays up to date.
         scriptsPanel?.onCharacterChanged(characterId);
-        hooks.rescanAll();
+        hooks.rescanAll(); // detaches the observer for cards without scripts
         return;
       }
 
@@ -85,12 +85,16 @@ export function setup(ctx: SpindleFrontendContext) {
       setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
 
-      // Notify the panel so it reloads character scripts.
-      // hasTavernHelperScripts() is a quick check — ST-exported cards with
-      // JSLR scripts carry them in extensions.tavern_helper.scripts, which
-      // the panel reads directly with no import step.
+      // Notify the scripts panel so it can reload character scripts and update
+      // the tab badge. hasTavernHelperScripts() is a fast check — if the card
+      // carries JSLR scripts, the panel will surface them automatically since
+      // both vishrun and JSLR write to extensions.tavern_helper.scripts.
       scriptsPanel?.onCharacterChanged(characterId);
-      scriptsPanel?.setHasTavernHelperScripts(hasTavernHelperScripts(char));
+      if (hasTavernHelperScripts(char)) {
+        scriptTab.setBadge('ST');
+      } else {
+        scriptTab.setBadge(null);
+      }
 
       hooks.rescanAll();
     } catch (err) {
@@ -113,6 +117,13 @@ export function setup(ctx: SpindleFrontendContext) {
   // seen swipe doesn't re-fire the interceptor, so capturesByMessage
   // holds stale captures and the widget shows content from another swipe
   // (the last unique fullMatch the handler did fire for).
+  //
+  // We compute captures locally from the event payload to bypass the
+  // host pipeline entirely. MESSAGE_SWIPED + MESSAGE_EDITED both ship
+  // the new message body in `message.content` (chats.service.ts:982-989
+  // for swipe, similar for edit), so re-running each paired-tag script's
+  // findRe against that string lets us reconstruct what the captures
+  // *should* be without depending on the interceptor firing.
   function handleMessageMutation(eventName: 'MESSAGE_EDITED' | 'MESSAGE_SWIPED', payload: unknown): void {
     const p = (payload || {}) as MessageEventPayload;
     const msg = p.message;
@@ -120,11 +131,24 @@ export function setup(ctx: SpindleFrontendContext) {
     const active = ctx.getActiveChat();
     if (active.chatId && p.chatId && active.chatId !== p.chatId) return;
 
+    // Force-rebuild every widget iframe in the affected message. The
+    // iframe registry keys on (messageId, scriptId, fullMatchHash); for
+    // static paired tags like <StatusPlaceHolderImpl> the fullMatch is
+    // identical across alternate greetings, so the idempotency check in
+    // renderPairedTagCaptures would reuse the existing iframe with its
+    // STALE baked-in variables snapshot. Wiping the registry here forces
+    // the next processNode pass to rebuild with a fresh snapshot.
     const destroyReason = eventName === 'MESSAGE_EDITED' ? 'message-edited' : 'message-swiped';
     destroyAllRegisteredWidgetsForMessage(msg.id, destroyReason);
 
     const compiled = hooks.compiledForActiveCard();
     if (!compiled) return;
+    // rebuildCapturesFromContent updates capturesByMessage so phase-1
+    // cleanup in renderPairedTagCaptures has a fresh capture list to
+    // compare against. processMessageById then forces processNode to run
+    // even if rebuildCapturesFromContent reported no semantic change
+    // (which happens when the paired-tag content didn't change across
+    // greetings — the case that motivated the destroyAll above).
     rebuildCapturesFromContent(msg.id, msg.content, compiled, eventName);
     hooks.processMessageById(msg.id);
   }
@@ -132,15 +156,24 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubMessageSwiped = ctx.events.on('MESSAGE_SWIPED', (p) => handleMessageMutation('MESSAGE_SWIPED', p));
   const unsubMessageEdited = ctx.events.on('MESSAGE_EDITED', (p) => handleMessageMutation('MESSAGE_EDITED', p));
 
-  // Cold-load on hydration: CHAT_CHANGED only fires on intra-app navigation,
-  // not on the initial SPA hydration. SETTINGS_UPDATED with key
-  // 'activeChatId' or 'activeCharacterId' is the wakeup signal.
+  // Cold-load from /characters: Lumiverse's SPA hydrates activeChatId /
+  // activeCharacterId AFTER spindle setup() runs. CHAT_CHANGED only fires
+  // on subsequent intra-app navigation, not on this initial hydration.
+  // SETTINGS_UPDATED with key 'activeChatId' or 'activeCharacterId' is the
+  // wakeup. Watch-item: depends on those literal key strings; if Lumiverse
+  // renames either, the cold-load path silently breaks until something
+  // else (CHAT_CHANGED) wakes the extension.
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
     if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
     void loadFor(ctx.getActiveChat().characterId ?? null);
   });
 
+  // If Lumiverse already hydrated by the time setup() runs, kick the load
+  // synchronously. Otherwise wait for SETTINGS_UPDATED. We deliberately do
+  // NOT call loadFor(null) here: that would render the "no character"
+  // branch (observer detached) which is correct as a runtime cleanup but
+  // wrong as a setup-time default.
   const active = ctx.getActiveChat();
   if (active.characterId) {
     void loadFor(active.characterId);
@@ -158,5 +191,6 @@ export function setup(ctx: SpindleFrontendContext) {
     clearActiveCard();
     scriptsPanel?.destroy();
     scriptsPanel = null;
+    scriptTab.destroy();
   };
 }
