@@ -69,6 +69,11 @@ interface LiveFrame {
   container: HTMLDivElement;
 }
 
+/** Frame map key = source + id, matching JSLR's :key="script.source + script.id + ...". */
+function frameKey(scope: Script['scope'], id: string): string {
+  return `${scope ?? 'global'}::${id}`;
+}
+
 /** Cheap non-cryptographic hash — same purpose as JSLR's getStringHash on content. */
 function hashContent(s: string): string {
   let h = 0;
@@ -99,26 +104,30 @@ export class ScriptRunner {
     const incomingIds = new Set(scripts.map(s => s.id));
 
     // Tear down frames that are no longer in the incoming list.
-    for (const [id, frame] of this.frames) {
-      if (!incomingIds.has(id)) {
+    for (const [key, frame] of this.frames) {
+      if (!incomingIds.has(frame.scriptId)) {
         this.destroyFrame(frame);
-        this.frames.delete(id);
+        this.frames.delete(key);
       }
     }
 
     // Tear down frames whose content OR reload memo changed.
     for (const script of scripts) {
-      const frame = this.frames.get(script.id);
+      const key = frameKey(script.scope, script.id);
+      const frame = this.frames.get(key);
       if (frame && (
         frame.contentHash !== hashContent(script.content) ||
         frame.reloadMemo !== (this.reloadMemos.get(script.id) ?? '')
       )) {
         this.destroyFrame(frame);
-        this.frames.delete(script.id);
+        this.frames.delete(key);
       }
     }
 
-    const scriptsToLaunch = scripts.filter(s => !this.frames.has(s.id));
+    // Fix 2: sort by id before launching — matches JSLR's sortBy(script => script.id).
+    const scriptsToLaunch = [...scripts]
+      .filter(s => !this.frames.has(frameKey(s.scope, s.id)))
+      .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
     if (scriptsToLaunch.length === 0) return;
 
     // Give Lumiverse one tick to finish updating its active-chat state before
@@ -155,8 +164,8 @@ export class ScriptRunner {
 
   /** Force-restart all running script frames. */
   reloadAll(): void {
-    for (const id of this.frames.keys()) {
-      this.reloadMemos.set(id, crypto.randomUUID());
+    for (const frame of this.frames.values()) {
+      this.reloadMemos.set(frame.scriptId, crypto.randomUUID());
     }
   }
 
@@ -224,7 +233,7 @@ export class ScriptRunner {
       container.appendChild(handle.element);
       document.body.appendChild(container);
 
-      this.frames.set(script.id, {
+      this.frames.set(frameKey(script.scope, script.id), {
         scriptId: script.id,
         scriptName: script.name,
         scope: script.scope,
