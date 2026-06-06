@@ -1,18 +1,18 @@
 /**
  * createScriptsPanel
  *
- * Builds vishrun's Script settings tab inside a Lumiverse drawer tab root.
- * Mirrors JS-Slash-Runner's three-tier structure: Global / Character / Preset.
+ * Renders vishrun's Script settings into the host's Extensions settings panel
+ * (Settings → Extensions). The host card is already provided by Lumiverse via
+ * the [data-spindle-mount="settings_extensions"] container — we just render our
+ * content into `root` and the host wraps it in a border + padding card.
  *
- * Character scripts are stored in character.extensions.tavern_helper.scripts
- * (JSLR-compatible), so cards exported from SillyTavern+JSLR display their
- * scripts here automatically — no import step required.
+ * Three sections mirror JS-Slash-Runner's Script tab:
+ *   Global    → stored in extension storage (scripts/global.json)
+ *   Character → stored in character.extensions.tavern_helper.scripts
+ *   Preset    → stored in extension storage (scripts/preset.json)
  *
- * Lifecycle
- * ─────────
- *   createScriptsPanel(root, ctx)   → call from frontend.ts setup()
- *   panel.onCharacterChanged(id)    → call from frontend.ts loadFor()
- *   panel.destroy()                 → call from frontend.ts cleanup
+ * Character scripts round-trip with SillyTavern+JSLR automatically — they
+ * share the same storage field and need no import step.
  */
 
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
@@ -27,22 +27,49 @@ import {
 import { getActiveCard } from '../state/active-card';
 
 // ── CSS ─────────────────────────────────────────────────────────────────────
+// The host card already supplies outer border + padding (14px 16px), so the
+// panel root padding is 0. We add our own internal gap/spacing only.
 
 const CSS = `
+.vsh-panel-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: 14px;
+  padding-bottom: 10px;
+  border-bottom: 1px solid var(--lumiverse-border);
+}
+.vsh-panel-title {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--lumiverse-text);
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.vsh-panel-badge {
+  font-size: 10px;
+  font-weight: 500;
+  padding: 1px 6px;
+  background: var(--lumiverse-accent);
+  color: var(--lumiverse-accent-fg);
+  border-radius: 99px;
+}
 .vsh-scripts-panel {
-  padding: 12px;
   display: flex;
   flex-direction: column;
   gap: 0;
   font-size: 13px;
   color: var(--lumiverse-text);
-  box-sizing: border-box;
 }
 .vsh-section {
   display: flex;
   flex-direction: column;
   gap: 6px;
-  padding: 14px 0;
+  padding: 12px 0;
+}
+.vsh-section + .vsh-section {
+  border-top: 1px solid var(--lumiverse-border);
 }
 .vsh-section-header {
   display: flex;
@@ -50,8 +77,8 @@ const CSS = `
   justify-content: space-between;
 }
 .vsh-section-title {
-  font-weight: 600;
   font-size: 11px;
+  font-weight: 600;
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--lumiverse-text-muted);
@@ -59,11 +86,6 @@ const CSS = `
 .vsh-section-sub {
   font-size: 11px;
   color: var(--lumiverse-text-dim);
-  margin: 0;
-}
-.vsh-divider {
-  border: none;
-  border-top: 1px solid var(--lumiverse-border);
   margin: 0;
 }
 .vsh-add-btn {
@@ -109,11 +131,11 @@ const CSS = `
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  background: var(--lumiverse-fill-subtle);
+  background: var(--lumiverse-fill);
   transition: background var(--lumiverse-transition-fast);
 }
 .vsh-script-row:hover {
-  background: var(--lumiverse-fill);
+  background: var(--lumiverse-fill-subtle);
 }
 .vsh-enable-toggle {
   flex-shrink: 0;
@@ -160,7 +182,7 @@ const CSS = `
 .vsh-editor {
   border-top: 1px solid var(--lumiverse-border);
   padding: 10px;
-  background: var(--lumiverse-fill);
+  background: var(--lumiverse-fill-subtle);
   display: flex;
   flex-direction: column;
   gap: 8px;
@@ -178,7 +200,7 @@ const CSS = `
 }
 .vsh-input {
   padding: 5px 7px;
-  background: var(--lumiverse-fill-subtle);
+  background: var(--lumiverse-fill);
   border: 1px solid var(--lumiverse-border);
   border-radius: var(--lumiverse-radius);
   color: var(--lumiverse-text);
@@ -188,13 +210,10 @@ const CSS = `
   font-family: inherit;
   transition: border-color var(--lumiverse-transition-fast);
 }
-.vsh-input:focus {
-  outline: none;
-  border-color: var(--lumiverse-accent);
-}
+.vsh-input:focus { outline: none; border-color: var(--lumiverse-accent); }
 .vsh-textarea {
   padding: 7px 8px;
-  background: var(--lumiverse-fill-subtle);
+  background: var(--lumiverse-fill);
   border: 1px solid var(--lumiverse-border);
   border-radius: var(--lumiverse-radius);
   color: var(--lumiverse-text);
@@ -207,10 +226,7 @@ const CSS = `
   box-sizing: border-box;
   transition: border-color var(--lumiverse-transition-fast);
 }
-.vsh-textarea:focus {
-  outline: none;
-  border-color: var(--lumiverse-accent);
-}
+.vsh-textarea:focus { outline: none; border-color: var(--lumiverse-accent); }
 .vsh-folder-item {
   border: 1px solid var(--lumiverse-border);
   border-radius: var(--lumiverse-radius);
@@ -221,7 +237,7 @@ const CSS = `
   align-items: center;
   gap: 6px;
   padding: 6px 8px;
-  background: var(--lumiverse-fill);
+  background: var(--lumiverse-fill-subtle);
   border-bottom: 1px solid var(--lumiverse-border);
 }
 .vsh-folder-scripts {
@@ -229,7 +245,7 @@ const CSS = `
   display: flex;
   flex-direction: column;
   gap: 4px;
-  background: var(--lumiverse-fill-subtle);
+  background: var(--lumiverse-fill);
 }
 `;
 
@@ -238,12 +254,9 @@ const CSS = `
 type Target = 'global' | 'character' | 'preset';
 
 export interface ScriptsPanel {
-  /**
-   * Called by frontend.ts immediately after loading a new character.
-   * Triggers a character-scripts reload for the given characterId.
-   * Pass null when no character is loaded (clears the character section).
-   */
   onCharacterChanged(characterId: string | null): void;
+  /** Called after fetchCharacter to show a badge when the card has JSLR scripts. */
+  setHasTavernHelperScripts(has: boolean): void;
   destroy(): void;
 }
 
@@ -253,7 +266,7 @@ export function createScriptsPanel(
   root: HTMLElement,
   ctx: SpindleFrontendContext,
 ): ScriptsPanel {
-  const storage = new ScriptStorageClient(ctx);
+  const storage = new ScriptStorageClient();
   const removeStyle = ctx.dom.addStyle(CSS);
 
   // ── State ──────────────────────────────────────────────────────────
@@ -261,31 +274,42 @@ export function createScriptsPanel(
   let charScripts: ScriptTree[] = [];
   let presetScripts: ScriptTree[] = [];
   let currentCharId: string | null = null;
-
   const saveTimers = new Map<Target, ReturnType<typeof setTimeout>>();
 
-  // ── Root container ─────────────────────────────────────────────────
+  // ── Root container (direct child of the host card) ─────────────────
   const container = document.createElement('div');
-  container.className = 'vsh-scripts-panel';
   root.appendChild(container);
 
-  // ── Build three sections ───────────────────────────────────────────
+  // Panel header: extension label + optional ST-import badge
+  const panelHeader = document.createElement('div');
+  panelHeader.className = 'vsh-panel-header';
+
+  const panelTitle = document.createElement('span');
+  panelTitle.className = 'vsh-panel-title';
+  panelTitle.textContent = 'Vishrun · Scripts';
+
+  const stBadge = document.createElement('span');
+  stBadge.className = 'vsh-panel-badge';
+  stBadge.textContent = 'ST import';
+  stBadge.title = 'Character has scripts from a SillyTavern+JSLR export';
+  stBadge.hidden = true;
+
+  panelHeader.append(panelTitle, stBadge);
+
+  // Three sections
+  const panel = document.createElement('div');
+  panel.className = 'vsh-scripts-panel';
+
   const globalSec = makeSection('Global Scripts', '🌐 Available in every chat');
   const charSec = makeSection('Character Scripts', getCharSubtitle());
   const presetSec = makeSection('Preset Scripts', '⚙️ Bound to the current preset');
 
-  // Wire up add buttons
   globalSec.addBtn.addEventListener('click', () => addScript('global'));
   charSec.addBtn.addEventListener('click', () => addScript('character'));
   presetSec.addBtn.addEventListener('click', () => addScript('preset'));
 
-  container.append(
-    globalSec.el,
-    makeDivider(),
-    charSec.el,
-    makeDivider(),
-    presetSec.el,
-  );
+  panel.append(globalSec.el, charSec.el, presetSec.el);
+  container.append(panelHeader, panel);
 
   // ── Section factory ────────────────────────────────────────────────
   function makeSection(title: string, subtitle: string) {
@@ -316,13 +340,7 @@ export function createScriptsPanel(
     return { el, list, subEl, addBtn };
   }
 
-  function makeDivider(): HTMLHRElement {
-    const hr = document.createElement('hr');
-    hr.className = 'vsh-divider';
-    return hr;
-  }
-
-  // ── Subtitle helper ────────────────────────────────────────────────
+  // ── Subtitle helpers ───────────────────────────────────────────────
   function getCharSubtitle(): string {
     const card = getActiveCard();
     if (card?.characterName) return `🎭 Bound to: ${card.characterName}`;
@@ -369,7 +387,6 @@ export function createScriptsPanel(
     const row = document.createElement('div');
     row.className = 'vsh-script-row';
 
-    // Enable toggle
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
     toggle.className = 'vsh-enable-toggle';
@@ -381,31 +398,27 @@ export function createScriptsPanel(
       saveTarget(target);
     });
 
-    // Name label
     const nameEl = document.createElement('span');
     nameEl.className = 'vsh-script-name' + (script.enabled ? '' : ' vsh-disabled');
     nameEl.textContent = script.name || '(unnamed)';
 
-    // Edit toggle button
     const editBtn = document.createElement('button');
-    editBtn.className = 'vsh-btn vsh-btn-edit';
+    editBtn.className = 'vsh-btn';
     editBtn.textContent = 'Edit';
 
-    // Delete button
     const delBtn = document.createElement('button');
     delBtn.className = 'vsh-btn vsh-btn-delete';
     delBtn.textContent = '✕';
     delBtn.title = 'Delete script';
     delBtn.addEventListener('click', () => {
       const idx = parentList.indexOf(script);
-      if (idx !== -1) { parentList.splice(idx, 1); }
+      if (idx !== -1) parentList.splice(idx, 1);
       saveTarget(target);
       refreshTarget(target);
     });
 
     row.append(toggle, nameEl, editBtn, delBtn);
 
-    // Inline editor (hidden by default)
     const editor = buildEditor(script, target, (newName) => {
       nameEl.textContent = newName || '(unnamed)';
     });
@@ -428,7 +441,6 @@ export function createScriptsPanel(
     const el = document.createElement('div');
     el.className = 'vsh-editor';
 
-    // Name field
     const nameField = makeField('Name');
     const nameInput = document.createElement('input');
     nameInput.type = 'text';
@@ -442,7 +454,6 @@ export function createScriptsPanel(
     });
     nameField.appendChild(nameInput);
 
-    // Content field
     const contentField = makeField('Script (JavaScript)');
     const contentArea = document.createElement('textarea');
     contentArea.className = 'vsh-textarea';
@@ -455,7 +466,6 @@ export function createScriptsPanel(
     });
     contentField.appendChild(contentArea);
 
-    // Info / description field
     const infoField = makeField('Description (optional)');
     const infoInput = document.createElement('input');
     infoInput.type = 'text';
@@ -494,7 +504,6 @@ export function createScriptsPanel(
     toggle.type = 'checkbox';
     toggle.className = 'vsh-enable-toggle';
     toggle.checked = folder.enabled;
-    toggle.title = 'Enable / disable folder';
     toggle.addEventListener('change', () => {
       folder.enabled = toggle.checked;
       saveTarget(target);
@@ -547,11 +556,9 @@ export function createScriptsPanel(
     clearTimeout(saveTimers.get(target));
     if (target === 'global') {
       storage.saveGlobal(globalScripts).catch(console.error);
-    } else if (target === 'character') {
-      if (currentCharId) {
-        storage.saveCharacter(currentCharId, charScripts).catch(console.error);
-      }
-    } else {
+    } else if (target === 'character' && currentCharId) {
+      storage.saveCharacter(currentCharId, charScripts).catch(console.error);
+    } else if (target === 'preset') {
       storage.savePreset(presetScripts).catch(console.error);
     }
   }
@@ -588,7 +595,6 @@ export function createScriptsPanel(
   return {
     onCharacterChanged(characterId: string | null) {
       currentCharId = characterId;
-      // Flush any pending saves for the old character before reloading.
       clearTimeout(saveTimers.get('character'));
 
       if (!characterId) {
@@ -597,22 +603,22 @@ export function createScriptsPanel(
         return;
       }
 
-      // Show an empty list immediately so the panel feels responsive,
-      // then populate once the backend responds.
       charScripts = [];
       renderChar();
 
       storage
         .loadCharacter(characterId)
         .then((scripts) => {
-          // Guard against a rapid second character switch arriving before
-          // this response comes back.
           if (currentCharId === characterId) {
             charScripts = scripts;
             renderChar();
           }
         })
         .catch(console.error);
+    },
+
+    setHasTavernHelperScripts(has: boolean) {
+      stBadge.hidden = !has;
     },
 
     destroy() {
