@@ -30,12 +30,22 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
 
-  // ── Script settings panel (Settings → Extensions) ──────────────────
-  const settingsMount = ctx.ui.mount('settings_extensions');
-  let scriptsPanel: ScriptsPanel | null = createScriptsPanel(settingsMount, ctx);
-
   // ── Script runner — executes enabled scripts as hidden sandbox iframes
   const runner = new ScriptRunner(ctx);
+
+  // Called by the panel after any save — reloads runner with updated script list.
+  async function reloadRunner(): Promise<void> {
+    const active = ctx.getActiveChat();
+    if (!active.characterId || !active.chatId) return;
+    const enabledScripts = await loadEnabledScripts(active.characterId);
+    await runner.run(enabledScripts, active.chatId);
+  }
+
+  // ── Script settings panel (Settings → Extensions) ──────────────────
+  const settingsMount = ctx.ui.mount('settings_extensions');
+  let scriptsPanel: ScriptsPanel | null = createScriptsPanel(settingsMount, ctx, () => {
+    void reloadRunner();
+  });
 
   let inflightCharacterId: string | null = null;
   let lastLoadedCharacterId: string | null = null;
