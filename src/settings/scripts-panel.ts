@@ -264,12 +264,15 @@ export interface ScriptsPanel {
   destroy(): void;
 }
 
+export type OnReloadScript = (scriptId: string) => void;
+
 // ── Entry point ──────────────────────────────────────────────────────────────
 
 export function createScriptsPanel(
   root: HTMLElement,
   ctx: SpindleFrontendContext,
   onScriptsSaved?: () => void,
+  onReloadScript?: OnReloadScript,
 ): ScriptsPanel {
   const storage = new ScriptStorageClient();
   const removeStyle = ctx.dom.addStyle(CSS);
@@ -423,6 +426,14 @@ export function createScriptsPanel(
     editBtn.className = 'vsh-btn';
     editBtn.textContent = 'Edit';
 
+    const reloadBtn = document.createElement('button');
+    reloadBtn.className = 'vsh-btn';
+    reloadBtn.textContent = '↺';
+    reloadBtn.title = 'Reload script (force restart without content change)';
+    reloadBtn.addEventListener('click', () => {
+      onReloadScript?.(script.id);
+    });
+
     const delBtn = document.createElement('button');
     delBtn.className = 'vsh-btn vsh-btn-delete';
     delBtn.textContent = '✕';
@@ -434,7 +445,7 @@ export function createScriptsPanel(
       refreshTarget(target);
     });
 
-    row.append(toggle, nameEl, editBtn, delBtn);
+    row.append(toggle, nameEl, editBtn, reloadBtn, delBtn);
 
     const editor = buildEditor(script, target, (newName) => {
       nameEl.textContent = newName || '(unnamed)';
