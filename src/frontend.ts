@@ -7,7 +7,7 @@ import { registerMvuDisplayStrip } from './hooks/mvu-display-strip';
 import { installStatusBarInjectHook } from './hooks/status-bar-inject';
 import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
-import { createScriptsPanel, type ScriptsPanel } from './settings/scripts-panel';
+import { createScriptsPanel, type ScriptsPanel, type OnReloadScript } from './settings/scripts-panel';
 import { ScriptRunner } from './settings/script-runner';
 import { loadEnabledScripts, initScriptStorage, getActiveLoomPresetId } from './settings/script-storage';
 
@@ -44,9 +44,14 @@ export function setup(ctx: SpindleFrontendContext) {
 
   // ── Script settings panel (Settings → Extensions) ──────────────────
   const settingsMount = ctx.ui.mount('settings_extensions');
+  const onReloadScript: OnReloadScript = (scriptId) => {
+    runner.reload(scriptId);
+    void reloadRunner();
+  };
+
   let scriptsPanel: ScriptsPanel | null = createScriptsPanel(settingsMount, ctx, () => {
     void reloadRunner();
-  });
+  }, onReloadScript);
 
   // Pre-create settings keys so subsequent GETs return 200 instead of 404.
   void initScriptStorage();
