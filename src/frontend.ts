@@ -1,5 +1,5 @@
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
-import { fetchCharacter, extractRegexScripts } from './lumiverse/fetch-character';
+import { fetchCharacter, extractRegexScripts, hasTavernHelperScripts } from './lumiverse/fetch-character';
 import { setActiveCard, clearActiveCard, getActiveCard } from './state/active-card';
 import { installMessageHooks } from './hooks/message-rendered';
 import { rebuildCapturesFromContent } from './hooks/tag-interceptor';
@@ -7,6 +7,7 @@ import { registerMvuDisplayStrip } from './hooks/mvu-display-strip';
 import { installStatusBarInjectHook } from './hooks/status-bar-inject';
 import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
+import { createScriptsPanel, type ScriptsPanel } from './settings/scripts-panel';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -32,6 +33,15 @@ export function setup(ctx: SpindleFrontendContext) {
   // lack the trigger so the Status Bar widget mounts on assistant
   // messages too (greeting already carries the placeholder in the card).
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
+
+  // ── Script settings panel ──────────────────────────────────────────
+  const scriptTab = ctx.ui.registerDrawerTab({
+    id: 'scripts',
+    title: 'Scripts',
+    description: 'Global, character, and preset JavaScript scripts',
+  });
+  let scriptsPanel: ScriptsPanel | null = createScriptsPanel(scriptTab.root, ctx);
+
   // Per-character debounce: avoid duplicate fetches when CHAT_CHANGED fires
   // with the same characterId (e.g. swipe edits, transient state).
   let inflightCharacterId: string | null = null;
@@ -41,6 +51,7 @@ export function setup(ctx: SpindleFrontendContext) {
     if (!characterId) {
       clearActiveCard();
       lastLoadedCharacterId = null;
+      scriptsPanel?.onCharacterChanged(null);
       hooks.rescanAll(); // detaches the observer when there's no active card
       return;
     }
@@ -60,6 +71,9 @@ export function setup(ctx: SpindleFrontendContext) {
       if (scripts.length === 0) {
         clearActiveCard();
         lastLoadedCharacterId = characterId;
+        // Character has no regex widgets, but may still have tavern_helper scripts.
+        // Notify the panel so the Character Scripts section stays up to date.
+        scriptsPanel?.onCharacterChanged(characterId);
         hooks.rescanAll(); // detaches the observer for cards without scripts
         return;
       }
@@ -70,6 +84,18 @@ export function setup(ctx: SpindleFrontendContext) {
         : [];
       setActiveCard({ characterId, characterName: name, scripts, firstMes, alternateGreetings });
       lastLoadedCharacterId = characterId;
+
+      // Notify the scripts panel so it can reload character scripts and update
+      // the tab badge. hasTavernHelperScripts() is a fast check — if the card
+      // carries JSLR scripts, the panel will surface them automatically since
+      // both vishrun and JSLR write to extensions.tavern_helper.scripts.
+      scriptsPanel?.onCharacterChanged(characterId);
+      if (hasTavernHelperScripts(char)) {
+        scriptTab.setBadge('ST');
+      } else {
+        scriptTab.setBadge(null);
+      }
+
       hooks.rescanAll();
     } catch (err) {
       console.debug('[vishrun] fetchCharacter failed:', err);
@@ -163,5 +189,8 @@ export function setup(ctx: SpindleFrontendContext) {
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();
+    scriptsPanel?.destroy();
+    scriptsPanel = null;
+    scriptTab.destroy();
   };
 }
