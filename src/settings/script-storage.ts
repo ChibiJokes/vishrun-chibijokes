@@ -17,7 +17,9 @@ import { normalizeScriptTrees, isFolder, type Script, type ScriptTree } from './
 
 const BASE = '/api/v1';
 const GLOBAL_KEY = encodeURIComponent('vishrun_chibijokes.scripts.global');
-const PRESET_KEY  = encodeURIComponent('vishrun_chibijokes.scripts.preset');
+function presetKey(presetId: string): string {
+  return encodeURIComponent(`vishrun_chibijokes.scripts.preset.${presetId}`);
+}
 
 async function getJson(url: string): Promise<unknown> {
   const r = await fetch(url, { credentials: 'same-origin' });
@@ -48,13 +50,15 @@ export class ScriptStorageClient {
 
   // ── Preset ───────────────────────────────────────────────────────────
 
-  async loadPreset(): Promise<ScriptTree[]> {
-    const row = await getJson(`${BASE}/settings/${PRESET_KEY}`) as { value?: { scripts?: unknown[] } } | null;
+  async loadPreset(presetId: string | null): Promise<ScriptTree[]> {
+    if (!presetId) return [];
+    const row = await getJson(`${BASE}/settings/${presetKey(presetId)}`) as { value?: { scripts?: unknown[] } } | null;
     return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!) : [];
   }
 
-  async savePreset(scripts: ScriptTree[]): Promise<void> {
-    await putJson(`${BASE}/settings/${PRESET_KEY}`, { value: { scripts } });
+  async savePreset(presetId: string | null, scripts: ScriptTree[]): Promise<void> {
+    if (!presetId) return;
+    await putJson(`${BASE}/settings/${presetKey(presetId)}`, { value: { scripts } });
   }
 
   // ── Character ────────────────────────────────────────────────────────
@@ -111,17 +115,20 @@ function flattenEnabled(trees: ScriptTree[]): Script[] {
   return out;
 }
 
-export async function loadEnabledScripts(characterId: string | null): Promise<Script[]> {
+export async function loadEnabledScripts(
+  characterId: string | null,
+  presetId: string | null,
+): Promise<Script[]> {
   const storage = new ScriptStorageClient();
   const [global, preset, char] = await Promise.all([
     storage.loadGlobal(),
-    storage.loadPreset(),
+    storage.loadPreset(presetId),
     characterId ? storage.loadCharacter(characterId) : Promise.resolve([] as ScriptTree[]),
   ]);
   return [
-    ...flattenEnabled(global).map(s => ({ ...s, scope: 'global'  as const })),
+    ...flattenEnabled(global).map(s => ({ ...s, scope: 'global'    as const })),
     ...flattenEnabled(char).map(s   => ({ ...s, scope: 'character' as const })),
-    ...flattenEnabled(preset).map(s => ({ ...s, scope: 'preset'  as const })),
+    ...flattenEnabled(preset).map(s => ({ ...s, scope: 'preset'    as const })),
   ];
 }
 
@@ -133,13 +140,22 @@ export async function loadEnabledScripts(characterId: string | null): Promise<Sc
 export async function initScriptStorage(): Promise<void> {
   const storage = new ScriptStorageClient();
 
-  const [global, preset] = await Promise.all([
-    fetch(`${BASE}/settings/${GLOBAL_KEY}`, { credentials: 'same-origin' }),
-    fetch(`${BASE}/settings/${PRESET_KEY}`, { credentials: 'same-origin' }),
-  ]);
+  const globalResp = await fetch(`${BASE}/settings/${GLOBAL_KEY}`, { credentials: 'same-origin' });
+  if (!globalResp.ok) await storage.saveGlobal([]);
+  // Preset keys are per-loom — no blanket pre-creation needed.
+}
 
-  await Promise.all([
-    global.ok ? Promise.resolve() : storage.saveGlobal([]),
-    preset.ok ? Promise.resolve() : storage.savePreset([]),
-  ]);
+// ── Loom helpers ──────────────────────────────────────────────────────────────
+
+/** Returns the currently active Loom preset ID, or null if none is set. */
+export async function getActiveLoomPresetId(): Promise<string | null> {
+  const row = await getJson(`${BASE}/settings/activeLoomPresetId`) as { value?: unknown } | null;
+  const id = row?.value;
+  return typeof id === 'string' && id.length > 0 ? id : null;
+}
+
+/** Returns the display name of a preset, or falls back to its ID. */
+export async function getPresetName(presetId: string): Promise<string> {
+  const preset = await getJson(`${BASE}/presets/${encodeURIComponent(presetId)}`) as { name?: string } | null;
+  return typeof preset?.name === 'string' ? preset.name : presetId;
 }
