@@ -9,7 +9,7 @@ import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { createScriptsPanel, type ScriptsPanel } from './settings/scripts-panel';
 import { ScriptRunner } from './settings/script-runner';
-import { loadEnabledScripts, initScriptStorage } from './settings/script-storage';
+import { loadEnabledScripts, initScriptStorage, getActiveLoomPresetId } from './settings/script-storage';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -37,9 +37,8 @@ export function setup(ctx: SpindleFrontendContext) {
   // hash — only scripts whose content changed will restart.
   async function reloadRunner(): Promise<void> {
     const active = ctx.getActiveChat();
-    console.log('[vishrun:diag] reloadRunner called, characterId:', active.characterId, 'chatId:', active.chatId);
-    const enabledScripts = await loadEnabledScripts(active.characterId ?? null);
-    console.log('[vishrun:diag] reloadRunner enabledScripts count:', enabledScripts.length);
+    const presetId = await getActiveLoomPresetId();
+    const enabledScripts = await loadEnabledScripts(active.characterId ?? null, presetId);
     await runner.run(enabledScripts, active.chatId ?? null);
   }
 
@@ -64,10 +63,12 @@ export function setup(ctx: SpindleFrontendContext) {
       clearActiveCard();
       lastLoadedCharacterId = null;
       scriptsPanel?.onCharacterChanged(null);
+      const presetId = await getActiveLoomPresetId();
+      scriptsPanel?.onPresetChanged(presetId);
       // Pass an empty list — runner.run() will tear down character frames
       // (no longer in the incoming list) while leaving globals/presets untouched
       // since they aren't in the frame map under any characterId key.
-      const enabledScripts = await loadEnabledScripts(null);
+      const enabledScripts = await loadEnabledScripts(null, presetId);
       await runner.run(enabledScripts, null);
       hooks.rescanAll();
       return;
@@ -90,9 +91,10 @@ export function setup(ctx: SpindleFrontendContext) {
     }
     inflightCharacterId = characterId;
     try {
+      const presetId = await getActiveLoomPresetId();
       const [char, enabledScripts] = await Promise.all([
         fetchCharacter(characterId),
-        loadEnabledScripts(characterId),
+        loadEnabledScripts(characterId, presetId),
       ]);
       console.log('[vishrun:diag] loadEnabledScripts returned', enabledScripts.length, 'scripts:', enabledScripts.map(s => s.name));
       const scripts = extractRegexScripts(char);
@@ -112,6 +114,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
       lastLoadedCharacterId = characterId;
       scriptsPanel?.onCharacterChanged(characterId);
+      scriptsPanel?.onPresetChanged(presetId);
       scriptsPanel?.setHasTavernHelperScripts(hasTavernHelperScripts(char));
 
       console.log('[vishrun:diag] calling runner.run with', enabledScripts.length, 'scripts, chatId:', chatId);
@@ -150,15 +153,16 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubMessageSwiped = ctx.events.on('MESSAGE_SWIPED', (p) => handleMessageMutation('MESSAGE_SWIPED', p));
   const unsubMessageEdited = ctx.events.on('MESSAGE_EDITED', (p) => handleMessageMutation('MESSAGE_EDITED', p));
 
+  let lastPresetId: string = '__default__';
+
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
     if (p.key === 'activeChatId' || p.key === 'activeCharacterId') {
       void loadFor(ctx.getActiveChat().characterId ?? null);
       return;
     }
-    // Bare WS SETTINGS_UPDATED (no key) fires when the user switches looms —
-    // selectedLoomStyles is batch-persisted and the server broadcasts the event
-    // without key info. Re-read and notify the panel if the loom changed.
+    // Bare WS event (no key) = batch settings flush. Fires when user switches
+    // looms. Re-read the loom ID and update the panel + runner if it changed.
     if (p.key === undefined) {
       void (async () => {
         const newPresetId = await getActiveLoomPresetId();
@@ -178,9 +182,12 @@ export function setup(ctx: SpindleFrontendContext) {
   if (active.characterId) {
     void loadFor(active.characterId);
   } else {
-    // No active character yet, but global/preset scripts should still run at startup.
-    console.warn('[vishrun:diag] setup(): no active characterId at startup, running global scripts');
-    void reloadRunner();
+    void (async () => {
+      const presetId = await getActiveLoomPresetId();
+      lastPresetId = presetId;
+      scriptsPanel?.onPresetChanged(presetId);
+      void reloadRunner();
+    })();
   }
 
   return () => {
