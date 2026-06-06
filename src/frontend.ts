@@ -52,6 +52,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let inflightCharacterId: string | null = null;
   let lastLoadedCharacterId: string | null = null;
+  let lastChatId: string | null = null;
 
   async function loadFor(characterId: string | null) {
     console.log('[vishrun:diag] loadFor called:', characterId,
@@ -70,8 +71,16 @@ export function setup(ctx: SpindleFrontendContext) {
       console.warn('[vishrun:diag] loadFor early-exit: already inflight for', characterId);
       return;
     }
+    const currentChatId = ctx.getActiveChat().chatId ?? null;
     if (lastLoadedCharacterId === characterId && getActiveCard()?.characterId === characterId) {
-      console.warn('[vishrun:diag] loadFor early-exit: already loaded, skipping runner.run!');
+      // Same character — skip re-fetching character data.
+      // But if the chat changed, restart the runner so scripts that clean up
+      // on chat switch (e.g. The Quill's nukeInterval) get a fresh frame.
+      if (currentChatId !== lastChatId) {
+        lastChatId = currentChatId;
+        const enabledScripts = await loadEnabledScripts(characterId);
+        await runner.run(enabledScripts, currentChatId);
+      }
       hooks.rescanAll();
       return;
     }
@@ -84,8 +93,7 @@ export function setup(ctx: SpindleFrontendContext) {
       console.log('[vishrun:diag] loadEnabledScripts returned', enabledScripts.length, 'scripts:', enabledScripts.map(s => s.name));
       const scripts = extractRegexScripts(char);
       const name = (char.name as string | undefined) ?? null;
-      const chatId = ctx.getActiveChat().chatId ?? null;
-      console.log('[vishrun:diag] chatId:', chatId, '| regex scripts:', scripts.length);
+      const chatId = currentChatId;
 
       if (scripts.length > 0) {
         const firstMes = typeof char.first_mes === 'string' ? char.first_mes : null;
@@ -98,6 +106,7 @@ export function setup(ctx: SpindleFrontendContext) {
       }
 
       lastLoadedCharacterId = characterId;
+      lastChatId = currentChatId;
       scriptsPanel?.onCharacterChanged(characterId);
       scriptsPanel?.setHasTavernHelperScripts(hasTavernHelperScripts(char));
 
