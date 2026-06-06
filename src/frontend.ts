@@ -76,8 +76,17 @@ export function setup(ctx: SpindleFrontendContext) {
       return;
     }
     if (lastLoadedCharacterId === characterId && getActiveCard()?.characterId === characterId) {
-      console.warn('[vishrun:diag] loadFor early-exit: already loaded, skipping runner.run!');
+      // Same character, card already cached — skip the REST fetch but still
+      // relaunch script iframes. teardownAll() runs inside runner.run() so
+      // iframes from the previous chat session are always dead by the time we
+      // get here; skipping runner.run() would leave the scripts permanently
+      // gone until a full page reload.
+      console.warn('[vishrun:diag] loadFor: same character, re-using cached card, relaunching runner');
       hooks.rescanAll();
+      const chatId = ctx.getActiveChat().chatId ?? null;
+      const enabledScripts = await loadEnabledScripts(characterId);
+      console.log('[vishrun:diag] loadFor(cache-hit) relaunching', enabledScripts.length, 'scripts, chatId:', chatId);
+      await runner.run(enabledScripts, chatId);
       return;
     }
     inflightCharacterId = characterId;
