@@ -14,11 +14,10 @@
  * JSLR reads, so the round-trip works without any import step.
  */
 
-import { normalizeScriptTrees, type ScriptTree } from './script-types';
+import { normalizeScriptTrees, isFolder, type Script, type ScriptTree } from './script-types';
 
 const BASE = '/api/v1';
-
-const GLOBAL_KEY  = encodeURIComponent('vishrun_chibijokes.scripts.global');
+const GLOBAL_KEY = encodeURIComponent('vishrun_chibijokes.scripts.global');
 const PRESET_KEY  = encodeURIComponent('vishrun_chibijokes.scripts.preset');
 
 async function getJson(url: string): Promise<unknown> {
@@ -41,8 +40,7 @@ export class ScriptStorageClient {
 
   async loadGlobal(): Promise<ScriptTree[]> {
     const row = await getJson(`${BASE}/settings/${GLOBAL_KEY}`) as { value?: { scripts?: unknown[] } } | null;
-    const scripts = row?.value?.scripts;
-    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
+    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!) : [];
   }
 
   async saveGlobal(scripts: ScriptTree[]): Promise<void> {
@@ -53,8 +51,7 @@ export class ScriptStorageClient {
 
   async loadPreset(): Promise<ScriptTree[]> {
     const row = await getJson(`${BASE}/settings/${PRESET_KEY}`) as { value?: { scripts?: unknown[] } } | null;
-    const scripts = row?.value?.scripts;
-    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
+    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!) : [];
   }
 
   async savePreset(scripts: ScriptTree[]): Promise<void> {
@@ -88,4 +85,38 @@ export class ScriptStorageClient {
 
   // No persistent state — nothing to clean up.
   destroy(): void {}
+}
+
+// ── Combined loader for the script runner ───────────────────────────────────
+// Returns all enabled flat Scripts across global → character → preset tiers.
+// Folders are flattened; disabled items at any level are skipped.
+
+function flattenEnabled(trees: ScriptTree[]): Script[] {
+  const out: Script[] = [];
+  for (const tree of trees) {
+    if (!tree.enabled) continue;
+    if (isFolder(tree)) {
+      for (const s of tree.scripts) {
+        if (s.enabled && s.content.trim()) out.push(s);
+      }
+    } else if (tree.content.trim()) {
+      out.push(tree);
+    }
+  }
+  return out;
+}
+
+export async function loadEnabledScripts(characterId: string | null): Promise<Script[]> {
+  const storage = new ScriptStorageClient();
+  const [global, preset, char] = await Promise.all([
+    storage.loadGlobal(),
+    storage.loadPreset(),
+    characterId ? storage.loadCharacter(characterId) : Promise.resolve([] as ScriptTree[]),
+  ]);
+  // JSLR execution order: global → character → preset
+  return [
+    ...flattenEnabled(global),
+    ...flattenEnabled(char),
+    ...flattenEnabled(preset),
+  ];
 }
