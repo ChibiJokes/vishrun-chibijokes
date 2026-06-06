@@ -64,6 +64,11 @@ export class ScriptRunner {
     this.teardownAll();
     if (scripts.length === 0) return;
 
+    // Brief delay so old iframes can receive pagehide and run their DOM
+    // cleanup (e.g. removing #qm-persistent-btn) before the new frame's
+    // script increments the generation counter and finds the button gone.
+    await new Promise<void>(r => setTimeout(r, 80));
+
     // chatId used for getChatMessages snapshot. Use '' when no chat is open —
     // scripts that don't call getChatMessages still run fine.
     const effectiveChatId = chatId ?? '';
