@@ -118,6 +118,12 @@ export class ScriptRunner {
         allowEval: true,
       } as Parameters<typeof this.ctx.dom.createSandboxFrame>[0] & { allowEval?: boolean });
 
+      // Widen Lumiverse's restrictive default sandbox so scripts can actually run.
+      // createSandboxFrame (since staging d157784) locks iframes down by default;
+      // without allow-scripts the iframe loads but all JS is silently blocked.
+      // This mirrors the identical setAttribute call in widget-iframe.ts.
+      handle.element.setAttribute('sandbox', 'allow-scripts allow-same-origin allow-popups allow-forms');
+
       // IMPORTANT: must NOT use display:none — hidden iframes do not load
       // their srcdoc content in Chromium/Firefox. Use off-screen positioning
       // with visibility:hidden to keep the frame in the render tree while
