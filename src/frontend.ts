@@ -36,8 +36,13 @@ export function setup(ctx: SpindleFrontendContext) {
   // Called by the panel after any save — reloads runner with updated script list.
   async function reloadRunner(): Promise<void> {
     const active = ctx.getActiveChat();
-    if (!active.characterId || !active.chatId) return;
+    console.log('[vishrun:diag] reloadRunner called, characterId:', active.characterId, 'chatId:', active.chatId);
+    if (!active.characterId || !active.chatId) {
+      console.warn('[vishrun:diag] reloadRunner early-exit: missing characterId or chatId');
+      return;
+    }
     const enabledScripts = await loadEnabledScripts(active.characterId);
+    console.log('[vishrun:diag] reloadRunner enabledScripts count:', enabledScripts.length);
     await runner.run(enabledScripts, active.chatId);
   }
 
@@ -54,6 +59,10 @@ export function setup(ctx: SpindleFrontendContext) {
   let lastLoadedCharacterId: string | null = null;
 
   async function loadFor(characterId: string | null) {
+    console.log('[vishrun:diag] loadFor called:', characterId,
+      '| inflight:', inflightCharacterId,
+      '| lastLoaded:', lastLoadedCharacterId);
+
     if (!characterId) {
       clearActiveCard();
       lastLoadedCharacterId = null;
@@ -62,8 +71,12 @@ export function setup(ctx: SpindleFrontendContext) {
       hooks.rescanAll();
       return;
     }
-    if (inflightCharacterId === characterId) return;
+    if (inflightCharacterId === characterId) {
+      console.warn('[vishrun:diag] loadFor early-exit: already inflight for', characterId);
+      return;
+    }
     if (lastLoadedCharacterId === characterId && getActiveCard()?.characterId === characterId) {
+      console.warn('[vishrun:diag] loadFor early-exit: already loaded, skipping runner.run!');
       hooks.rescanAll();
       return;
     }
@@ -73,9 +86,11 @@ export function setup(ctx: SpindleFrontendContext) {
         fetchCharacter(characterId),
         loadEnabledScripts(characterId),
       ]);
+      console.log('[vishrun:diag] loadEnabledScripts returned', enabledScripts.length, 'scripts:', enabledScripts.map(s => s.name));
       const scripts = extractRegexScripts(char);
       const name = (char.name as string | undefined) ?? null;
       const chatId = ctx.getActiveChat().chatId ?? null;
+      console.log('[vishrun:diag] chatId:', chatId, '| regex scripts:', scripts.length);
 
       if (scripts.length > 0) {
         const firstMes = typeof char.first_mes === 'string' ? char.first_mes : null;
@@ -91,12 +106,12 @@ export function setup(ctx: SpindleFrontendContext) {
       scriptsPanel?.onCharacterChanged(characterId);
       scriptsPanel?.setHasTavernHelperScripts(hasTavernHelperScripts(char));
 
-      // Launch enabled scripts in hidden sandbox iframes.
+      console.log('[vishrun:diag] calling runner.run with', enabledScripts.length, 'scripts, chatId:', chatId);
       await runner.run(enabledScripts, chatId);
 
       hooks.rescanAll();
     } catch (err) {
-      console.debug('[vishrun] loadFor failed:', err);
+      console.error('[vishrun:diag] loadFor FAILED:', err);
     } finally {
       if (inflightCharacterId === characterId) inflightCharacterId = null;
     }
@@ -104,7 +119,9 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubChatChanged = ctx.events.on('CHAT_CHANGED', (payload: unknown) => {
     const p = (payload || {}) as ChatChangedPayload;
-    if (!shouldRescanForChangedFields(p.changedFields)) return;
+    const pass = shouldRescanForChangedFields(p.changedFields);
+    console.log('[vishrun:diag] CHAT_CHANGED fired, changedFields:', p.changedFields, '| passes filter:', pass, '| characterId:', p.characterId);
+    if (!pass) return;
     void loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
   });
 
@@ -127,13 +144,17 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
+    console.log('[vishrun:diag] SETTINGS_UPDATED key:', p.key);
     if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
     void loadFor(ctx.getActiveChat().characterId ?? null);
   });
 
   const active = ctx.getActiveChat();
+  console.log('[vishrun:diag] setup() initial state — characterId:', active.characterId, 'chatId:', active.chatId);
   if (active.characterId) {
     void loadFor(active.characterId);
+  } else {
+    console.warn('[vishrun:diag] setup(): no active characterId at startup, waiting for events');
   }
 
   return () => {
