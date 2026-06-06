@@ -265,6 +265,7 @@ export interface ScriptsPanel {
 export function createScriptsPanel(
   root: HTMLElement,
   ctx: SpindleFrontendContext,
+  onScriptsSaved?: () => void,
 ): ScriptsPanel {
   const storage = new ScriptStorageClient();
   const removeStyle = ctx.dom.addStyle(CSS);
@@ -555,11 +556,11 @@ export function createScriptsPanel(
   function saveTarget(target: Target) {
     clearTimeout(saveTimers.get(target));
     if (target === 'global') {
-      storage.saveGlobal(globalScripts).catch(console.error);
+      storage.saveGlobal(globalScripts).then(() => onScriptsSaved?.()).catch(console.error);
     } else if (target === 'character' && currentCharId) {
-      storage.saveCharacter(currentCharId, charScripts).catch(console.error);
+      storage.saveCharacter(currentCharId, charScripts).then(() => onScriptsSaved?.()).catch(console.error);
     } else if (target === 'preset') {
-      storage.savePreset(presetScripts).catch(console.error);
+      storage.savePreset(presetScripts).then(() => onScriptsSaved?.()).catch(console.error);
     }
   }
 
