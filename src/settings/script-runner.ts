@@ -1,95 +1,49 @@
-/**
- * ScriptRunner
- *
- * Executes enabled scripts (global → character → preset, in that order) as
- * hidden sandbox iframes when a chat becomes active. Provides the same
- * tavernHelper compatibility layer that vishrun's widget iframes already use,
- * plus a minimal eventSource + event_types shim so scripts written for
- * JS-Slash-Runner can subscribe to chat events without modification.
- *
- * How it works
- * ────────────
- *  1. Each enabled Script gets a ctx.dom.createSandboxFrame with:
- *       • thHelpersShim   — getChatMessages / setChatMessage / getChatId / getCurrentMessageId
- *       • eventBridgeShim — eventSource.on(event_types.CHAT_CHANGED, ...) etc.
- *       • script.content  — the user's raw JavaScript
- *  2. The frame's element is appended to a hidden host-side container.
- *  3. Key Lumiverse events (CHAT_CHANGED, GENERATION_ENDED, MESSAGE_SWIPED,
- *     MESSAGE_EDITED, MESSAGE_RECEIVED) are forwarded to every live frame via
- *     handle.postMessage({ type: 'vsh_event', event, data }).
- *     Inside the iframe the eventSource bridge picks these up and fires the
- *     registered handlers.
- *  4. On chat change / extension teardown, all frames are destroyed.
- *
- * Limitations (fixable later)
- * ───────────────────────────
- *  • getChatMessages() uses a snapshot baked at frame-creation time. Calling
- *    it after new messages arrive returns stale data (same trade-off as
- *    vishrun's widget iframes).
- *  • ST-specific globals (SillyTavern, characters[], etc.) are not provided.
- *    Scripts that access them will hit ReferenceError. The tavernHelper API
- *    covers the majority of card-script use cases.
- */
-
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import { thHelpersShim } from '../render/th-helpers-shim';
 import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
 import type { Script } from './script-types';
 
-// ── Event bridge shim (injected before user code) ───────────────────────────
-// Provides window.eventSource + window.event_types so JSLR scripts that call
-// eventSource.on(event_types.CHAT_CHANGED, fn) compile and run without errors.
-// Events are forwarded from the host as { type: 'vsh_event', event, data }
-// messages via window.spindleSandbox.onMessage.
+// ── Event bridge shim ────────────────────────────────────────────────────────
+// Provides window.eventSource + window.event_types inside each frame so JSLR
+// scripts can call eventSource.on(event_types.CHAT_CHANGED, fn) unchanged.
+// The host forwards Lumiverse events via handle.postMessage({ type:'vsh_event' });
+// the bridge here re-emits them through eventSource so handlers fire normally.
 const EVENT_BRIDGE_SHIM = `<script>(function(){
-var ET = {
-  CHAT_CHANGED:'CHAT_CHANGED',
-  MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
-  MESSAGE_SENT:'MESSAGE_SENT',
-  GENERATION_STARTED:'GENERATION_STARTED',
-  GENERATION_ENDED:'GENERATION_ENDED',
-  GENERATION_STOPPED:'GENERATION_STOPPED',
+var ET={
+  CHAT_CHANGED:'CHAT_CHANGED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
+  MESSAGE_SENT:'MESSAGE_SENT',GENERATION_STARTED:'GENERATION_STARTED',
+  GENERATION_ENDED:'GENERATION_ENDED',GENERATION_STOPPED:'GENERATION_STOPPED',
   CHARACTER_MESSAGE_RENDERED:'CHARACTER_MESSAGE_RENDERED',
   USER_MESSAGE_RENDERED:'USER_MESSAGE_RENDERED',
-  MESSAGE_SWIPED:'MESSAGE_SWIPED',
-  MESSAGE_EDITED:'MESSAGE_EDITED',
+  MESSAGE_SWIPED:'MESSAGE_SWIPED',MESSAGE_EDITED:'MESSAGE_EDITED',
 };
-window.event_types = ET;
-var _h = {};
-window.eventSource = {
-  on:function(e,fn){ (_h[e]=_h[e]||[]).push(fn); },
-  makeFirst:function(e,fn){ (_h[e]=_h[e]||[]).unshift(fn); },
+window.event_types=ET;
+var _h={};
+window.eventSource={
+  on:function(e,fn){(_h[e]=_h[e]||[]).push(fn);},
+  makeFirst:function(e,fn){(_h[e]=_h[e]||[]).unshift(fn);},
   off:function(e,fn){
-    if(!fn){ _h[e]=[]; return; }
-    _h[e]=(_h[e]||[]).filter(function(h){ return h!==fn; });
+    if(!fn){_h[e]=[];return;}
+    _h[e]=(_h[e]||[]).filter(function(h){return h!==fn;});
   },
   emit:function(e,d){
-    (_h[e]||[]).forEach(function(fn){ try{ fn(d); }catch(ex){ console.error('[vsh-script]',ex); } });
+    (_h[e]||[]).forEach(function(fn){try{fn(d);}catch(ex){console.error('[vsh-script]',ex);}});
   },
 };
-if(window.spindleSandbox && typeof window.spindleSandbox.onMessage==='function'){
+if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
   window.spindleSandbox.onMessage(function(msg){
-    if(!msg||msg.type!=='vsh_event') return;
-    window.eventSource.emit(msg.event, msg.data);
+    if(!msg||msg.type!=='vsh_event')return;
+    window.eventSource.emit(msg.event,msg.data);
   });
 }
 })()</script>`;
 
-// Lumiverse event names we forward into script frames.
 const BRIDGED_EVENTS = [
-  'CHAT_CHANGED',
-  'MESSAGE_RECEIVED',
-  'MESSAGE_SENT',
-  'GENERATION_STARTED',
-  'GENERATION_ENDED',
-  'GENERATION_STOPPED',
-  'CHARACTER_MESSAGE_RENDERED',
-  'USER_MESSAGE_RENDERED',
-  'MESSAGE_SWIPED',
-  'MESSAGE_EDITED',
+  'CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT',
+  'GENERATION_STARTED','GENERATION_ENDED','GENERATION_STOPPED',
+  'CHARACTER_MESSAGE_RENDERED','USER_MESSAGE_RENDERED',
+  'MESSAGE_SWIPED','MESSAGE_EDITED',
 ] as const;
-
-// ── Types ────────────────────────────────────────────────────────────────────
 
 interface LiveFrame {
   scriptId: string;
@@ -97,8 +51,6 @@ interface LiveFrame {
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
 }
-
-// ── Runner ───────────────────────────────────────────────────────────────────
 
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
@@ -108,33 +60,28 @@ export class ScriptRunner {
     this.installEventBridge();
   }
 
-  // ── Public ──────────────────────────────────────────────────────────
-
-  /**
-   * Replace all running scripts with a new set. Called by frontend.ts on
-   * every CHAT_CHANGED after loading the character and fetching scripts.
-   * Pass null/[] for chatId or scripts to just tear down existing frames.
-   */
-  async run(
-    scripts: Script[],
-    chatId: string | null,
-  ): Promise<void> {
+  async run(scripts: Script[], chatId: string | null): Promise<void> {
     this.teardownAll();
-    if (!chatId || scripts.length === 0) return;
+    if (scripts.length === 0) return;
 
-    // Fetch message snapshot once and share across all frames.
+    // chatId used for getChatMessages snapshot. Use '' when no chat is open —
+    // scripts that don't call getChatMessages still run fine.
+    const effectiveChatId = chatId ?? '';
+
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
-    try {
-      messagesSnapshot = await fetchMessagesSnapshot(
-        { chatId, currentMessageId: '', currentMessageIndex: -1 },
-        this.ctx,
-      );
-    } catch {
-      // Non-fatal — scripts still run, getChatMessages() returns [].
+    if (effectiveChatId) {
+      try {
+        messagesSnapshot = await fetchMessagesSnapshot(
+          { chatId: effectiveChatId, currentMessageId: '', currentMessageIndex: -1 },
+          this.ctx,
+        );
+      } catch { /* non-fatal */ }
     }
 
+    console.log(`[vishrun:script-runner] launching ${scripts.length} script(s)`, scripts.map(s => s.name));
+
     for (const script of scripts) {
-      await this.launchFrame(script, chatId, messagesSnapshot);
+      this.launchFrame(script, effectiveChatId, messagesSnapshot);
     }
   }
 
@@ -144,13 +91,11 @@ export class ScriptRunner {
     this.eventUnsubs = [];
   }
 
-  // ── Private ─────────────────────────────────────────────────────────
-
-  private async launchFrame(
+  private launchFrame(
     script: Script,
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
-  ): Promise<void> {
+  ): void {
     try {
       const shim = thHelpersShim({
         currentMessageIndex: -1,
@@ -159,31 +104,43 @@ export class ScriptRunner {
         messagesSnapshot,
       });
 
-      // Build srcdoc: event-bridge shim → thHelpers shim → user script
       const srcdoc = [
         EVENT_BRIDGE_SHIM,
         shim,
-        `<script>\n// Script: ${script.name}\n${script.content}\n</script>`,
+        `<script>\n// [vishrun] Script: ${script.name}\n${script.content}\n</script>`,
       ].join('\n');
 
       const handle = this.ctx.dom.createSandboxFrame({
         html: srcdoc,
         autoResize: false,
-        minHeight: 0,
-        initialHeight: 0,
+        minHeight: 1,
+        initialHeight: 1,
         allowEval: true,
       } as Parameters<typeof this.ctx.dom.createSandboxFrame>[0] & { allowEval?: boolean });
 
-      // Hidden container — frame must be in the DOM to run.
+      // IMPORTANT: must NOT use display:none — hidden iframes do not load
+      // their srcdoc content in Chromium/Firefox. Use off-screen positioning
+      // with visibility:hidden to keep the frame in the render tree while
+      // making it invisible and non-interactive.
       const container = document.createElement('div');
       container.dataset.vishrunScript = script.id;
-      container.style.cssText = 'display:none;position:fixed;width:0;height:0;overflow:hidden;pointer-events:none;';
+      container.style.cssText = [
+        'position:fixed',
+        'left:-99999px',
+        'top:-99999px',
+        'width:1px',
+        'height:1px',
+        'visibility:hidden',
+        'pointer-events:none',
+        'overflow:hidden',
+      ].join(';');
       container.appendChild(handle.element);
       document.body.appendChild(container);
 
       this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, handle, container });
+      console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
-      console.error('[vishrun:script-runner] failed to launch script:', script.name, err);
+      console.error('[vishrun:script-runner] failed to launch:', script.name, err);
     }
   }
 
@@ -192,13 +149,12 @@ export class ScriptRunner {
       try { frame.handle.destroy?.(); } catch { /* no-op */ }
       try { frame.container.remove(); } catch { /* no-op */ }
     }
+    if (this.frames.size > 0) {
+      console.log(`[vishrun:script-runner] tore down ${this.frames.size} script frame(s)`);
+    }
     this.frames.clear();
   }
 
-  /**
-   * Subscribe to key Lumiverse events and forward them to every live script
-   * frame as { type: 'vsh_event', event: string, data: unknown }.
-   */
   private installEventBridge(): void {
     for (const eventName of BRIDGED_EVENTS) {
       const unsub = this.ctx.events.on(eventName, (data: unknown) => {
@@ -212,11 +168,7 @@ export class ScriptRunner {
     if (this.frames.size === 0) return;
     const msg = { type: 'vsh_event', event, data };
     for (const frame of this.frames.values()) {
-      try {
-        frame.handle.postMessage(msg);
-      } catch {
-        // Frame may be in a torn-down state; ignore.
-      }
+      try { frame.handle.postMessage(msg); } catch { /* frame torn down */ }
     }
   }
 }
