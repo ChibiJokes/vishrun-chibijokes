@@ -119,11 +119,20 @@ export async function loadEnabledScripts(
   characterId: string | null,
   presetId: string | null,
 ): Promise<Script[]> {
+  // Section-enabled flags are stored in localStorage by the scripts panel.
+  // Default true when not set (matches JSLR's default-enabled behaviour).
+  const secOn = (t: string) =>
+    typeof localStorage !== 'undefined'
+      ? localStorage.getItem(`vsh_section_enabled_${t}`) !== 'false'
+      : true;
+
   const storage = new ScriptStorageClient();
   const [global, preset, char] = await Promise.all([
-    storage.loadGlobal(),
-    storage.loadPreset(presetId),
-    characterId ? storage.loadCharacter(characterId) : Promise.resolve([] as ScriptTree[]),
+    secOn('global')    ? storage.loadGlobal()                    : Promise.resolve([] as ScriptTree[]),
+    secOn('preset')    ? storage.loadPreset(presetId)             : Promise.resolve([] as ScriptTree[]),
+    secOn('character') && characterId
+                       ? storage.loadCharacter(characterId)
+                       : Promise.resolve([] as ScriptTree[]),
   ]);
   return [
     ...flattenEnabled(global).map(s => ({ ...s, scope: 'global'    as const })),
