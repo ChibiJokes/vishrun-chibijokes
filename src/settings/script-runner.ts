@@ -17,21 +17,6 @@ import type { Script } from './script-types';
 // 2. eventSource bridge — forwards vsh_event host messages as eventSource
 //    emissions so JSLR scripts can call eventSource.on(event_types.*, fn).
 const EVENT_BRIDGE_SHIM = `<script>(function(){
-var _ph=[];
-var _ael=window.addEventListener.bind(window);
-var _rel=window.removeEventListener.bind(window);
-window.addEventListener=function(type,fn,opts){
-  if(type==='pagehide'){_ph.push(fn);return;}
-  return _ael(type,fn,opts);
-};
-window.removeEventListener=function(type,fn,opts){
-  if(type==='pagehide'){var i=_ph.indexOf(fn);if(i!==-1)_ph.splice(i,1);return;}
-  return _rel(type,fn,opts);
-};
-_ael('pagehide',function(){
-  if(!window.__vshTeardownPending)return;
-  _ph.forEach(function(h){try{h();}catch(e){}});
-});
 var ET={
   CHAT_CHANGED:'CHAT_CHANGED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
   MESSAGE_SENT:'MESSAGE_SENT',GENERATION_STARTED:'GENERATION_STARTED',
@@ -57,7 +42,6 @@ if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
   window.spindleSandbox.onMessage(function(msg){
     if(!msg)return;
     if(msg.type==='vsh_teardown'){
-      window.__vshTeardownPending=true;
       try{window.dispatchEvent(new Event('pagehide'));}catch(e){}
       return;
     }
