@@ -1,108 +1,91 @@
 /**
- * ScriptStorageClient
+ * ScriptStorageClient — REST-based, no backend messages required.
  *
- * Thin frontend wrapper over vishrun's backend scripts handler.
- * Uses the same request/response protocol as th-helpers and fetch-external:
- *   frontend sends  { type: 'scripts_request',  requestId, op, ...body }
- *   backend replies { type: 'scripts_response', requestId, ok, result? }
+ * Follows the same pattern as fetch-character.ts: direct fetch() calls to
+ * the Lumiverse REST API at /api/v1. No ctx needed; no message timeouts;
+ * no async bus complexity.
  *
- * All methods return empty arrays on timeout or backend error, so the panel
- * degrades gracefully without throwing.
+ * Global / Preset scripts  → GET|PUT /api/v1/settings/:key
+ * Character scripts        → GET /api/v1/characters/:id  (read extensions.tavern_helper.scripts)
+ *                            PUT /api/v1/characters/:id  (write extensions.tavern_helper.scripts)
+ *
+ * Storing character scripts under tavern_helper keeps them ST-compatible:
+ * cards exported from Lumiverse carry the scripts in the same field that
+ * JSLR reads, so the round-trip works without any import step.
  */
 
-import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { normalizeScriptTrees, type ScriptTree } from './script-types';
 
-interface ScriptsResponse {
-  type: 'scripts_response';
-  requestId: string;
-  ok: boolean;
-  result?: unknown;
-  error?: string;
+const BASE = '/api/v1';
+
+const GLOBAL_KEY  = encodeURIComponent('vishrun_chibijokes.scripts.global');
+const PRESET_KEY  = encodeURIComponent('vishrun_chibijokes.scripts.preset');
+
+async function getJson(url: string): Promise<unknown> {
+  const r = await fetch(url, { credentials: 'same-origin' });
+  if (!r.ok) return null;
+  return r.json();
 }
 
-function isScriptsResponse(p: unknown): p is ScriptsResponse {
-  return (
-    !!p &&
-    typeof p === 'object' &&
-    (p as Record<string, unknown>).type === 'scripts_response' &&
-    typeof (p as Record<string, unknown>).requestId === 'string'
-  );
+async function putJson(url: string, body: unknown): Promise<void> {
+  await fetch(url, {
+    method: 'PUT',
+    credentials: 'same-origin',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
 }
-
-const TIMEOUT_MS = 8_000;
 
 export class ScriptStorageClient {
-  private pending = new Map<
-    string,
-    { resolve: (v: unknown) => void; timer: ReturnType<typeof setTimeout> }
-  >();
-  private counter = 0;
-  private readonly unsub: () => void;
-
-  constructor(private readonly ctx: SpindleFrontendContext) {
-    this.unsub = ctx.onBackendMessage((payload) => {
-      if (!isScriptsResponse(payload)) return;
-      const entry = this.pending.get(payload.requestId);
-      if (!entry) return;
-      clearTimeout(entry.timer);
-      this.pending.delete(payload.requestId);
-      entry.resolve(payload.ok ? payload.result : null);
-    });
-  }
-
-  destroy(): void {
-    this.unsub();
-    for (const entry of this.pending.values()) clearTimeout(entry.timer);
-    this.pending.clear();
-  }
-
-  private request<T>(op: string, body: Record<string, unknown> = {}): Promise<T | null> {
-    const requestId = `vsh_scripts_${++this.counter}`;
-    return new Promise<T | null>((resolve) => {
-      const timer = setTimeout(() => {
-        this.pending.delete(requestId);
-        console.warn('[vishrun:scripts] request timed out:', op, requestId);
-        resolve(null);
-      }, TIMEOUT_MS);
-      this.pending.set(requestId, { resolve: resolve as (v: unknown) => void, timer });
-      this.ctx.sendToBackend({ type: 'scripts_request', requestId, op, ...body });
-    });
-  }
-
-  // ── Readers ─────────────────────────────────────────────────────────
+  // ── Global ──────────────────────────────────────────────────────────
 
   async loadGlobal(): Promise<ScriptTree[]> {
-    const r = await this.request<{ scripts: unknown[] }>('read_global');
-    return Array.isArray(r?.scripts) ? normalizeScriptTrees(r.scripts) : [];
+    const row = await getJson(`${BASE}/settings/${GLOBAL_KEY}`) as { value?: { scripts?: unknown[] } } | null;
+    const scripts = row?.value?.scripts;
+    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
   }
-
-  async loadPreset(): Promise<ScriptTree[]> {
-    const r = await this.request<{ scripts: unknown[] }>('read_preset');
-    return Array.isArray(r?.scripts) ? normalizeScriptTrees(r.scripts) : [];
-  }
-
-  /**
-   * Reads character scripts from character.extensions.tavern_helper.scripts.
-   * Cards exported from SillyTavern+JSLR already carry scripts here, so they
-   * appear in vishrun's panel automatically without any import step.
-   */
-  async loadCharacter(characterId: string): Promise<ScriptTree[]> {
-    const r = await this.request<{ scripts: unknown[] }>('read_character', { characterId });
-    return Array.isArray(r?.scripts) ? normalizeScriptTrees(r.scripts) : [];
-  }
-
-  // ── Writers ─────────────────────────────────────────────────────────
 
   async saveGlobal(scripts: ScriptTree[]): Promise<void> {
-    await this.request('save_global', { scripts });
+    await putJson(`${BASE}/settings/${GLOBAL_KEY}`, { value: { scripts } });
+  }
+
+  // ── Preset ───────────────────────────────────────────────────────────
+
+  async loadPreset(): Promise<ScriptTree[]> {
+    const row = await getJson(`${BASE}/settings/${PRESET_KEY}`) as { value?: { scripts?: unknown[] } } | null;
+    const scripts = row?.value?.scripts;
+    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
   }
 
   async savePreset(scripts: ScriptTree[]): Promise<void> {
-    await this.request('save_preset', { scripts });
+    await putJson(`${BASE}/settings/${PRESET_KEY}`, { value: { scripts } });
   }
 
-  async saveCharacter(characterId: string, scripts: ScriptTree[]): Promise<void> {
-    await this.request('save_character', { characterId, scripts });
+  // ── Character ────────────────────────────────────────────────────────
+  // Reads from extensions.tavern_helper.scripts so ST-exported cards
+  // (which carry JSLR scripts there) appear in the panel automatically.
+
+  async loadCharacter(characterId: string): Promise<ScriptTree[]> {
+    const char = await getJson(`${BASE}/characters/${encodeURIComponent(characterId)}`) as {
+      extensions?: { tavern_helper?: { scripts?: unknown[] } };
+    } | null;
+    const scripts = char?.extensions?.tavern_helper?.scripts;
+    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
   }
+
+  /**
+   * Writes scripts back to extensions.tavern_helper.scripts.
+   * Lumiverse shallow-merges the extensions object, so only tavern_helper
+   * is touched — regex_scripts and every other extension key are preserved.
+   */
+  async saveCharacter(characterId: string, scripts: ScriptTree[]): Promise<void> {
+    await putJson(`${BASE}/characters/${encodeURIComponent(characterId)}`, {
+      extensions: {
+        tavern_helper: { scripts },
+      },
+    });
+  }
+
+  // No persistent state — nothing to clean up.
+  destroy(): void {}
 }
