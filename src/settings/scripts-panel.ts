@@ -187,6 +187,9 @@ const CSS = `
   flex-direction: column;
   gap: 8px;
 }
+.vsh-editor[hidden] {
+  display: none;
+}
 .vsh-field {
   display: flex;
   flex-direction: column;
