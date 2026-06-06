@@ -2,6 +2,7 @@ import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumivers
 import { thHelpersShim } from '../render/th-helpers-shim';
 import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
 import type { Script } from './script-types';
+import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 
 // ── Event bridge shim ────────────────────────────────────────────────────────
 // Provides window.eventSource + window.event_types inside each frame so JSLR
@@ -38,7 +39,18 @@ if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
 }
 })()</script>`;
 
-const BRIDGED_EVENTS = [
+const CLIPBOARD_SHIM = `<script>(function(){
+try{
+if(!navigator.clipboard){Object.defineProperty(navigator,'clipboard',{value:{},configurable:true});}
+navigator.clipboard.writeText=function(text){
+try{window.spindleSandbox.postMessage({kind:'clipboard-write-text',payload:{text:String(text)}});return Promise.resolve();}
+catch(e){return Promise.reject(e);}
+};
+}catch(e){}
+window.alert=function(msg){
+try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}
+};
+})()</script>`;
   'CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT',
   'GENERATION_STARTED','GENERATION_ENDED','GENERATION_STOPPED',
   'CHARACTER_MESSAGE_RENDERED','USER_MESSAGE_RENDERED',
@@ -155,6 +167,7 @@ export class ScriptRunner {
 
       const srcdoc = [
         EVENT_BRIDGE_SHIM,
+        CLIPBOARD_SHIM,
         shim,
         `<script>\n// [vishrun] Script: ${script.name}\n${script.content}\n</script>`,
       ].join('\n');
@@ -200,6 +213,17 @@ export class ScriptRunner {
         handle,
         container,
       });
+
+      handle.onMessage((payload: unknown) => {
+        const p = payload as { kind?: string; payload?: unknown } | null;
+        if (!p || typeof p.kind !== 'string') return;
+        if (p.kind === 'clipboard-write-text') {
+          void handleClipboardWriteText(p.payload, this.ctx);
+        } else if (p.kind === 'alert') {
+          handleHostAlert(p.payload);
+        }
+      });
+
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error('[vishrun:script-runner] failed to launch:', script.name, err);
