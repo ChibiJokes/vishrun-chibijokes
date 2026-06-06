@@ -64,6 +64,7 @@ interface LiveFrame {
   scriptName: string;
   scope: Script['scope'];
   contentHash: string;
+  reloadMemo: string;
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
 }
@@ -79,6 +80,7 @@ function hashContent(s: string): string {
 
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
+  private reloadMemos = new Map<string, string>();
   private eventUnsubs: Array<() => void> = [];
 
   constructor(private readonly ctx: SpindleFrontendContext) {
@@ -104,10 +106,13 @@ export class ScriptRunner {
       }
     }
 
-    // Tear down frames whose content changed so they get relaunched below.
+    // Tear down frames whose content OR reload memo changed.
     for (const script of scripts) {
       const frame = this.frames.get(script.id);
-      if (frame && frame.contentHash !== hashContent(script.content)) {
+      if (frame && (
+        frame.contentHash !== hashContent(script.content) ||
+        frame.reloadMemo !== (this.reloadMemos.get(script.id) ?? '')
+      )) {
         this.destroyFrame(frame);
         this.frames.delete(script.id);
       }
@@ -140,6 +145,18 @@ export class ScriptRunner {
 
     for (const script of scriptsToLaunch) {
       this.launchFrame(script, effectiveChatId, messagesSnapshot);
+    }
+  }
+
+  /** Force-restart a single script frame even if its content hasn't changed. */
+  reload(scriptId: string): void {
+    this.reloadMemos.set(scriptId, crypto.randomUUID());
+  }
+
+  /** Force-restart all running script frames. */
+  reloadAll(): void {
+    for (const id of this.frames.keys()) {
+      this.reloadMemos.set(id, crypto.randomUUID());
     }
   }
 
@@ -212,6 +229,7 @@ export class ScriptRunner {
         scriptName: script.name,
         scope: script.scope,
         contentHash: hashContent(script.content),
+        reloadMemo: this.reloadMemos.get(script.id) ?? '',
         handle,
         container,
       });
