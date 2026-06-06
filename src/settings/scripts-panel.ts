@@ -187,6 +187,39 @@ const CSS = `
   flex-direction: column;
   gap: 8px;
 }
+.vsh-editor[hidden] { display: none !important; }
+.vsh-code-toggle {
+  flex-shrink: 0;
+  padding: 2px 6px;
+  background: transparent;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  color: var(--lumiverse-text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  font-family: monospace;
+  line-height: 1.4;
+  transition: var(--lumiverse-transition-fast);
+}
+.vsh-code-toggle:hover {
+  border-color: var(--lumiverse-accent);
+  color: var(--lumiverse-accent);
+}
+.vsh-name-input {
+  flex: 1;
+  min-width: 0;
+  padding: 2px 5px;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--lumiverse-radius);
+  color: var(--lumiverse-text);
+  font-size: 12px;
+  font-family: inherit;
+  transition: border-color var(--lumiverse-transition-fast);
+}
+.vsh-name-input:hover { border-color: var(--lumiverse-border); }
+.vsh-name-input:focus { outline: none; border-color: var(--lumiverse-accent); background: var(--lumiverse-fill-subtle); }
+.vsh-name-input.vsh-disabled { color: var(--lumiverse-text-dim); text-decoration: line-through; }
 .vsh-field {
   display: flex;
   flex-direction: column;
@@ -388,6 +421,7 @@ export function createScriptsPanel(
     const row = document.createElement('div');
     row.className = 'vsh-script-row';
 
+    // Enable toggle
     const toggle = document.createElement('input');
     toggle.type = 'checkbox';
     toggle.className = 'vsh-enable-toggle';
@@ -395,65 +429,64 @@ export function createScriptsPanel(
     toggle.title = 'Enable / disable';
     toggle.addEventListener('change', () => {
       script.enabled = toggle.checked;
-      nameEl.classList.toggle('vsh-disabled', !script.enabled);
+      nameInput.classList.toggle('vsh-disabled', !script.enabled);
       saveTarget(target);
     });
 
-    const nameEl = document.createElement('span');
-    nameEl.className = 'vsh-script-name' + (script.enabled ? '' : ' vsh-disabled');
-    nameEl.textContent = script.name || '(unnamed)';
+    // Name — always visible and editable inline, like JSLR
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'vsh-name-input' + (script.enabled ? '' : ' vsh-disabled');
+    nameInput.value = script.name;
+    nameInput.placeholder = '(unnamed)';
+    nameInput.addEventListener('input', () => {
+      script.name = nameInput.value;
+      debouncedSave(target);
+    });
+    // Prevent row click from toggling editor when typing in name
+    nameInput.addEventListener('click', (e) => e.stopPropagation());
 
-    const editBtn = document.createElement('button');
-    editBtn.className = 'vsh-btn';
-    editBtn.textContent = 'Edit';
+    // Code toggle — ▸ collapsed, ▾ expanded
+    const codeBtn = document.createElement('button');
+    codeBtn.className = 'vsh-code-toggle';
+    codeBtn.textContent = '▸';
+    codeBtn.title = 'Show / hide script code';
 
     const delBtn = document.createElement('button');
     delBtn.className = 'vsh-btn vsh-btn-delete';
     delBtn.textContent = '✕';
     delBtn.title = 'Delete script';
-    delBtn.addEventListener('click', () => {
+    delBtn.addEventListener('click', (e) => {
+      e.stopPropagation();
       const idx = parentList.indexOf(script);
       if (idx !== -1) parentList.splice(idx, 1);
       saveTarget(target);
       refreshTarget(target);
     });
 
-    row.append(toggle, nameEl, editBtn, delBtn);
+    row.append(toggle, nameInput, codeBtn, delBtn);
 
-    const editor = buildEditor(script, target, (newName) => {
-      nameEl.textContent = newName || '(unnamed)';
-    });
+    // Code editor — hidden by default (JSLR behaviour)
+    const editor = buildEditor(script, target);
     editor.hidden = true;
 
-    editBtn.addEventListener('click', () => {
+    const toggleEditor = () => {
       editor.hidden = !editor.hidden;
-      editBtn.textContent = editor.hidden ? 'Edit' : 'Done';
-    });
+      codeBtn.textContent = editor.hidden ? '▸' : '▾';
+    };
+    codeBtn.addEventListener('click', (e) => { e.stopPropagation(); toggleEditor(); });
 
     item.append(row, editor);
     return item;
   }
 
+  // buildEditor: name is now in the row — only code and description live here.
   function buildEditor(
     script: Script,
     target: Target,
-    onNameChange: (name: string) => void,
   ): HTMLElement {
     const el = document.createElement('div');
     el.className = 'vsh-editor';
-
-    const nameField = makeField('Name');
-    const nameInput = document.createElement('input');
-    nameInput.type = 'text';
-    nameInput.className = 'vsh-input';
-    nameInput.value = script.name;
-    nameInput.placeholder = 'Script name...';
-    nameInput.addEventListener('input', () => {
-      script.name = nameInput.value;
-      onNameChange(nameInput.value);
-      debouncedSave(target);
-    });
-    nameField.appendChild(nameInput);
 
     const contentField = makeField('Script (JavaScript)');
     const contentArea = document.createElement('textarea');
@@ -479,7 +512,7 @@ export function createScriptsPanel(
     });
     infoField.appendChild(infoInput);
 
-    el.append(nameField, contentField, infoField);
+    el.append(contentField, infoField);
     return el;
   }
 
