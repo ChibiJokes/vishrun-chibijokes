@@ -1,5 +1,4 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
-import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 import { thHelpersShim } from '../render/th-helpers-shim';
 import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
 import type { Script } from './script-types';
@@ -9,19 +8,6 @@ import type { Script } from './script-types';
 // scripts can call eventSource.on(event_types.CHAT_CHANGED, fn) unchanged.
 // The host forwards Lumiverse events via handle.postMessage({ type:'vsh_event' });
 // the bridge here re-emits them through eventSource so handlers fire normally.
-// ── Clipboard / alert shim ───────────────────────────────────────────────────
-const CLIPBOARD_SHIM = `<script>(function(){` +
-  `try{` +
-  `if(!navigator.clipboard){Object.defineProperty(navigator,'clipboard',{value:{},configurable:true});}` +
-  `navigator.clipboard.writeText=function(text){` +
-  `try{window.spindleSandbox.postMessage({kind:'clipboard-write-text',payload:{text:String(text)}});return Promise.resolve();}` +
-  `catch(e){return Promise.reject(e);}` +
-  `};}catch(e){}` +
-  `window.alert=function(msg){` +
-  `try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}` +
-  `};` +
-  `})();<\/script>`;
-
 const EVENT_BRIDGE_SHIM = `<script>(function(){
 var ET={
   CHAT_CHANGED:'CHAT_CHANGED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
@@ -69,20 +55,34 @@ interface LiveFrame {
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
   private eventUnsubs: Array<() => void> = [];
-  private runGeneration = 0;
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     this.installEventBridge();
   }
 
   async run(scripts: Script[], chatId: string | null): Promise<void> {
-    const myGen = ++this.runGeneration;
+    // Diff incoming scripts against currently running frames.
+    // Scripts already running with the same ID are kept alive (e.g. global
+    // scripts shouldn't restart just because you opened a character).
+    // Only frames whose script is no longer in the incoming list get torn down.
+    const incomingIds = new Set(scripts.map(s => s.id));
+    for (const [id, frame] of this.frames) {
+      if (!incomingIds.has(id)) {
+        try { frame.handle.destroy?.(); } catch { /* no-op */ }
+        try { frame.container.remove(); } catch { /* no-op */ }
+        this.frames.delete(id);
+        console.log(`[vishrun:script-runner] tearing down removed script: ${id}`);
+      }
+    }
 
-    await this.teardownAll();
+    const scriptsToLaunch = scripts.filter(s => !this.frames.has(s.id));
+    if (scriptsToLaunch.length === 0) return;
 
-    if (myGen !== this.runGeneration) return; // superseded by a newer run() call
-
-    if (scripts.length === 0) return;
+    // Give Lumiverse one tick to finish updating its active-chat state before
+    // we snapshot. CHAT_CHANGED fires slightly before getActiveChat() reflects
+    // the new chatId, so without this the snapshot (and the iframe shim) would
+    // use the *previous* chat's id on rapid chat switches.
+    await new Promise<void>((r) => setTimeout(r, 50));
 
     // chatId used for getChatMessages snapshot. Use '' when no chat is open —
     // scripts that don't call getChatMessages still run fine.
@@ -98,15 +98,15 @@ export class ScriptRunner {
       } catch { /* non-fatal */ }
     }
 
-    console.log(`[vishrun:script-runner] launching ${scripts.length} script(s)`, scripts.map(s => s.name));
+    console.log(`[vishrun:script-runner] launching ${scriptsToLaunch.length} script(s)`, scriptsToLaunch.map(s => s.name));
 
-    for (const script of scripts) {
+    for (const script of scriptsToLaunch) {
       this.launchFrame(script, effectiveChatId, messagesSnapshot);
     }
   }
 
   destroy(): void {
-    void this.teardownAll();
+    this.teardownAll();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
   }
@@ -125,7 +125,6 @@ export class ScriptRunner {
       });
 
       const srcdoc = [
-        CLIPBOARD_SHIM,
         EVENT_BRIDGE_SHIM,
         shim,
         `<script>\n// [vishrun] Script: ${script.name}\n${script.content}\n</script>`,
@@ -164,16 +163,6 @@ export class ScriptRunner {
       container.appendChild(handle.element);
       document.body.appendChild(container);
 
-      handle.onMessage((raw: unknown) => {
-        const p = raw as { kind?: string; payload?: unknown } | null;
-        if (!p) return;
-        if (p.kind === 'clipboard-write-text') {
-          void handleClipboardWriteText(p.payload, this.ctx);
-        } else if (p.kind === 'alert') {
-          handleHostAlert(p.payload);
-        }
-      });
-
       this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, handle, container });
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
@@ -181,16 +170,13 @@ export class ScriptRunner {
     }
   }
 
-  private async teardownAll(): Promise<void> {
-    if (this.frames.size === 0) return;
-    console.log(`[vishrun:script-runner] tearing down ${this.frames.size} script frame(s)`);
-    for (const frame of this.frames.values()) {
-      try { frame.handle.postMessage({ type: 'vsh_teardown' }); } catch { /* no-op */ }
-    }
-    await new Promise<void>(r => setTimeout(r, 60));
+  private teardownAll(): void {
     for (const frame of this.frames.values()) {
       try { frame.handle.destroy?.(); } catch { /* no-op */ }
       try { frame.container.remove(); } catch { /* no-op */ }
+    }
+    if (this.frames.size > 0) {
+      console.log(`[vishrun:script-runner] tore down ${this.frames.size} script frame(s)`);
     }
     this.frames.clear();
   }
