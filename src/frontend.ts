@@ -9,7 +9,7 @@ import { destroyAllRegisteredWidgetsForMessage } from './render/widget-iframe';
 import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { createScriptsPanel, type ScriptsPanel } from './settings/scripts-panel';
 import { ScriptRunner } from './settings/script-runner';
-import { loadEnabledScripts, initScriptStorage, getActiveLoomPresetId } from './settings/script-storage';
+import { loadEnabledScripts, initScriptStorage } from './settings/script-storage';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -37,13 +37,15 @@ export function setup(ctx: SpindleFrontendContext) {
   async function reloadRunner(): Promise<void> {
     const active = ctx.getActiveChat();
     console.log('[vishrun:diag] reloadRunner called, characterId:', active.characterId, 'chatId:', active.chatId);
-    if (!active.characterId || !active.chatId) {
-      console.warn('[vishrun:diag] reloadRunner early-exit: missing characterId or chatId');
+    // Global/preset scripts should run even without an active character.
+    // Only bail if there's truly nothing to load (no scripts at all).
+    const enabledScripts = await loadEnabledScripts(active.characterId ?? null);
+    console.log('[vishrun:diag] reloadRunner enabledScripts count:', enabledScripts.length);
+    if (enabledScripts.length === 0) {
+      console.warn('[vishrun:diag] reloadRunner early-exit: no enabled scripts');
       return;
     }
-    const enabledScripts = await loadEnabledScripts(active.characterId);
-    console.log('[vishrun:diag] reloadRunner enabledScripts count:', enabledScripts.length);
-    await runner.run(enabledScripts, active.chatId);
+    await runner.run(enabledScripts, active.chatId ?? null);
   }
 
   // ── Script settings panel (Settings → Extensions) ──────────────────
@@ -57,8 +59,6 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let inflightCharacterId: string | null = null;
   let lastLoadedCharacterId: string | null = null;
-  let lastChatId: string | null = null;
-  let lastPresetId: string | null = null;
 
   async function loadFor(characterId: string | null) {
     console.log('[vishrun:diag] loadFor called:', characterId,
@@ -77,24 +77,25 @@ export function setup(ctx: SpindleFrontendContext) {
       console.warn('[vishrun:diag] loadFor early-exit: already inflight for', characterId);
       return;
     }
-    const currentChatId = ctx.getActiveChat().chatId ?? null;
     if (lastLoadedCharacterId === characterId && getActiveCard()?.characterId === characterId) {
-      if (currentChatId !== lastChatId) {
-        lastChatId = currentChatId;
-        const presetId = await getActiveLoomPresetId();
-        const enabledScripts = await loadEnabledScripts(characterId, presetId);
-        await runner.run(enabledScripts, currentChatId);
-      }
+      // Same character, card already cached — skip the REST fetch but still
+      // relaunch script iframes. teardownAll() runs inside runner.run() so
+      // iframes from the previous chat session are always dead by the time we
+      // get here; skipping runner.run() would leave the scripts permanently
+      // gone until a full page reload.
+      console.warn('[vishrun:diag] loadFor: same character, re-using cached card, relaunching runner');
       hooks.rescanAll();
+      const chatId = ctx.getActiveChat().chatId ?? null;
+      const enabledScripts = await loadEnabledScripts(characterId);
+      console.log('[vishrun:diag] loadFor(cache-hit) relaunching', enabledScripts.length, 'scripts, chatId:', chatId);
+      await runner.run(enabledScripts, chatId);
       return;
     }
     inflightCharacterId = characterId;
     try {
-      // currentChatId already declared above
-      const presetId = await getActiveLoomPresetId();
       const [char, enabledScripts] = await Promise.all([
         fetchCharacter(characterId),
-        loadEnabledScripts(characterId, presetId),
+        loadEnabledScripts(characterId),
       ]);
       console.log('[vishrun:diag] loadEnabledScripts returned', enabledScripts.length, 'scripts:', enabledScripts.map(s => s.name));
       const scripts = extractRegexScripts(char);
@@ -155,20 +156,15 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
     console.log('[vishrun:diag] SETTINGS_UPDATED key:', p.key);
-    if (p.key === 'activeLoomPresetId') {
-      // Loom switched — reload preset scripts without re-fetching character.
-      void (async () => {
-        const presetId = await getActiveLoomPresetId();
-        lastPresetId = presetId;
-        scriptsPanel?.onPresetChanged(presetId);
-        const active = ctx.getActiveChat();
-        const enabledScripts = await loadEnabledScripts(active.characterId ?? null, presetId);
-        await runner.run(enabledScripts, active.chatId ?? null);
-      })();
-      return;
+    const isNavEvent = p.key === 'activeChatId' || p.key === 'activeCharacterId';
+    const isGlobalScriptSave = typeof p.key === 'string' && p.key.includes('scripts.global');
+    const isPresetScriptSave = typeof p.key === 'string' && p.key.includes('scripts.preset');
+    if (isNavEvent) {
+      void loadFor(ctx.getActiveChat().characterId ?? null);
+    } else if (isGlobalScriptSave || isPresetScriptSave) {
+      // Global/preset scripts changed — reload runner even without an active character
+      void reloadRunner();
     }
-    if (p.key !== 'activeChatId' && p.key !== 'activeCharacterId') return;
-    void loadFor(ctx.getActiveChat().characterId ?? null);
   });
 
   const active = ctx.getActiveChat();
