@@ -1,17 +1,16 @@
 /**
  * ScriptStorageClient — REST-based, no backend messages required.
  *
- * Follows the same pattern as fetch-character.ts: direct fetch() calls to
- * the Lumiverse REST API at /api/v1. No ctx needed; no message timeouts;
- * no async bus complexity.
+ * Global / Preset scripts → GET|PUT /api/v1/settings/:key
+ * Character scripts       → read:  GET /api/v1/characters/:id (extensions.tavern_helper.scripts)
+ *                           write: read-modify-write to preserve regex_scripts and all other keys
  *
- * Global / Preset scripts  → GET|PUT /api/v1/settings/:key
- * Character scripts        → GET /api/v1/characters/:id  (read extensions.tavern_helper.scripts)
- *                            PUT /api/v1/characters/:id  (write extensions.tavern_helper.scripts)
- *
- * Storing character scripts under tavern_helper keeps them ST-compatible:
- * cards exported from Lumiverse carry the scripts in the same field that
- * JSLR reads, so the round-trip works without any import step.
+ * IMPORTANT: PUT /api/v1/characters/:id does a plain spread of the body's
+ * extensions field — it does NOT shallow-merge with the existing extensions
+ * the way spindle.characters.update() does. Sending only { tavern_helper: {...} }
+ * would wipe regex_scripts (breaking every widget). saveCharacter therefore
+ * reads the current extensions first, merges only tavern_helper.scripts,
+ * then writes the full merged blob back.
  */
 
 import { normalizeScriptTrees, isFolder, type Script, type ScriptTree } from './script-types';
@@ -59,8 +58,6 @@ export class ScriptStorageClient {
   }
 
   // ── Character ────────────────────────────────────────────────────────
-  // Reads from extensions.tavern_helper.scripts so ST-exported cards
-  // (which carry JSLR scripts there) appear in the panel automatically.
 
   async loadCharacter(characterId: string): Promise<ScriptTree[]> {
     const char = await getJson(`${BASE}/characters/${encodeURIComponent(characterId)}`) as {
@@ -71,25 +68,33 @@ export class ScriptStorageClient {
   }
 
   /**
-   * Writes scripts back to extensions.tavern_helper.scripts.
-   * Lumiverse shallow-merges the extensions object, so only tavern_helper
-   * is touched — regex_scripts and every other extension key are preserved.
+   * Read-modify-write: fetches the full current extensions object, merges
+   * only tavern_helper.scripts, then writes everything back. This preserves
+   * regex_scripts and any other extension keys that vishrun didn't touch.
    */
   async saveCharacter(characterId: string, scripts: ScriptTree[]): Promise<void> {
-    await putJson(`${BASE}/characters/${encodeURIComponent(characterId)}`, {
-      extensions: {
-        tavern_helper: { scripts },
-      },
-    });
+    const url = `${BASE}/characters/${encodeURIComponent(characterId)}`;
+
+    // Read current state to get the full extensions blob.
+    const current = await getJson(url) as {
+      extensions?: Record<string, unknown>;
+    } | null;
+
+    const existing = (current?.extensions ?? {}) as Record<string, unknown>;
+    const existingTh = (existing.tavern_helper ?? {}) as Record<string, unknown>;
+
+    const merged: Record<string, unknown> = {
+      ...existing,
+      tavern_helper: { ...existingTh, scripts },
+    };
+
+    await putJson(url, { extensions: merged });
   }
 
-  // No persistent state — nothing to clean up.
   destroy(): void {}
 }
 
 // ── Combined loader for the script runner ───────────────────────────────────
-// Returns all enabled flat Scripts across global → character → preset tiers.
-// Folders are flattened; disabled items at any level are skipped.
 
 function flattenEnabled(trees: ScriptTree[]): Script[] {
   const out: Script[] = [];
@@ -113,7 +118,6 @@ export async function loadEnabledScripts(characterId: string | null): Promise<Sc
     storage.loadPreset(),
     characterId ? storage.loadCharacter(characterId) : Promise.resolve([] as ScriptTree[]),
   ]);
-  // JSLR execution order: global → character → preset
   return [
     ...flattenEnabled(global),
     ...flattenEnabled(char),
