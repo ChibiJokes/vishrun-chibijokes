@@ -64,12 +64,6 @@ export class ScriptRunner {
     this.teardownAll();
     if (scripts.length === 0) return;
 
-    // Give Lumiverse one tick to finish updating its active-chat state before
-    // we snapshot. CHAT_CHANGED fires slightly before getActiveChat() reflects
-    // the new chatId, so without this the snapshot (and the iframe shim) would
-    // use the *previous* chat's id on rapid chat switches.
-    await new Promise<void>((r) => setTimeout(r, 50));
-
     // chatId used for getChatMessages snapshot. Use '' when no chat is open —
     // scripts that don't call getChatMessages still run fine.
     const effectiveChatId = chatId ?? '';
