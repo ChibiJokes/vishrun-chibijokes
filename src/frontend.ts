@@ -69,7 +69,9 @@ export function setup(ctx: SpindleFrontendContext) {
       clearActiveCard();
       lastLoadedCharacterId = null;
       scriptsPanel?.onCharacterChanged(null);
-      await runner.run([], null);
+      // Only tear down character-scoped scripts — global/preset scripts
+      // should survive navigation away from a character.
+      await runner.runCharacterOnly([], null);
       hooks.rescanAll();
       return;
     }
