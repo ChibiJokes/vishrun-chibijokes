@@ -1,6 +1,7 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import { thHelpersShim } from '../render/th-helpers-shim';
 import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
+import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 import type { Script } from './script-types';
 
 // ── Event bridge shim ────────────────────────────────────────────────────────
@@ -37,6 +38,23 @@ if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
   });
 }
 })()</script>`;
+
+// ── Clipboard / alert shim ───────────────────────────────────────────────────
+// Mirrors the shim injected into regex widget iframes (clipboardAlertShim in
+// widget-iframe.ts). Intercepts navigator.clipboard.writeText and alert so
+// quill.js's pushToSillyTavern fallback routes through the same
+// dispatch_slash_text backend path that widget frames use.
+const CLIPBOARD_SHIM = `<script>(function(){` +
+  `try{` +
+  `if(!navigator.clipboard){Object.defineProperty(navigator,'clipboard',{value:{},configurable:true});}` +
+  `navigator.clipboard.writeText=function(text){` +
+  `try{window.spindleSandbox.postMessage({kind:'clipboard-write-text',payload:{text:String(text)}});return Promise.resolve();}` +
+  `catch(e){return Promise.reject(e);}` +
+  `};}catch(e){}` +
+  `window.alert=function(msg){` +
+  `try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}` +
+  `};` +
+  `})();<\/script>`;
 
 const BRIDGED_EVENTS = [
   'CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT',
@@ -110,6 +128,7 @@ export class ScriptRunner {
       });
 
       const srcdoc = [
+        CLIPBOARD_SHIM,
         EVENT_BRIDGE_SHIM,
         shim,
         `<script>\n// [vishrun] Script: ${script.name}\n${script.content}\n</script>`,
@@ -147,6 +166,19 @@ export class ScriptRunner {
       ].join(';');
       container.appendChild(handle.element);
       document.body.appendChild(container);
+
+      // Route clipboard / alert messages from the frame through the same
+      // host-side handlers that widget iframes use — this is what makes
+      // quill.js's pushToSillyTavern → /sys path work in character scripts.
+      handle.onMessage((raw: unknown) => {
+        const p = raw as { kind?: string; payload?: unknown } | null;
+        if (!p) return;
+        if (p.kind === 'clipboard-write-text') {
+          void handleClipboardWriteText(p.payload, this.ctx);
+        } else if (p.kind === 'alert') {
+          handleHostAlert(p.payload);
+        }
+      });
 
       this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, handle, container });
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
