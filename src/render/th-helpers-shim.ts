@@ -54,6 +54,9 @@ export interface ThHelpersHandle {
     messageId: number | string,
     opts?: Record<string, unknown>,
   ): Promise<void>;
+  getAllVariables(): Record<string, unknown>;
+  getVariable(key: string): unknown;
+  setVariable(key: string, value: unknown): Promise<void>;
 }
 
 function resolveRangeToIndex(
@@ -134,6 +137,17 @@ export function createThHelpers(
         messageId,
         opts: opts ?? {},
       });
+    },
+    async getAllVariables() {
+      const result = await bridge.postRequest('th-get-variables-snapshot', {}) as { stat_data?: Record<string, unknown> } | null;
+      return result?.stat_data ?? {};
+    },
+    async getVariable(key: string) {
+      const vars = await bridge.postRequest('th-get-variables-snapshot', {}) as { stat_data?: Record<string, unknown> } | null;
+      return vars?.stat_data?.[key] ?? null;
+    },
+    async setVariable(key: string, value: unknown) {
+      await bridge.postRequest('th-set-variable', { key, value });
     },
   };
 }
@@ -225,6 +239,20 @@ window.getChatMessages = function(range, opts){
 window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
+};
+window.getAllVariables = function(){
+  return postRequest('th-get-variables-snapshot', {}).then(function(result){
+    return (result && result.stat_data) ? result.stat_data : {};
+  });
+};
+window.getVariable = function(key){
+  return postRequest('th-get-variables-snapshot', {}).then(function(result){
+    var vars = (result && result.stat_data) ? result.stat_data : {};
+    return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
+  });
+};
+window.setVariable = function(key, value){
+  return postRequest('th-set-variable', { key: key, value: value });
 };
 })();</script>`;
 }
