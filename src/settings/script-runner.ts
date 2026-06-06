@@ -1,21 +1,27 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
+import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 import { thHelpersShim } from '../render/th-helpers-shim';
 import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
-import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 import type { Script } from './script-types';
 
 // ── Event bridge shim ────────────────────────────────────────────────────────
-// This shim runs BEFORE user code. It does two things:
-//
-// 1. pagehide gate — Lumiverse fires pagehide on every SPA navigation,
-//    including on frames we just created. Without this gate, The Quill's
-//    triggerNuke() removes the button the instant it's created. We intercept
-//    window.addEventListener('pagehide') so those handlers only run when WE
-//    explicitly request teardown via vsh_teardown. All other pagehide events
-//    from Lumiverse's navigation are silently swallowed.
-//
-// 2. eventSource bridge — forwards vsh_event host messages as eventSource
-//    emissions so JSLR scripts can call eventSource.on(event_types.*, fn).
+// Provides window.eventSource + window.event_types inside each frame so JSLR
+// scripts can call eventSource.on(event_types.CHAT_CHANGED, fn) unchanged.
+// The host forwards Lumiverse events via handle.postMessage({ type:'vsh_event' });
+// the bridge here re-emits them through eventSource so handlers fire normally.
+// ── Clipboard / alert shim ───────────────────────────────────────────────────
+const CLIPBOARD_SHIM = `<script>(function(){` +
+  `try{` +
+  `if(!navigator.clipboard){Object.defineProperty(navigator,'clipboard',{value:{},configurable:true});}` +
+  `navigator.clipboard.writeText=function(text){` +
+  `try{window.spindleSandbox.postMessage({kind:'clipboard-write-text',payload:{text:String(text)}});return Promise.resolve();}` +
+  `catch(e){return Promise.reject(e);}` +
+  `};}catch(e){}` +
+  `window.alert=function(msg){` +
+  `try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}` +
+  `};` +
+  `})();<\/script>`;
+
 const EVENT_BRIDGE_SHIM = `<script>(function(){
 var ET={
   CHAT_CHANGED:'CHAT_CHANGED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
@@ -40,33 +46,11 @@ window.eventSource={
 };
 if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
   window.spindleSandbox.onMessage(function(msg){
-    if(!msg)return;
-    if(msg.type==='vsh_teardown'){
-      try{window.dispatchEvent(new Event('pagehide'));}catch(e){}
-      return;
-    }
-    if(msg.type!=='vsh_event')return;
+    if(!msg||msg.type!=='vsh_event')return;
     window.eventSource.emit(msg.event,msg.data);
   });
 }
 })()</script>`;
-
-// ── Clipboard / alert shim ───────────────────────────────────────────────────
-// Mirrors the shim injected into regex widget iframes (clipboardAlertShim in
-// widget-iframe.ts). Intercepts navigator.clipboard.writeText and alert so
-// quill.js's pushToSillyTavern fallback routes through the same
-// dispatch_slash_text backend path that widget frames use.
-const CLIPBOARD_SHIM = `<script>(function(){` +
-  `try{` +
-  `if(!navigator.clipboard){Object.defineProperty(navigator,'clipboard',{value:{},configurable:true});}` +
-  `navigator.clipboard.writeText=function(text){` +
-  `try{window.spindleSandbox.postMessage({kind:'clipboard-write-text',payload:{text:String(text)}});return Promise.resolve();}` +
-  `catch(e){return Promise.reject(e);}` +
-  `};}catch(e){}` +
-  `window.alert=function(msg){` +
-  `try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)}});}catch(e){}` +
-  `};` +
-  `})();<\/script>`;
 
 const BRIDGED_EVENTS = [
   'CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT',
@@ -78,7 +62,6 @@ const BRIDGED_EVENTS = [
 interface LiveFrame {
   scriptId: string;
   scriptName: string;
-  contentHash: number;
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
 }
@@ -86,43 +69,24 @@ interface LiveFrame {
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
   private eventUnsubs: Array<() => void> = [];
+  private runGeneration = 0;
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     this.installEventBridge();
   }
 
-  /**
-   * Diff the new script set against currently running frames — JSLR style.
-   * Frames whose script id + content hash hasn't changed are kept alive.
-   * Only added/changed scripts get new frames; only removed scripts get torn down.
-   *
-   * This means switching to the same character in a different chat never
-   * touches the frames at all — no pagehide, button stays, exactly like JSLR's
-   * keyed v-for where the key = script.source + script.id + script.reload_memo.
-   */
   async run(scripts: Script[], chatId: string | null): Promise<void> {
+    const myGen = ++this.runGeneration;
+
+    await this.teardownAll();
+
+    if (myGen !== this.runGeneration) return; // superseded by a newer run() call
+
+    if (scripts.length === 0) return;
+
+    // chatId used for getChatMessages snapshot. Use '' when no chat is open —
+    // scripts that don't call getChatMessages still run fine.
     const effectiveChatId = chatId ?? '';
-
-    // Build a key for each incoming script (id + content hash).
-    // If the key matches a running frame, keep it. Otherwise rebuild.
-    const incoming = new Map<string, Script>();
-    for (const s of scripts) {
-      incoming.set(s.id + '::' + this.hashContent(s.content), s);
-    }
-
-    // Tear down frames that are no longer in the incoming set.
-    const toRemove: LiveFrame[] = [];
-    for (const [key, frame] of this.frames) {
-      if (!incoming.has(key)) toRemove.push(frame);
-    }
-    for (const frame of toRemove) {
-      this.frames.delete(this.frameKey(frame));
-      await this.destroyFrame(frame);
-    }
-
-    // Fetch snapshot once for any new frames that need launching.
-    const needsLaunch = [...incoming.entries()].filter(([key]) => !this.frames.has(key));
-    if (needsLaunch.length === 0) return;
 
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
     if (effectiveChatId) {
@@ -134,8 +98,10 @@ export class ScriptRunner {
       } catch { /* non-fatal */ }
     }
 
-    for (const [key, script] of needsLaunch) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot, key);
+    console.log(`[vishrun:script-runner] launching ${scripts.length} script(s)`, scripts.map(s => s.name));
+
+    for (const script of scripts) {
+      this.launchFrame(script, effectiveChatId, messagesSnapshot);
     }
   }
 
@@ -145,38 +111,10 @@ export class ScriptRunner {
     this.eventUnsubs = [];
   }
 
-  private frameKey(frame: LiveFrame): string {
-    return frame.scriptId + '::' + frame.contentHash;
-  }
-
-  private hashContent(content: string): number {
-    // Simple but fast djb2-style hash — good enough for change detection.
-    let h = 5381;
-    for (let i = 0; i < content.length; i++) {
-      h = ((h << 5) + h) ^ content.charCodeAt(i);
-      h = h >>> 0; // keep uint32
-    }
-    return h;
-  }
-
-  private async destroyFrame(frame: LiveFrame): Promise<void> {
-    try { frame.handle.postMessage({ type: 'vsh_teardown' }); } catch { /* no-op */ }
-    await new Promise<void>(r => setTimeout(r, 60));
-    try { frame.handle.destroy?.(); } catch { /* no-op */ }
-    try { frame.container.remove(); } catch { /* no-op */ }
-  }
-
-  private async teardownAll(): Promise<void> {
-    const all = [...this.frames.values()];
-    this.frames.clear();
-    for (const frame of all) await this.destroyFrame(frame);
-  }
-
   private launchFrame(
     script: Script,
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
-    frameKey: string,
   ): void {
     try {
       const shim = thHelpersShim({
@@ -226,9 +164,6 @@ export class ScriptRunner {
       container.appendChild(handle.element);
       document.body.appendChild(container);
 
-      // Route clipboard / alert messages from the frame through the same
-      // host-side handlers that widget iframes use — this is what makes
-      // quill.js's pushToSillyTavern → /sys path work in character scripts.
       handle.onMessage((raw: unknown) => {
         const p = raw as { kind?: string; payload?: unknown } | null;
         if (!p) return;
@@ -239,8 +174,7 @@ export class ScriptRunner {
         }
       });
 
-      const contentHash = this.hashContent(script.content);
-      this.frames.set(frameKey, { scriptId: script.id, scriptName: script.name, contentHash, handle, container });
+      this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, handle, container });
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error('[vishrun:script-runner] failed to launch:', script.name, err);
@@ -250,19 +184,10 @@ export class ScriptRunner {
   private async teardownAll(): Promise<void> {
     if (this.frames.size === 0) return;
     console.log(`[vishrun:script-runner] tearing down ${this.frames.size} script frame(s)`);
-
-    // Step 1: signal each frame to clean up its own DOM artifacts.
-    // The vsh_teardown handler in EVENT_BRIDGE_SHIM dispatches a synthetic
-    // pagehide so scripts like quill.js run triggerNuke() and remove buttons
-    // they added to the parent document — before we destroy the frames.
     for (const frame of this.frames.values()) {
       try { frame.handle.postMessage({ type: 'vsh_teardown' }); } catch { /* no-op */ }
     }
-
-    // Step 2: give frames ~60ms to process the message and run their cleanup.
     await new Promise<void>(r => setTimeout(r, 60));
-
-    // Step 3: now actually remove the frames.
     for (const frame of this.frames.values()) {
       try { frame.handle.destroy?.(); } catch { /* no-op */ }
       try { frame.container.remove(); } catch { /* no-op */ }
