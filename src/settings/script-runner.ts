@@ -111,7 +111,7 @@ export class ScriptRunner {
   /** Like run() but only tears down character-scoped frames, leaving global/preset alive. */
   async runCharacterOnly(scripts: Script[], chatId: string | null): Promise<void> {
     for (const [id, frame] of this.frames) {
-      const scope = frame.script?.scope;
+      const scope = frame.scope;
       if (scope === 'global' || scope === 'preset') continue;
       try { frame.handle.destroy?.(); } catch { /* no-op */ }
       try { frame.container.remove(); } catch { /* no-op */ }
