@@ -250,6 +250,89 @@ const CSS = `
   gap: 4px;
   background: var(--lumiverse-fill);
 }
+/* Search bar */
+.vsh-search-bar {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  margin-bottom: 10px;
+}
+.vsh-search-input {
+  flex: 1;
+  padding: 5px 8px;
+  background: var(--lumiverse-fill);
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  color: var(--lumiverse-text);
+  font-size: 12px;
+  font-family: inherit;
+  transition: border-color var(--lumiverse-transition-fast);
+}
+.vsh-search-input:focus { outline: none; border-color: var(--lumiverse-accent); }
+.vsh-search-input::placeholder { color: var(--lumiverse-text-dim); }
+/* Section header controls */
+.vsh-section-controls {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+/* Section toggle */
+.vsh-section-toggle {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 10px;
+  color: var(--lumiverse-text-muted);
+  cursor: pointer;
+  user-select: none;
+  padding: 2px 6px;
+  border: 1px solid var(--lumiverse-border);
+  border-radius: var(--lumiverse-radius);
+  transition: var(--lumiverse-transition-fast);
+}
+.vsh-section-toggle:hover { border-color: var(--lumiverse-accent); color: var(--lumiverse-accent); }
+.vsh-section-toggle.active { border-color: var(--lumiverse-accent); color: var(--lumiverse-accent); background: color-mix(in srgb, var(--lumiverse-accent) 10%, transparent); }
+/* Section disabled state */
+.vsh-section.vsh-section-disabled .vsh-script-list { opacity: 0.4; pointer-events: none; }
+/* Editor tabs */
+.vsh-editor-tabs {
+  display: flex;
+  gap: 2px;
+  border-bottom: 1px solid var(--lumiverse-border);
+  margin-bottom: 8px;
+}
+.vsh-editor-tab {
+  padding: 4px 10px;
+  font-size: 10px;
+  font-family: inherit;
+  background: transparent;
+  border: none;
+  border-bottom: 2px solid transparent;
+  color: var(--lumiverse-text-muted);
+  cursor: pointer;
+  transition: var(--lumiverse-transition-fast);
+  margin-bottom: -1px;
+}
+.vsh-editor-tab:hover { color: var(--lumiverse-text); }
+.vsh-editor-tab.vsh-tab-active { color: var(--lumiverse-accent); border-bottom-color: var(--lumiverse-accent); }
+.vsh-editor-tabpanel { display: flex; flex-direction: column; gap: 8px; }
+.vsh-editor-tabpanel[hidden] { display: none; }
+/* export_with row */
+.vsh-checkbox-row {
+  display: flex;
+  gap: 14px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.vsh-checkbox-label {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--lumiverse-text-muted);
+  cursor: pointer;
+  user-select: none;
+}
 `;
 
 // ── Types ────────────────────────────────────────────────────────────────────
@@ -285,6 +368,13 @@ export function createScriptsPanel(
   let currentPresetId: string | null = null;
   let currentPresetName: string | null = null;
   const saveTimers = new Map<Target, ReturnType<typeof setTimeout>>();
+  const LS_KEY = (t: Target) => `vsh_section_enabled_${t}`;
+  const sectionEnabled: Record<Target, boolean> = {
+    global:    localStorage.getItem(LS_KEY('global'))    !== 'false',
+    character: localStorage.getItem(LS_KEY('character')) !== 'false',
+    preset:    localStorage.getItem(LS_KEY('preset'))    !== 'false',
+  };
+  let searchFilter = '';
 
   // ── Root container (direct child of the host card) ─────────────────
   const container = document.createElement('div');
@@ -310,21 +400,79 @@ export function createScriptsPanel(
   const panel = document.createElement('div');
   panel.className = 'vsh-scripts-panel';
 
-  const globalSec = makeSection('Global Scripts', '🌐 Available in every chat');
-  const charSec = makeSection('Character Scripts', getCharSubtitle());
-  const presetSec = makeSection('Preset Scripts', getPresetSubtitle());
+  const globalSec = makeSection('Global Scripts', '🌐 Available in every chat', 'global');
+  const charSec = makeSection('Character Scripts', getCharSubtitle(), 'character');
+  const presetSec = makeSection('Preset Scripts', getPresetSubtitle(), 'preset');
 
   globalSec.addBtn.addEventListener('click', () => addScript('global'));
+  globalSec.addFolderBtn.addEventListener('click', () => addFolder('global'));
   charSec.addBtn.addEventListener('click', () => addScript('character'));
+  charSec.addFolderBtn.addEventListener('click', () => addFolder('character'));
   presetSec.addBtn.addEventListener('click', () => addScript('preset'));
+  presetSec.addFolderBtn.addEventListener('click', () => addFolder('preset'));
 
   panel.append(globalSec.el, charSec.el, presetSec.el);
-  container.append(panelHeader, panel);
+
+  // Search bar
+  const searchBar = document.createElement('div');
+  searchBar.className = 'vsh-search-bar';
+
+  const searchInput = document.createElement('input');
+  searchInput.type = 'text';
+  searchInput.className = 'vsh-search-input';
+  searchInput.placeholder = 'Search scripts...';
+  searchInput.addEventListener('input', () => {
+    searchFilter = searchInput.value.trim().toLowerCase();
+    renderGlobal(); renderChar(); renderPreset();
+  });
+
+  const importBtn = document.createElement('button');
+  importBtn.className = 'vsh-add-btn';
+  importBtn.textContent = '⬆ Import';
+  importBtn.title = 'Import scripts from a JSLR-format JSON file';
+  importBtn.addEventListener('click', () => {
+    const fileInput = document.createElement('input');
+    fileInput.type = 'file';
+    fileInput.accept = '.json';
+    fileInput.addEventListener('change', async () => {
+      const file = fileInput.files?.[0];
+      if (!file) return;
+      try {
+        const text = await file.text();
+        const parsed = JSON.parse(text);
+        const trees: ScriptTree[] = normalizeScriptTrees(
+          Array.isArray(parsed) ? parsed : (parsed.scripts ?? [])
+        );
+        // ID conflict resolution — matching JSLR's useResolveIdConflict
+        const allIds = new Set([
+          ...globalScripts, ...charScripts, ...presetScripts,
+        ].map(t => t.id));
+        const deduped = trees.map(tree => {
+          if (allIds.has(tree.id)) {
+            return { ...tree, id: crypto.randomUUID() };
+          }
+          return tree;
+        });
+        // Default target: global
+        const target: Target = 'global';
+        getList(target).push(...deduped);
+        saveTarget(target);
+        refreshTarget(target);
+      } catch (e) {
+        console.error('[vishrun] import failed:', e);
+      }
+    });
+    fileInput.click();
+  });
+
+  searchBar.append(searchInput, importBtn);
+  container.append(panelHeader, searchBar, panel);
 
   // ── Section factory ────────────────────────────────────────────────
-  function makeSection(title: string, subtitle: string) {
+  function makeSection(title: string, subtitle: string, target: Target) {
     const el = document.createElement('div');
     el.className = 'vsh-section';
+    if (!sectionEnabled[target]) el.classList.add('vsh-section-disabled');
 
     const header = document.createElement('div');
     header.className = 'vsh-section-header';
@@ -333,11 +481,33 @@ export function createScriptsPanel(
     titleEl.className = 'vsh-section-title';
     titleEl.textContent = title;
 
+    const controls = document.createElement('div');
+    controls.className = 'vsh-section-controls';
+
+    // Section enable/disable toggle
+    const toggleBtn = document.createElement('button');
+    toggleBtn.className = 'vsh-section-toggle' + (sectionEnabled[target] ? ' active' : '');
+    toggleBtn.textContent = sectionEnabled[target] ? '● On' : '○ Off';
+    toggleBtn.title = 'Enable / disable this entire section';
+    toggleBtn.addEventListener('click', () => {
+      sectionEnabled[target] = !sectionEnabled[target];
+      localStorage.setItem(LS_KEY(target), String(sectionEnabled[target]));
+      toggleBtn.textContent = sectionEnabled[target] ? '● On' : '○ Off';
+      toggleBtn.classList.toggle('active', sectionEnabled[target]);
+      el.classList.toggle('vsh-section-disabled', !sectionEnabled[target]);
+      onScriptsSaved?.();
+    });
+
+    const addFolderBtn = document.createElement('button');
+    addFolderBtn.className = 'vsh-add-btn';
+    addFolderBtn.textContent = '+ Folder';
+
     const addBtn = document.createElement('button');
     addBtn.className = 'vsh-add-btn';
-    addBtn.textContent = '+ Add Script';
+    addBtn.textContent = '+ Script';
 
-    header.append(titleEl, addBtn);
+    controls.append(toggleBtn, addFolderBtn, addBtn);
+    header.append(titleEl, controls);
 
     const subEl = document.createElement('p');
     subEl.className = 'vsh-section-sub';
@@ -347,7 +517,7 @@ export function createScriptsPanel(
     list.className = 'vsh-script-list';
 
     el.append(header, subEl, list);
-    return { el, list, subEl, addBtn };
+    return { el, list, subEl, addBtn, addFolderBtn };
   }
 
   // ── Subtitle helpers ───────────────────────────────────────────────
@@ -365,16 +535,27 @@ export function createScriptsPanel(
   }
 
   // ── Render ─────────────────────────────────────────────────────────
+  function matchesSearch(name: string): boolean {
+    return !searchFilter || name.toLowerCase().includes(searchFilter);
+  }
+
   function renderList(listEl: HTMLElement, scripts: ScriptTree[], target: Target) {
     listEl.innerHTML = '';
-    if (scripts.length === 0) {
+    const visible = searchFilter
+      ? scripts.filter(t =>
+          t.type === 'folder'
+            ? matchesSearch(t.name) || t.scripts.some(s => matchesSearch(s.name))
+            : matchesSearch(t.name)
+        )
+      : scripts;
+    if (visible.length === 0) {
       const empty = document.createElement('div');
       empty.className = 'vsh-empty';
-      empty.textContent = 'No scripts yet. Click "+ Add Script" to create one.';
+      empty.textContent = 'No scripts yet. Click "+ Script" to create one.';
       listEl.appendChild(empty);
       return;
     }
-    for (const tree of scripts) {
+    for (const tree of visible) {
       listEl.appendChild(
         isFolder(tree)
           ? buildFolderItem(tree, target)
@@ -469,6 +650,41 @@ export function createScriptsPanel(
     const el = document.createElement('div');
     el.className = 'vsh-editor';
 
+    // Tab bar
+    const tabBar = document.createElement('div');
+    tabBar.className = 'vsh-editor-tabs';
+    const tabCode = document.createElement('button');
+    tabCode.className = 'vsh-editor-tab vsh-tab-active';
+    tabCode.textContent = 'Code';
+    const tabData = document.createElement('button');
+    tabData.className = 'vsh-editor-tab';
+    tabData.textContent = 'Data';
+    const tabSettings = document.createElement('button');
+    tabSettings.className = 'vsh-editor-tab';
+    tabSettings.textContent = 'Settings';
+    tabBar.append(tabCode, tabData, tabSettings);
+
+    // Tab panels
+    const panelCode = document.createElement('div');
+    panelCode.className = 'vsh-editor-tabpanel';
+    const panelData = document.createElement('div');
+    panelData.className = 'vsh-editor-tabpanel';
+    panelData.hidden = true;
+    const panelSettings = document.createElement('div');
+    panelSettings.className = 'vsh-editor-tabpanel';
+    panelSettings.hidden = true;
+
+    const switchTab = (active: HTMLButtonElement, panel: HTMLElement) => {
+      [tabCode, tabData, tabSettings].forEach(t => t.classList.remove('vsh-tab-active'));
+      [panelCode, panelData, panelSettings].forEach(p => { p.hidden = true; });
+      active.classList.add('vsh-tab-active');
+      panel.hidden = false;
+    };
+    tabCode.addEventListener('click', () => switchTab(tabCode, panelCode));
+    tabData.addEventListener('click', () => switchTab(tabData, panelData));
+    tabSettings.addEventListener('click', () => switchTab(tabSettings, panelSettings));
+
+    // ── Code tab ──────────────────────────────────────────────────
     const nameField = makeField('Name');
     const nameInput = document.createElement('input');
     nameInput.type = 'text';
@@ -493,8 +709,30 @@ export function createScriptsPanel(
       debouncedSave(target);
     });
     contentField.appendChild(contentArea);
+    panelCode.append(nameField, contentField);
 
-    const infoField = makeField('Description (optional)');
+    // ── Data tab ──────────────────────────────────────────────────
+    const dataField = makeField('script.data (JSON)');
+    const dataArea = document.createElement('textarea');
+    dataArea.className = 'vsh-textarea';
+    dataArea.style.fontFamily = 'monospace';
+    dataArea.style.minHeight = '100px';
+    try { dataArea.value = JSON.stringify(script.data, null, 2); } catch { dataArea.value = '{}'; }
+    dataArea.placeholder = '{}';
+    dataArea.addEventListener('input', () => {
+      try {
+        script.data = JSON.parse(dataArea.value);
+        dataArea.style.borderColor = '';
+        debouncedSave(target);
+      } catch {
+        dataArea.style.borderColor = '#c0392b';
+      }
+    });
+    dataField.appendChild(dataArea);
+    panelData.append(dataField);
+
+    // ── Settings tab ──────────────────────────────────────────────
+    const infoField = makeField('Description');
     const infoInput = document.createElement('input');
     infoInput.type = 'text';
     infoInput.className = 'vsh-input';
@@ -506,7 +744,28 @@ export function createScriptsPanel(
     });
     infoField.appendChild(infoInput);
 
-    el.append(nameField, contentField, infoField);
+    const exportField = makeField('Export with');
+    const exportRow = document.createElement('div');
+    exportRow.className = 'vsh-checkbox-row';
+
+    const mkCheck = (label: string, checked: boolean, onChange: (v: boolean) => void) => {
+      const lbl = document.createElement('label');
+      lbl.className = 'vsh-checkbox-label';
+      const cb = document.createElement('input');
+      cb.type = 'checkbox';
+      cb.checked = checked;
+      cb.addEventListener('change', () => { onChange(cb.checked); debouncedSave(target); });
+      lbl.append(cb, document.createTextNode(label));
+      return lbl;
+    };
+    exportRow.append(
+      mkCheck('Data', script.export_with.data,   v => { script.export_with.data   = v; }),
+      mkCheck('Buttons', script.export_with.button, v => { script.export_with.button = v; }),
+    );
+    exportField.appendChild(exportRow);
+    panelSettings.append(infoField, exportField);
+
+    el.append(tabBar, panelCode, panelData, panelSettings);
     return el;
   }
 
@@ -565,6 +824,22 @@ export function createScriptsPanel(
   function addScript(target: Target) {
     if (target === 'character' && !currentCharId) return;
     getList(target).push(makeScript({ name: 'New Script' }));
+    saveTarget(target);
+    refreshTarget(target);
+  }
+
+  function addFolder(target: Target) {
+    if (target === 'character' && !currentCharId) return;
+    const folder: ScriptFolder = {
+      type: 'folder',
+      enabled: true,
+      name: 'New Folder',
+      id: crypto.randomUUID(),
+      icon: 'fa-solid fa-folder',
+      color: '#888888',
+      scripts: [],
+    };
+    getList(target).push(folder);
     saveTarget(target);
     refreshTarget(target);
   }
