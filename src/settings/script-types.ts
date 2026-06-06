@@ -58,7 +58,7 @@ export function isFolder(tree: ScriptTree): tree is ScriptFolder {
 export function makeScript(partial: Partial<Script> = {}): Script {
   return {
     type: 'script',
-    enabled: partial.enabled ?? false,
+    enabled: partial.enabled ?? true,
     name: partial.name ?? 'New Script',
     id: partial.id ?? crypto.randomUUID(),
     content: partial.content ?? '',
