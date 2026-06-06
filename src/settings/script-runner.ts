@@ -48,6 +48,7 @@ const BRIDGED_EVENTS = [
 interface LiveFrame {
   scriptId: string;
   scriptName: string;
+  scope: Script['scope'];
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
 }
@@ -107,7 +108,21 @@ export class ScriptRunner {
     }
   }
 
-  destroy(): void {
+  /** Like run() but only tears down character-scoped frames, leaving global/preset alive. */
+  async runCharacterOnly(scripts: Script[], chatId: string | null): Promise<void> {
+    for (const [id, frame] of this.frames) {
+      const scope = frame.script?.scope;
+      if (scope === 'global' || scope === 'preset') continue;
+      try { frame.handle.destroy?.(); } catch { /* no-op */ }
+      try { frame.container.remove(); } catch { /* no-op */ }
+      this.frames.delete(id);
+    }
+    if (scripts.length > 0) {
+      await this.run(scripts, chatId);
+    }
+  }
+
+    destroy(): void {
     this.teardownAll();
     for (const unsub of this.eventUnsubs) unsub();
     this.eventUnsubs = [];
@@ -165,7 +180,7 @@ export class ScriptRunner {
       container.appendChild(handle.element);
       document.body.appendChild(container);
 
-      this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, handle, container });
+      this.frames.set(script.id, { scriptId: script.id, scriptName: script.name, scope: script.scope, handle, container });
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error('[vishrun:script-runner] failed to launch:', script.name, err);
