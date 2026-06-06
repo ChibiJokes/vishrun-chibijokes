@@ -33,19 +33,14 @@ export function setup(ctx: SpindleFrontendContext) {
   // ── Script runner — executes enabled scripts as hidden sandbox iframes
   const runner = new ScriptRunner(ctx);
 
-  // Called by the panel after any save — reloads runner with updated script list.
+  // Called by the panel after any save. runner.run() will reconcile by content
+  // hash — only scripts whose content changed will restart.
   async function reloadRunner(): Promise<void> {
     const active = ctx.getActiveChat();
     console.log('[vishrun:diag] reloadRunner called, characterId:', active.characterId, 'chatId:', active.chatId);
-    // Global/preset scripts should run even without an active character.
-    // Only bail if there's truly nothing to load (no scripts at all).
     const enabledScripts = await loadEnabledScripts(active.characterId ?? null);
     console.log('[vishrun:diag] reloadRunner enabledScripts count:', enabledScripts.length);
-    if (enabledScripts.length === 0) {
-      console.warn('[vishrun:diag] reloadRunner early-exit: no enabled scripts');
-      return;
-    }
-    await runner.reloadAll(enabledScripts, active.chatId ?? null);
+    await runner.run(enabledScripts, active.chatId ?? null);
   }
 
   // ── Script settings panel (Settings → Extensions) ──────────────────
@@ -69,9 +64,11 @@ export function setup(ctx: SpindleFrontendContext) {
       clearActiveCard();
       lastLoadedCharacterId = null;
       scriptsPanel?.onCharacterChanged(null);
-      // Only tear down character-scoped scripts — global/preset scripts
-      // should survive navigation away from a character.
-      await runner.runCharacterOnly([], null);
+      // Pass an empty list — runner.run() will tear down character frames
+      // (no longer in the incoming list) while leaving globals/presets untouched
+      // since they aren't in the frame map under any characterId key.
+      const enabledScripts = await loadEnabledScripts(null);
+      await runner.run(enabledScripts, null);
       hooks.rescanAll();
       return;
     }
@@ -80,16 +77,14 @@ export function setup(ctx: SpindleFrontendContext) {
       return;
     }
     if (lastLoadedCharacterId === characterId && getActiveCard()?.characterId === characterId) {
-      // Same character, card already cached — skip the REST fetch but still
-      // relaunch script iframes. teardownAll() runs inside runner.run() so
-      // iframes from the previous chat session are always dead by the time we
-      // get here; skipping runner.run() would leave the scripts permanently
-      // gone until a full page reload.
-      console.warn('[vishrun:diag] loadFor: same character, re-using cached card, relaunching runner');
+      // Same character, card already cached — skip the REST fetch.
+      // runner.run() will reconcile by content hash; if nothing changed,
+      // no frames are touched at all (same as JSLR on a chat switch).
+      console.warn('[vishrun:diag] loadFor: same character, re-using cached card');
       hooks.rescanAll();
       const chatId = ctx.getActiveChat().chatId ?? null;
       const enabledScripts = await loadEnabledScripts(characterId);
-      console.log('[vishrun:diag] loadFor(cache-hit) relaunching', enabledScripts.length, 'scripts, chatId:', chatId);
+      console.log('[vishrun:diag] loadFor(cache-hit) reconciling', enabledScripts.length, 'scripts, chatId:', chatId);
       await runner.run(enabledScripts, chatId);
       return;
     }
