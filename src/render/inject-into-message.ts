@@ -36,13 +36,31 @@ type ResolvedMap = Map<string, string>;
 // case (variables are set up front, rarely mutate).
 const resolutionCache = new Map<string, string>();
 
-// Per-message in-flight guard. Prevents concurrent processNode calls for the
-// same message from racing on the same text nodes — specifically the overlap
-// between GENERATION_ENDED → processMessageById and the MutationObserver →
-// scanAllNow paths, which can both fire for the last message simultaneously.
-// The losing call would have its widgets destroyed by the tn.parentNode guard
-// in replacePlaceholderMatches, causing intermittent partial renders.
+// Per-message in-flight guard + pending rescan queue.
+//
+// Problem: GENERATION_ENDED fires processMessageById while Lumiverse's
+// useDisplayPreprocessed is still resolving async. processNode starts and
+// awaits resolveMacrosForMessage (~100-200ms). During that await,
+// useDisplayPreprocessed resolves → React re-renders the message → DOM
+// mutation → MutationObserver fires → scanAllNow tries processNode again →
+// blocked by the in-flight guard → DROPPED.
+//
+// processNode then finishes but its widgets land in stale DOM nodes
+// (React already replaced them), so tn.parentNode !== parent → widgets
+// destroyed. The blocked scanAllNow was the call that had the settled DOM —
+// dropping it means widgets never render.
+//
+// Fix: instead of dropping concurrent calls, stash the latest one. When the
+// current call finishes, fire the pending rescan on the now-settled DOM.
+// This means at most one extra processNode run per message per generation,
+// and it runs after all React async re-renders have committed.
 const inFlightMessages = new Set<string>();
+interface PendingRescan {
+  root: HTMLElement;
+  scripts: CompiledScript[];
+  ctx: SpindleFrontendContext;
+}
+const pendingRescans = new Map<string, PendingRescan>();
 
 // Module-scoped tracker for which messageIds are currently observed in edit
 // mode. Lumiverse emits no event for the edit enter/exit transition (pure
@@ -131,10 +149,15 @@ export async function processNode(
   }
 
   // In-flight guard: if a processNode call is already running for this
-  // message, skip. Prevents the GENERATION_ENDED → processMessageById path
-  // and the MutationObserver → scanAllNow path from running concurrently on
-  // the same message and racing on the same text nodes.
-  if (inFlightMessages.has(messageId)) return 0;
+  // message, stash this call as a pending rescan rather than dropping it.
+  // The current in-flight call may be working on stale DOM nodes (React
+  // re-rendered while it was awaiting macro resolution). The stashed call
+  // will fire after the in-flight call finishes, by which time the DOM has
+  // settled and widgets will land correctly.
+  if (inFlightMessages.has(messageId)) {
+    pendingRescans.set(messageId, { root, scripts, ctx });
+    return 0;
+  }
   inFlightMessages.add(messageId);
 
   // Edit-mode gate. Lumiverse replaces MessageContent with MessageEditArea
@@ -205,6 +228,14 @@ export async function processNode(
     return total;
   } finally {
     inFlightMessages.delete(messageId);
+    // Fire any queued rescan now that the DOM has had time to settle.
+    // Use Promise.resolve() to yield one microtask tick so React can flush
+    // any remaining synchronous state updates before we re-enter.
+    const pending = pendingRescans.get(messageId);
+    if (pending) {
+      pendingRescans.delete(messageId);
+      void Promise.resolve().then(() => processNode(pending.root, pending.scripts, pending.ctx));
+    }
   }
 }
 
