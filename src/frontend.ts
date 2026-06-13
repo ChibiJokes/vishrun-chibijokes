@@ -138,7 +138,12 @@ export function setup(ctx: SpindleFrontendContext) {
     const pass = shouldRescanForChangedFields(p.changedFields);
     console.log('[vishrun:diag] CHAT_CHANGED fired, changedFields:', p.changedFields, '| passes filter:', pass, '| characterId:', p.characterId);
     if (!pass) return;
-    void loadFor(p.characterId ?? ctx.getActiveChat().characterId ?? null);
+    void loadFor(
+      p.characterId ??
+      ctx.getActiveChat().characterId ??
+      getActiveCard()?.characterId ??
+      null
+    );
   });
 
   function handleMessageMutation(eventName: 'MESSAGE_EDITED' | 'MESSAGE_SWIPED', payload: unknown): void {
