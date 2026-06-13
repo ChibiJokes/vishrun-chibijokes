@@ -84,7 +84,15 @@ export class ScriptStorageClient {
       extensions?: Record<string, unknown>;
     } | null;
 
-    const existing = (current?.extensions ?? {}) as Record<string, unknown>;
+    // Hard bail if the read failed. Proceeding with a null/empty extensions
+    // object would cause the PUT to overwrite the character with no regex_scripts
+    // (and no other extension keys), permanently destroying them on disk.
+    if (!current) {
+      console.error('[vishrun] saveCharacter: GET returned null for', characterId, '— aborting write to prevent data loss');
+      throw new Error('saveCharacter: failed to read character before write, aborting to prevent data loss');
+    }
+
+    const existing = (current.extensions ?? {}) as Record<string, unknown>;
     const existingTh = (existing.tavern_helper ?? {}) as Record<string, unknown>;
 
     const merged: Record<string, unknown> = {
