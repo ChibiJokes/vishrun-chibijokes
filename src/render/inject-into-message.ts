@@ -36,6 +36,14 @@ type ResolvedMap = Map<string, string>;
 // case (variables are set up front, rarely mutate).
 const resolutionCache = new Map<string, string>();
 
+// Per-message in-flight guard. Prevents concurrent processNode calls for the
+// same message from racing on the same text nodes — specifically the overlap
+// between GENERATION_ENDED → processMessageById and the MutationObserver →
+// scanAllNow paths, which can both fire for the last message simultaneously.
+// The losing call would have its widgets destroyed by the tn.parentNode guard
+// in replacePlaceholderMatches, causing intermittent partial renders.
+const inFlightMessages = new Set<string>();
+
 // Module-scoped tracker for which messageIds are currently observed in edit
 // mode. Lumiverse emits no event for the edit enter/exit transition (pure
 // React state, see BubbleMessageDefault.tsx:270-293), so we infer transitions
@@ -122,6 +130,13 @@ export async function processNode(
     return 0;
   }
 
+  // In-flight guard: if a processNode call is already running for this
+  // message, skip. Prevents the GENERATION_ENDED → processMessageById path
+  // and the MutationObserver → scanAllNow path from running concurrently on
+  // the same message and racing on the same text nodes.
+  if (inFlightMessages.has(messageId)) return 0;
+  inFlightMessages.add(messageId);
+
   // Edit-mode gate. Lumiverse replaces MessageContent with MessageEditArea
   // (textarea) when editingMessageId === message.id; no event fires for the
   // transition, so we diff the DOM signal against the editing Set every pass.
@@ -143,50 +158,54 @@ export async function processNode(
       console.log('[vishrun:edit-mode] transition', { messageId, phase: 'exit' });
     }
   }
-  if (transition === 'enter') {
-    // Reuse the teardown path the MESSAGE_EDITED rebuild uses. Idempotent
-    // when nothing's registered for this id.
-    destroyAllRegisteredWidgetsForMessage(messageId, 'edit-mode-enter');
-    return 0;
-  }
-  if (transition === 'still') return 0;
-
-  // Global pre-pipeline cleanup: destroy any registered iframes for this
-  // messageId that aren't currently inside the expected MessageContent.
-  // Catches React subtree rebuilds (swipe / edit / regen) that detached
-  // an iframe but didn't unmount the host's sandboxFrames record.
-  const target = findContentRoot(root);
-  cleanupOrphansForMessage(messageId, target);
-
-  // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
-  // widget HTML before any widget is built. Always returns a map; missing
-  // entries → widget renders the raw template (no worse than pre-MVU-lite).
-  const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
-
-  let total = 0;
-  // Widget building is async now (buildWidgetIframe → injectShimsAndSizeReporter
-  // → transformHtmlForTailwind may fetch the Tailwind bundle on first use).
-  // Swallow errors so a single bad render doesn't reject for fire-and-forget
-  // callers (scanAllNow / processMessageById) and so a later scan can retry.
   try {
-    for (const script of scripts) {
-      // placeholder + delimitedCapture run through the post-DOMPurify text scan.
-      // delimitedCaptureMultiLine routes through the linearize-bubble path
-      // (single regex across all text nodes in the bubble). pairedTag scripts
-      // go through registerTagInterceptor (pre-sanitizer) and surface here as
-      // captures via getCapturesForMessage. unknown is skipped.
-      if (!isPlaceholderLikeKind(script.kind)) continue;
-      if (script.kind === 'delimitedCaptureMultiLine') {
-        total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
-      } else {
-        total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
-      }
+    if (transition === 'enter') {
+      // Reuse the teardown path the MESSAGE_EDITED rebuild uses. Idempotent
+      // when nothing's registered for this id.
+      destroyAllRegisteredWidgetsForMessage(messageId, 'edit-mode-enter');
+      return 0;
     }
-    total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-  } catch (err) {
-    console.debug('[vishrun] processNode render error:', err);
+    if (transition === 'still') return 0;
+
+    // Global pre-pipeline cleanup: destroy any registered iframes for this
+    // messageId that aren't currently inside the expected MessageContent.
+    // Catches React subtree rebuilds (swipe / edit / regen) that detached
+    // an iframe but didn't unmount the host's sandboxFrames record.
+    const target = findContentRoot(root);
+    cleanupOrphansForMessage(messageId, target);
+
+    // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
+    // widget HTML before any widget is built. Always returns a map; missing
+    // entries → widget renders the raw template (no worse than pre-MVU-lite).
+    const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
+
+    let total = 0;
+    // Widget building is async now (buildWidgetIframe → injectShimsAndSizeReporter
+    // → transformHtmlForTailwind may fetch the Tailwind bundle on first use).
+    // Swallow errors so a single bad render doesn't reject for fire-and-forget
+    // callers (scanAllNow / processMessageById) and so a later scan can retry.
+    try {
+      for (const script of scripts) {
+        // placeholder + delimitedCapture run through the post-DOMPurify text scan.
+        // delimitedCaptureMultiLine routes through the linearize-bubble path
+        // (single regex across all text nodes in the bubble). pairedTag scripts
+        // go through registerTagInterceptor (pre-sanitizer) and surface here as
+        // captures via getCapturesForMessage. unknown is skipped.
+        if (!isPlaceholderLikeKind(script.kind)) continue;
+        if (script.kind === 'delimitedCaptureMultiLine') {
+          total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
+        } else {
+          total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
+        }
+      }
+      total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
+    } catch (err) {
+      console.debug('[vishrun] processNode render error:', err);
+    }
+    return total;
+  } finally {
+    inFlightMessages.delete(messageId);
   }
-  return total;
 }
 
 // ─── Macro resolution ──────────────────────────────────────────────────
