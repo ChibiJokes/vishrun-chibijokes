@@ -30,6 +30,39 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
 
+  // ── Generation relay bridge ──────────────────────────────────────────
+  // Exposes window.__vishrunGenerate for injected scripts (e.g. Quill)
+  // that need LLM access on hosted Lumiverse (where /generate/raw is
+  // localhost-only). Requests go: window → ctx.sendToBackend() → worker
+  // → api.generate.raw() over IPC → result back here → resolve promise.
+  const pendingGenerates = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+
+  const unsubBackendMsg = ctx.onBackendMessage((msg: unknown) => {
+    if (!msg || typeof msg !== 'object') return;
+    const m = msg as { type?: string; requestId?: string; result?: unknown; error?: string };
+    if (m.type === 'vsh_generate_result' && m.requestId) {
+      pendingGenerates.get(m.requestId)?.resolve(m.result);
+      pendingGenerates.delete(m.requestId);
+    } else if (m.type === 'vsh_generate_error' && m.requestId) {
+      pendingGenerates.get(m.requestId)?.reject(new Error(m.error || 'Generation failed'));
+      pendingGenerates.delete(m.requestId);
+    }
+  });
+
+  (window as any).__vishrunGenerate = (opts: unknown) => {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      pendingGenerates.set(requestId, { resolve, reject });
+      ctx.sendToBackend({ type: 'vsh_generate', requestId, ...(opts as object) });
+      setTimeout(() => {
+        if (pendingGenerates.has(requestId)) {
+          pendingGenerates.delete(requestId);
+          reject(new Error('Generation timed out'));
+        }
+      }, 120000);
+    });
+  };
+
   // ── Script runner — executes enabled scripts as hidden sandbox iframes
   const runner = new ScriptRunner(ctx);
 
@@ -207,6 +240,8 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubMessageEdited();
     unsubMvuDisplayStrip();
     unsubStatusBarInject();
+    unsubBackendMsg();
+    delete (window as any).__vishrunGenerate;
     hooks.dispose();
     ctx.dom.cleanup();
     clearActiveCard();
