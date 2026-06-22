@@ -11,10 +11,6 @@ import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
 // ─── /inject infrastructure ──────────────────────────────────────────────────
-// Inject specs are stored in api.storage (extension-scoped file storage) rather
-// than api.variables.chat. This avoids a race where generate.service.ts writes
-// the macro environment's snapshot of chat_variables back to the DB after the
-// interceptor has already updated them, clobbering the turn decrement.
 
 interface InjectSpec {
   id: string;
@@ -45,7 +41,7 @@ async function writeInjects(chatId: string, injects: InjectSpec[]): Promise<void
       await api.storage.setJson(injectPath(chatId), injects);
     }
   } catch (e) {
-    // best-effort; don't crash the processor
+    // best-effort
   }
 }
 
@@ -105,10 +101,7 @@ export async function processMessageContent(
         try {
           await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
         } catch (err) {
-          varsLog.warn(
-            `setvar failed for "${kind}::${key}":`,
-            err instanceof Error ? err.message : String(err),
-          );
+          varsLog.warn(`setvar failed for "${kind}::${key}":`, err instanceof Error ? err.message : String(err));
         }
       }
       content = parsed.strippedContent;
@@ -158,40 +151,38 @@ export async function processMessageContent(
 // ─── Prompt interceptor ───────────────────────────────────────────────────────
 
 function installInjectInterceptor(): void {
-  // Use `any` for the payload to defensively capture the entire generation state object
-  api.registerInterceptor(async (payload: any, context: unknown): Promise<InterceptorResultDTO | any> => {
+  // We type the return as `any` because we strictly want to avoid returning 
+  // an object that overwrites the backend's generation state variables.
+  api.registerInterceptor(async (messages: LlmMessageDTO[], context: unknown): Promise<any> => {
     const ctx = context as { chatId?: string };
     
-    // Safely extract messages whether Spindle passes an array directly or a payload object
-    const isArray = Array.isArray(payload);
-    const messagesArray: LlmMessageDTO[] = isArray ? payload : (payload.messages || []);
-
-    if (!ctx.chatId) return payload;
+    // FIX: Exit silently and do not return anything if there's no chat or no injects.
+    // This stops the engine from replacing your variable state with an empty object.
+    if (!ctx.chatId) return;
 
     const injects = await readInjects(ctx.chatId);
-    if (injects.length === 0) return payload; // Return unmodified payload if no injects
+    if (injects.length === 0) return;
 
-    const result: LlmMessageDTO[] = [...messagesArray];
     const surviving: InjectSpec[] = [];
-    const breakdown: Array<{ messageIndex: number; name: string }> = isArray ? [] : (payload.breakdown || []);
 
+    // FIX: Mutate the array IN-PLACE rather than creating a new array.
     for (const spec of injects) {
       const msg: LlmMessageDTO = { role: spec.role, content: spec.content };
       let insertAt: number;
 
       if (spec.position === 'before') {
-        const first = result.findIndex((m: any) => m.__isChatHistory === true);
+        const first = messages.findIndex((m: any) => m.__isChatHistory === true);
         insertAt = first >= 0 ? first : 0;
       } else if (spec.position === 'after') {
-        insertAt = result.length;
+        insertAt = messages.length;
       } else {
         if (spec.depth === 0) {
-          insertAt = result.length;
+          insertAt = messages.length;
         } else {
           let count = 0;
-          insertAt = result.length;
-          for (let i = result.length - 1; i >= 0; i--) {
-            if (result[i].__isChatHistory === true) {
+          insertAt = messages.length;
+          for (let i = messages.length - 1; i >= 0; i--) {
+            if ((messages[i] as any).__isChatHistory === true) {
               count++;
               if (count === spec.depth) { insertAt = i; break; }
             }
@@ -199,8 +190,7 @@ function installInjectInterceptor(): void {
         }
       }
 
-      result.splice(insertAt, 0, msg);
-      breakdown.push({ messageIndex: insertAt, name: 'Inject: ' + spec.id });
+      messages.splice(insertAt, 0, msg);
 
       if (spec.turns === 0) {
         surviving.push(spec);
@@ -213,12 +203,7 @@ function installInjectInterceptor(): void {
       await writeInjects(ctx.chatId, surviving);
     }
 
-    // CRITICAL FIX: If payload is an object, spread it to preserve all variables and system state!
-    if (isArray) {
-      return { messages: result, breakdown };
-    } else {
-      return { ...payload, messages: result, breakdown };
-    }
+    return;
   });
 }
 
