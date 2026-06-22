@@ -1,6 +1,8 @@
 import type {
   MessageContentProcessorCtxDTO,
   MessageContentProcessorResultDTO,
+  LlmMessageDTO,
+  InterceptorResultDTO,
 } from 'lumiverse-spindle-types';
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
@@ -33,7 +35,7 @@ function parseInjectArgs(raw: string): { args: Record<string, string>; content: 
   let remaining = raw.trim();
   const ARG_RE = /^([a-zA-Z_]\w*)=(\S+)\s*/;
   let m: RegExpExecArray | null;
-  while ((m = ARG_RE.exec(remaining))) {
+  while ((m = ARG_RE.exec(remaining)) !== null) {
     args[m[1].toLowerCase()] = m[2];
     remaining = remaining.slice(m[0].length);
   }
@@ -44,9 +46,9 @@ async function readInjects(chatId: string): Promise<InjectSpec[]> {
   try {
     const raw = await api.variables.chat.get(chatId, INJECT_STORAGE_KEY);
     if (!raw) return [];
-    const parsed = JSON.parse(raw);
+    const parsed: unknown = JSON.parse(raw);
     return Array.isArray(parsed) ? (parsed as InjectSpec[]) : [];
-  } catch {
+  } catch (e) {
     return [];
   }
 }
@@ -58,7 +60,7 @@ async function writeInjects(chatId: string, injects: InjectSpec[]): Promise<void
     } else {
       await api.variables.chat.set(chatId, INJECT_STORAGE_KEY, JSON.stringify(injects));
     }
-  } catch {
+  } catch (e) {
     // best-effort; don't crash the message processor
   }
 }
@@ -129,16 +131,16 @@ export async function processMessageContent(
     content = parsed.strippedContent;
   }
 
-  // Handle /inject — store an injection spec in chat_variables for the interceptor to pick up.
+  // Handle /inject — store an injection spec in chat_variables for the interceptor.
   // Syntax: /inject [id=<id>] [depth=<n>] [role=system|user|assistant] [position=chat|before|after] [turns=<n>] <content>
   if (INJECT_RE.test(content)) {
-    const INJECT_CMD_RE = /^[ \t]*\/inject(?:\s+(.*?))?[ \t]*$/gim;
-    let injectMatch: RegExpExecArray | null;
+    const INJECT_CMD_RE = /^\/inject(?:\s+(.*?))?\s*$/gim;
     const injects = await readInjects(ctx.chatId);
-    while ((injectMatch = INJECT_CMD_RE.exec(content)) !== null) {
-      const { args, content: body } = parseInjectArgs(injectMatch[1] ?? '');
+    let im: RegExpExecArray | null;
+    while ((im = INJECT_CMD_RE.exec(content)) !== null) {
+      const { args, content: body } = parseInjectArgs(im[1] ?? '');
       if (!body.trim()) continue;
-      const id = args.id ?? crypto.randomUUID().slice(0, 8);
+      const id = args.id ?? Math.random().toString(36).slice(2, 10);
       const spec: InjectSpec = {
         id,
         content: body,
@@ -147,25 +149,25 @@ export async function processMessageContent(
         position: (args.position === 'before' || args.position === 'after') ? args.position : 'chat',
         turns: Math.max(0, parseInt(args.turns ?? '0', 10) || 0),
       };
-      const existing = injects.findIndex(e => e.id === id);
+      const existing = injects.findIndex((e) => e.id === id);
       if (existing >= 0) { injects[existing] = spec; } else { injects.push(spec); }
     }
     await writeInjects(ctx.chatId, injects);
-    content = content.replace(/^[ \t]*\/inject(?:\s+.*?)?[ \t]*$/gim, '').replace(/\n{3,}/g, '\n\n');
+    content = content.replace(/^\/inject(?:\s+.*?)?\s*$/gim, '').replace(/\n{3,}/g, '\n\n');
   }
 
   // Handle /flushinject — remove one or all injections.
-  // Syntax: /flushinject [id=<id>]   (no id = flush all)
+  // Syntax: /flushinject [id=<id>]   (omit id to flush all)
   if (FLUSHINJECT_RE.test(content)) {
-    const FLUSHINJECT_CMD_RE = /^[ \t]*\/flushinject(?:\s+id=(\S+))?[ \t]*$/gim;
-    let flushMatch: RegExpExecArray | null;
+    const FLUSH_CMD_RE = /^\/flushinject(?:\s+id=(\S+))?\s*$/gim;
     let injects = await readInjects(ctx.chatId);
-    while ((flushMatch = FLUSHINJECT_CMD_RE.exec(content)) !== null) {
-      const id = flushMatch[1];
-      injects = id ? injects.filter(e => e.id !== id) : [];
+    let fm: RegExpExecArray | null;
+    while ((fm = FLUSH_CMD_RE.exec(content)) !== null) {
+      const id = fm[1];
+      injects = id ? injects.filter((e) => e.id !== id) : [];
     }
     await writeInjects(ctx.chatId, injects);
-    content = content.replace(/^[ \t]*\/flushinject(?:\s+\S+)?[ \t]*$/gim, '').replace(/\n{3,}/g, '\n\n');
+    content = content.replace(/^\/flushinject(?:\s+\S+)?\s*$/gim, '').replace(/\n{3,}/g, '\n\n');
   }
 
   if (content === ctx.content) return;
@@ -174,40 +176,40 @@ export async function processMessageContent(
 }
 
 // ─── Prompt interceptor ───────────────────────────────────────────────────────
-//
 // Reads lumi_injects from chat_variables on every generation and splices each
-// active spec into the assembled message array at the requested position/depth.
-// Turn-counted specs are decremented and removed when they reach zero.
+// active entry into the assembled message array at the requested position/depth.
+// Turn-counted entries are decremented and removed when they reach zero.
 
 function installInjectInterceptor(): void {
-  api.registerInterceptor(async (messages, context) => {
-    const chatId = (context as { chatId?: string }).chatId;
-    if (!chatId) return messages;
+  api.registerInterceptor(async (messages: LlmMessageDTO[], context: unknown): Promise<InterceptorResultDTO> => {
+    const ctx = context as { chatId?: string };
+    if (!ctx.chatId) return { messages };
 
-    const injects = await readInjects(chatId);
-    if (injects.length === 0) return messages;
+    const injects = await readInjects(ctx.chatId);
+    if (injects.length === 0) return { messages };
 
-    const result = [...messages];
+    const result: LlmMessageDTO[] = [...messages];
     const surviving: InjectSpec[] = [];
-    const breakdown: { messageIndex: number; name: string }[] = [];
+    const breakdown: Array<{ messageIndex: number; name: string }> = [];
 
     for (const spec of injects) {
-      const msg = { role: spec.role, content: spec.content } as (typeof messages)[number];
+      const msg: LlmMessageDTO = { role: spec.role, content: spec.content };
       let insertAt: number;
 
       if (spec.position === 'before') {
-        const first = result.findIndex(m => m.__isChatHistory);
+        const first = result.findIndex((m) => m.__isChatHistory === true);
         insertAt = first >= 0 ? first : 0;
       } else if (spec.position === 'after') {
         insertAt = result.length;
       } else {
+        // 'chat': depth-based within chat history (depth 0 = append)
         if (spec.depth === 0) {
           insertAt = result.length;
         } else {
           let count = 0;
           insertAt = result.length;
           for (let i = result.length - 1; i >= 0; i--) {
-            if (result[i].__isChatHistory) {
+            if (result[i].__isChatHistory === true) {
               count++;
               if (count === spec.depth) { insertAt = i; break; }
             }
@@ -216,17 +218,18 @@ function installInjectInterceptor(): void {
       }
 
       result.splice(insertAt, 0, msg);
-      breakdown.push({ messageIndex: insertAt, name: `Inject: ${spec.id}` });
+      breakdown.push({ messageIndex: insertAt, name: 'Inject: ' + spec.id });
 
       if (spec.turns === 0) {
         surviving.push(spec);
       } else if (spec.turns > 1) {
         surviving.push({ ...spec, turns: spec.turns - 1 });
       }
+      // turns === 1: this was the last use, don't push back
     }
 
     if (surviving.length !== injects.length) {
-      await writeInjects(chatId, surviving);
+      await writeInjects(ctx.chatId, surviving);
     }
 
     return { messages: result, breakdown };
@@ -236,14 +239,4 @@ function installInjectInterceptor(): void {
 export function installMessageContentProcessor(): void {
   api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
   installInjectInterceptor();
-}
-  }
-
-  if (content === ctx.content) return;
-  const stripped = content.trim();
-  return { content: stripped.length > 0 ? stripped : EMPTY_REPLACEMENT };
-}
-
-export function installMessageContentProcessor(): void {
-  api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
 }
