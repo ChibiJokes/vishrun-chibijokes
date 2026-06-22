@@ -54,7 +54,27 @@ export function installGenerateRelayHandler(): void {
     };
     if (connection_id) input.connection_id = connection_id;
     if (parameters) input.parameters = parameters;
-    if (tools) { input.tools = tools; input.tool_choice = tool_choice; }
+    
+    // Map OpenAI format -> Lumiverse ToolDefinition format
+    if (tools && Array.isArray(tools)) {
+      input.tools = tools.map((t: any) => {
+        if (t?.type === 'function' && t?.function) {
+          return {
+            name: t.function.name,
+            description: t.function.description,
+            parameters: t.function.parameters,
+            ...(t.function.strict !== undefined ? { strict: t.function.strict } : {}),
+          };
+        }
+        return t; // Fallback
+      });
+    }
+    
+    // Lumiverse expects tool_choice inside parameters
+    if (tool_choice) {
+      if (!input.parameters) input.parameters = {};
+      (input.parameters as Record<string, unknown>).tool_choice = tool_choice;
+    }
 
     api.generate.raw(input).then(
       (result) => {
