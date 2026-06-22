@@ -27,7 +27,7 @@ import { dispatchSlashViaBackend } from '../core/dispatch-slash';
 // pure temporal correlation. On dispatch failure we remove the entry so the
 // user still sees alerts unrelated to a successful intercept.
 
-const DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys)\b/i;
+const DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys|inject|flushinject)\b/i;
 const DISPATCH_CORRELATION_WINDOW_MS = 1000;
 const DISPATCH_CLEANUP_INTERVAL_MS = 2000;
 
