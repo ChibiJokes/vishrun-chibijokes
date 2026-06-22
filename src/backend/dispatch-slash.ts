@@ -59,8 +59,8 @@ interface InjectSpec {
   turns: number;
 }
 
-function injectKey(): string {
-  return 'lumi_injects';
+function injectPath(chatId: string): string {
+  return `injects/${chatId}.json`;
 }
 
 function parseInjectArgs(raw: string): { args: Record<string, string>; content: string } {
@@ -77,10 +77,7 @@ function parseInjectArgs(raw: string): { args: Record<string, string>; content: 
 
 async function readInjectsFromStorage(chatId: string): Promise<InjectSpec[]> {
   try {
-    const raw = await api.variables.chat.get(chatId, injectKey());
-    if (!raw) return [];
-    const parsed: unknown = JSON.parse(raw);
-    return Array.isArray(parsed) ? (parsed as InjectSpec[]) : [];
+    return await api.storage.getJson<InjectSpec[]>(injectPath(chatId), { fallback: [] });
   } catch (e) {
     return [];
   }
@@ -89,9 +86,9 @@ async function readInjectsFromStorage(chatId: string): Promise<InjectSpec[]> {
 async function writeInjectsToStorage(chatId: string, injects: InjectSpec[]): Promise<void> {
   try {
     if (injects.length === 0) {
-      await api.variables.chat.delete(chatId, injectKey());
+      await api.storage.delete(injectPath(chatId));
     } else {
-      await api.variables.chat.set(chatId, injectKey(), JSON.stringify(injects));
+      await api.storage.setJson(injectPath(chatId), injects);
     }
   } catch (e) {
     // best-effort
@@ -187,4 +184,3 @@ export function installDispatchSlashHandler(): void {
     })();
   });
 }
-
