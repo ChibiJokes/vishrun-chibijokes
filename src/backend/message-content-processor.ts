@@ -21,10 +21,7 @@ interface InjectSpec {
   content: string;
   role: 'system' | 'user' | 'assistant';
   depth: number;
-  /** 'chat' = depth-based within chat history; 'before' = before first history
-   *  message; 'after' = append after all messages. */
   position: 'chat' | 'before' | 'after';
-  /** 0 = permanent; >0 = generations remaining before auto-removal. */
   turns: number;
 }
 
@@ -52,7 +49,6 @@ async function writeInjects(chatId: string, injects: InjectSpec[]): Promise<void
   }
 }
 
-/** Parse leading key=value pairs from a string, return remainder as content. */
 function parseInjectArgs(raw: string): { args: Record<string, string>; content: string } {
   const args: Record<string, string> = {};
   let remaining = raw.trim();
@@ -101,23 +97,24 @@ export async function processMessageContent(
   }
 
   let content = workingContent;
-  const parsed = parseSetvarChain(content);
-  if (parsed) {
-    for (const { kind, key, value } of parsed.pairs) {
-      try {
-        await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
-      } catch (err) {
-        varsLog.warn(
-          `setvar failed for "${kind}::${key}":`,
-          err instanceof Error ? err.message : String(err),
-        );
+
+  if (SETVAR_RE.test(content)) {
+    const parsed = parseSetvarChain(content);
+    if (parsed) {
+      for (const { kind, key, value } of parsed.pairs) {
+        try {
+          await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
+        } catch (err) {
+          varsLog.warn(
+            `setvar failed for "${kind}::${key}":`,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
       }
+      content = parsed.strippedContent;
     }
-    content = parsed.strippedContent;
   }
 
-  // Handle /inject — store a spec in extension storage for the interceptor.
-  // Syntax: /inject [id=<id>] [depth=<n>] [role=system|user|assistant] [position=chat|before|after] [turns=<n>] <content>
   if (INJECT_RE.test(content)) {
     const INJECT_CMD_RE = /^\/inject(?:\s+(.*?))?\s*$/gim;
     const injects = await readInjects(ctx.chatId);
@@ -141,8 +138,6 @@ export async function processMessageContent(
     content = content.replace(/^\/inject(?:\s+.*?)?\s*$/gim, '').replace(/\n{3,}/g, '\n\n');
   }
 
-  // Handle /flushinject — remove one or all injections.
-  // Syntax: /flushinject [id=<id>]   (omit id to flush all)
   if (FLUSHINJECT_RE.test(content)) {
     const FLUSH_CMD_RE = /^\/flushinject(?:\s+id=(\S+))?\s*$/gim;
     let injects = await readInjects(ctx.chatId);
@@ -161,33 +156,35 @@ export async function processMessageContent(
 }
 
 // ─── Prompt interceptor ───────────────────────────────────────────────────────
-// Reads inject specs from extension storage on every generation and splices
-// each active entry into the assembled message array at the right depth.
-// Turn-counted entries are decremented and removed when they expire.
 
 function installInjectInterceptor(): void {
-  api.registerInterceptor(async (messages: LlmMessageDTO[], context: unknown): Promise<InterceptorResultDTO> => {
+  // Use `any` for the payload to defensively capture the entire generation state object
+  api.registerInterceptor(async (payload: any, context: unknown): Promise<InterceptorResultDTO | any> => {
     const ctx = context as { chatId?: string };
-    if (!ctx.chatId) return { messages };
+    
+    // Safely extract messages whether Spindle passes an array directly or a payload object
+    const isArray = Array.isArray(payload);
+    const messagesArray: LlmMessageDTO[] = isArray ? payload : (payload.messages || []);
+
+    if (!ctx.chatId) return payload;
 
     const injects = await readInjects(ctx.chatId);
-    if (injects.length === 0) return { messages };
+    if (injects.length === 0) return payload; // Return unmodified payload if no injects
 
-    const result: LlmMessageDTO[] = [...messages];
+    const result: LlmMessageDTO[] = [...messagesArray];
     const surviving: InjectSpec[] = [];
-    const breakdown: Array<{ messageIndex: number; name: string }> = [];
+    const breakdown: Array<{ messageIndex: number; name: string }> = isArray ? [] : (payload.breakdown || []);
 
     for (const spec of injects) {
       const msg: LlmMessageDTO = { role: spec.role, content: spec.content };
       let insertAt: number;
 
       if (spec.position === 'before') {
-        const first = result.findIndex((m) => m.__isChatHistory === true);
+        const first = result.findIndex((m: any) => m.__isChatHistory === true);
         insertAt = first >= 0 ? first : 0;
       } else if (spec.position === 'after') {
         insertAt = result.length;
       } else {
-        // 'chat': depth-based within chat history (depth 0 = append)
         if (spec.depth === 0) {
           insertAt = result.length;
         } else {
@@ -210,18 +207,22 @@ function installInjectInterceptor(): void {
       } else if (spec.turns > 1) {
         surviving.push({ ...spec, turns: spec.turns - 1 });
       }
-      // turns === 1: last use this generation, don't carry forward
     }
 
     if (surviving.length !== injects.length) {
       await writeInjects(ctx.chatId, surviving);
     }
 
-    return { messages: result, breakdown };
+    // CRITICAL FIX: If payload is an object, spread it to preserve all variables and system state!
+    if (isArray) {
+      return { messages: result, breakdown };
+    } else {
+      return { ...payload, messages: result, breakdown };
+    }
   });
 }
 
 export function installMessageContentProcessor(): void {
   api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
   installInjectInterceptor();
-                        }
+}
