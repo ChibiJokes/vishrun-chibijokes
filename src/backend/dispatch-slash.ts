@@ -59,8 +59,8 @@ interface InjectSpec {
   turns: number;
 }
 
-function injectPath(chatId: string): string {
-  return `injects/${chatId}.json`;
+function injectKey(): string {
+  return 'lumi_injects';
 }
 
 function parseInjectArgs(raw: string): { args: Record<string, string>; content: string } {
@@ -77,7 +77,10 @@ function parseInjectArgs(raw: string): { args: Record<string, string>; content: 
 
 async function readInjectsFromStorage(chatId: string): Promise<InjectSpec[]> {
   try {
-    return await api.storage.getJson<InjectSpec[]>(injectPath(chatId), { fallback: [] });
+    const raw = await api.variables.chat.get(chatId, injectKey());
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as InjectSpec[]) : [];
   } catch (e) {
     return [];
   }
@@ -86,9 +89,9 @@ async function readInjectsFromStorage(chatId: string): Promise<InjectSpec[]> {
 async function writeInjectsToStorage(chatId: string, injects: InjectSpec[]): Promise<void> {
   try {
     if (injects.length === 0) {
-      await api.storage.delete(injectPath(chatId));
+      await api.variables.chat.delete(chatId, injectKey());
     } else {
-      await api.storage.setJson(injectPath(chatId), injects);
+      await api.variables.chat.set(chatId, injectKey(), JSON.stringify(injects));
     }
   } catch (e) {
     // best-effort
