@@ -26,7 +26,7 @@ interface DispatchSlashResponse {
   type: 'dispatch_slash_text_response';
   requestId: string;
   handled: boolean;
-  kind: 'setvar_chain' | 'sys_message' | 'inject' | 'flushinject' | 'none';
+  kind: 'setvar_chain' | 'sys_message' | 'inject' | 'flushinject' | 'listinjects' | 'none';
   error?: string;
 }
 
@@ -45,6 +45,9 @@ const SETVAR_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
 const SYS_PREFIX_RE = /^\s*\/sys\b/i;
 const INJECT_PREFIX_RE = /^\s*\/inject\b/i;
 const FLUSHINJECT_PREFIX_RE = /^\s*\/flushinject\b/i;
+const LISTINJECTS_PREFIX_RE = /^\s*\/listinjects\b/i;
+
+const VISHRUN_INJECTS_VAR = '_vishrun_injects';
 
 // ─── /inject storage helpers (shared with message-content-processor) ─────────
 
@@ -100,7 +103,7 @@ export async function dispatchSlashText(
   chatId: string,
   userId: string,
   deps: { vars?: VarsApi; appendMessage?: typeof api.chat.appendMessage } = {},
-): Promise<{ handled: boolean; kind: 'setvar_chain' | 'sys_message' | 'inject' | 'flushinject' | 'none' }> {
+): Promise<{ handled: boolean; kind: 'setvar_chain' | 'sys_message' | 'inject' | 'flushinject' | 'listinjects' | 'none' }> {
   if (SETVAR_PREFIX_RE.test(text)) {
     const parsed = parseSetvarChain(text);
     if (!parsed || parsed.pairs.length === 0) {
@@ -153,6 +156,16 @@ export async function dispatchSlashText(
     injects = id ? injects.filter((e) => e.id !== id) : [];
     await writeInjectsToStorage(chatId, injects);
     return { handled: true, kind: 'flushinject' };
+  }
+
+  if (LISTINJECTS_PREFIX_RE.test(text)) {
+    const injects = await readInjectsFromStorage(chatId);
+    try {
+      await api.variables.chat.set(chatId, VISHRUN_INJECTS_VAR, JSON.stringify(injects));
+    } catch (e) {
+      // best-effort
+    }
+    return { handled: true, kind: 'listinjects' };
   }
 
   return { handled: false, kind: 'none' };
