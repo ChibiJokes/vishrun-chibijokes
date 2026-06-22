@@ -27,7 +27,7 @@ import { dispatchSlashViaBackend } from '../core/dispatch-slash';
 // pure temporal correlation. On dispatch failure we remove the entry so the
 // user still sees alerts unrelated to a successful intercept.
 
-const DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys)\b/i;
+const DISPATCH_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar|sys|inject|flushinject)\b/i;
 const DISPATCH_CORRELATION_WINDOW_MS = 1000;
 const DISPATCH_CLEANUP_INTERVAL_MS = 2000;
 
@@ -74,23 +74,15 @@ export async function handleClipboardWriteText(
     if (!chatId) {
       console.warn('[vishrun] dispatch_slash_text: no active chatId, falling back to clipboard');
     } else {
-      // Register BEFORE the await so a card alert that arrives while the
-      // backend is still working still gets suppressed by handleHostAlert.
-      // Without this, the alert (synchronous postMessage from the iframe)
-      // races the dispatch and slips through.
       if (!deps.recentlyDispatched) ensureCleanupTimer();
       dispatched.set(text, now());
       try {
         const dispatch = deps.dispatch ?? dispatchSlashViaBackend;
         const result = await dispatch(ctx, chatId, text);
         if (result.handled) {
-          // Refresh timestamp so the correlation window starts at completion,
-          // catching any alert the card schedules after the dispatch resolves.
           dispatched.set(text, now());
           return;
         }
-        // backend returned handled:false — fall through to clipboard.
-        // Remove the entry so subsequent unrelated alerts aren't suppressed.
         dispatched.delete(text);
       } catch (e) {
         console.warn('[vishrun] dispatch_slash_text failed, falling back to clipboard:', e instanceof Error ? e.message : String(e));
