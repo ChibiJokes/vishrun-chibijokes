@@ -11,7 +11,63 @@ import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
 // empty LLM turn (some providers reject that).
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
+// ─── /inject infrastructure ──────────────────────────────────────────────────
+
+const INJECT_STORAGE_KEY = 'lumi_injects';
+
+interface InjectSpec {
+  id: string;
+  content: string;
+  role: 'system' | 'user' | 'assistant';
+  depth: number;
+  /** 'chat' = depth-based within chat history; 'before' = before first history
+   *  message; 'after' = append after all messages. */
+  position: 'chat' | 'before' | 'after';
+  /** 0 = permanent; >0 = generations remaining before auto-removal. */
+  turns: number;
+}
+
+/** Parse leading key=value pairs from a string, return remainder as content. */
+function parseInjectArgs(raw: string): { args: Record<string, string>; content: string } {
+  const args: Record<string, string> = {};
+  let remaining = raw.trim();
+  const ARG_RE = /^([a-zA-Z_]\w*)=(\S+)\s*/;
+  let m: RegExpExecArray | null;
+  while ((m = ARG_RE.exec(remaining))) {
+    args[m[1].toLowerCase()] = m[2];
+    remaining = remaining.slice(m[0].length);
+  }
+  return { args, content: remaining };
+}
+
+async function readInjects(chatId: string): Promise<InjectSpec[]> {
+  try {
+    const raw = await api.variables.chat.get(chatId, INJECT_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as InjectSpec[]) : [];
+  } catch {
+    return [];
+  }
+}
+
+async function writeInjects(chatId: string, injects: InjectSpec[]): Promise<void> {
+  try {
+    if (injects.length === 0) {
+      await api.variables.chat.delete(chatId, INJECT_STORAGE_KEY);
+    } else {
+      await api.variables.chat.set(chatId, INJECT_STORAGE_KEY, JSON.stringify(injects));
+    }
+  } catch {
+    // best-effort; don't crash the message processor
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 const SETVAR_RE = /\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
+const INJECT_RE = /\/inject\b/i;
+const FLUSHINJECT_RE = /\/flushinject\b/i;
 
 // Self-closing custom tags → paired form. Lumiverse's tag interceptor only
 // handles paired tags (<TAG>...</TAG>); DOMPurify strips unknown self-closing
@@ -53,7 +109,7 @@ export async function processMessageContent(
     return selfCloseChanged ? { content: workingContent } : undefined;
   }
 
-  if (!SETVAR_RE.test(workingContent)) {
+  if (!SETVAR_RE.test(workingContent) && !INJECT_RE.test(workingContent) && !FLUSHINJECT_RE.test(workingContent)) {
     return selfCloseChanged ? { content: workingContent } : undefined;
   }
 
@@ -71,6 +127,116 @@ export async function processMessageContent(
       }
     }
     content = parsed.strippedContent;
+  }
+
+  // Handle /inject — store an injection spec in chat_variables for the interceptor to pick up.
+  // Syntax: /inject [id=<id>] [depth=<n>] [role=system|user|assistant] [position=chat|before|after] [turns=<n>] <content>
+  if (INJECT_RE.test(content)) {
+    const INJECT_CMD_RE = /^[ \t]*\/inject(?:\s+(.*?))?[ \t]*$/gim;
+    let injectMatch: RegExpExecArray | null;
+    const injects = await readInjects(ctx.chatId);
+    while ((injectMatch = INJECT_CMD_RE.exec(content)) !== null) {
+      const { args, content: body } = parseInjectArgs(injectMatch[1] ?? '');
+      if (!body.trim()) continue;
+      const id = args.id ?? crypto.randomUUID().slice(0, 8);
+      const spec: InjectSpec = {
+        id,
+        content: body,
+        role: (args.role === 'user' || args.role === 'assistant') ? args.role : 'system',
+        depth: Math.max(0, parseInt(args.depth ?? '0', 10) || 0),
+        position: (args.position === 'before' || args.position === 'after') ? args.position : 'chat',
+        turns: Math.max(0, parseInt(args.turns ?? '0', 10) || 0),
+      };
+      const existing = injects.findIndex(e => e.id === id);
+      if (existing >= 0) { injects[existing] = spec; } else { injects.push(spec); }
+    }
+    await writeInjects(ctx.chatId, injects);
+    content = content.replace(/^[ \t]*\/inject(?:\s+.*?)?[ \t]*$/gim, '').replace(/\n{3,}/g, '\n\n');
+  }
+
+  // Handle /flushinject — remove one or all injections.
+  // Syntax: /flushinject [id=<id>]   (no id = flush all)
+  if (FLUSHINJECT_RE.test(content)) {
+    const FLUSHINJECT_CMD_RE = /^[ \t]*\/flushinject(?:\s+id=(\S+))?[ \t]*$/gim;
+    let flushMatch: RegExpExecArray | null;
+    let injects = await readInjects(ctx.chatId);
+    while ((flushMatch = FLUSHINJECT_CMD_RE.exec(content)) !== null) {
+      const id = flushMatch[1];
+      injects = id ? injects.filter(e => e.id !== id) : [];
+    }
+    await writeInjects(ctx.chatId, injects);
+    content = content.replace(/^[ \t]*\/flushinject(?:\s+\S+)?[ \t]*$/gim, '').replace(/\n{3,}/g, '\n\n');
+  }
+
+  if (content === ctx.content) return;
+  const stripped = content.trim();
+  return { content: stripped.length > 0 ? stripped : EMPTY_REPLACEMENT };
+}
+
+// ─── Prompt interceptor ───────────────────────────────────────────────────────
+//
+// Reads lumi_injects from chat_variables on every generation and splices each
+// active spec into the assembled message array at the requested position/depth.
+// Turn-counted specs are decremented and removed when they reach zero.
+
+function installInjectInterceptor(): void {
+  api.registerInterceptor(async (messages, context) => {
+    const chatId = (context as { chatId?: string }).chatId;
+    if (!chatId) return messages;
+
+    const injects = await readInjects(chatId);
+    if (injects.length === 0) return messages;
+
+    const result = [...messages];
+    const surviving: InjectSpec[] = [];
+    const breakdown: { messageIndex: number; name: string }[] = [];
+
+    for (const spec of injects) {
+      const msg = { role: spec.role, content: spec.content } as (typeof messages)[number];
+      let insertAt: number;
+
+      if (spec.position === 'before') {
+        const first = result.findIndex(m => m.__isChatHistory);
+        insertAt = first >= 0 ? first : 0;
+      } else if (spec.position === 'after') {
+        insertAt = result.length;
+      } else {
+        if (spec.depth === 0) {
+          insertAt = result.length;
+        } else {
+          let count = 0;
+          insertAt = result.length;
+          for (let i = result.length - 1; i >= 0; i--) {
+            if (result[i].__isChatHistory) {
+              count++;
+              if (count === spec.depth) { insertAt = i; break; }
+            }
+          }
+        }
+      }
+
+      result.splice(insertAt, 0, msg);
+      breakdown.push({ messageIndex: insertAt, name: `Inject: ${spec.id}` });
+
+      if (spec.turns === 0) {
+        surviving.push(spec);
+      } else if (spec.turns > 1) {
+        surviving.push({ ...spec, turns: spec.turns - 1 });
+      }
+    }
+
+    if (surviving.length !== injects.length) {
+      await writeInjects(chatId, surviving);
+    }
+
+    return { messages: result, breakdown };
+  });
+}
+
+export function installMessageContentProcessor(): void {
+  api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
+  installInjectInterceptor();
+}
   }
 
   if (content === ctx.content) return;
