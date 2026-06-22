@@ -11,10 +11,7 @@ import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
 // ─── /inject infrastructure ──────────────────────────────────────────────────
-// Inject specs are stored in api.storage (extension-scoped file storage) rather
-// than api.variables.chat. This avoids a race where generate.service.ts writes
-// the macro environment's snapshot of chat_variables back to the DB after the
-// interceptor has already updated them, clobbering the turn decrement.
+// Inject specs are stored in chat_variables using a namespaced key.
 
 interface InjectSpec {
   id: string;
@@ -28,13 +25,16 @@ interface InjectSpec {
   turns: number;
 }
 
-function injectPath(chatId: string): string {
-  return `injects/${chatId}.json`;
+function injectKey(): string {
+  return 'lumi_injects';
 }
 
 async function readInjects(chatId: string): Promise<InjectSpec[]> {
   try {
-    return await api.storage.getJson<InjectSpec[]>(injectPath(chatId), { fallback: [] });
+    const raw = await api.variables.chat.get(chatId, injectKey());
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    return Array.isArray(parsed) ? (parsed as InjectSpec[]) : [];
   } catch (e) {
     return [];
   }
@@ -43,9 +43,9 @@ async function readInjects(chatId: string): Promise<InjectSpec[]> {
 async function writeInjects(chatId: string, injects: InjectSpec[]): Promise<void> {
   try {
     if (injects.length === 0) {
-      await api.storage.delete(injectPath(chatId));
+      await api.variables.chat.delete(chatId, injectKey());
     } else {
-      await api.storage.setJson(injectPath(chatId), injects);
+      await api.variables.chat.set(chatId, injectKey(), JSON.stringify(injects));
     }
   } catch (e) {
     // best-effort; don't crash the processor
