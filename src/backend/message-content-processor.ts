@@ -7,7 +7,7 @@ import type {
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
-import { resolveMacroText, resolveDynamicVarMacros, DYNAMIC_VAR_MACRO_NAMES } from './macro-resolve';
+import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES } from './macro-resolve';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -72,6 +72,16 @@ const SETVAR_RE = /\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
 const INJECT_RE = /\/inject\b/i;
 const FLUSHINJECT_RE = /\/flushinject\b/i;
 
+// Macros deferred at /inject command time so they're re-resolved fresh on
+// every generation by the interceptor instead of being frozen forever.
+// getvar/getchatvar need a live value lookup; random/roll/pick need a fresh
+// roll each time; newline/input are included too for consistency even
+// though their resolved value wouldn't actually differ by timing.
+const DEFERRED_MACRO_NAMES: ReadonlySet<string> = new Set([
+  ...DYNAMIC_VAR_MACRO_NAMES,
+  ...LOCAL_DYNAMIC_MACRO_NAMES,
+]);
+
 const SELF_CLOSING_CUSTOM_RE = /<([A-Z][a-zA-Z0-9_-]*)(\s[^>]*)?\s*\/>/g;
 export function expandSelfClosingTags(content: string): string {
   return content.replace(SELF_CLOSING_CUSTOM_RE, (_m, tag: string, attrs: string | undefined) => {
@@ -127,19 +137,21 @@ export async function processMessageContent(
       const { args, content: body } = parseInjectArgs(im[1] ?? '');
       if (!body.trim()) continue;
       // Resolve {{macros}} in the inject body NOW, at /inject command time —
-      // EXCEPT {{getvar}}/{{getchatvar}}, which are deliberately left as
-      // literal text here (DYNAMIC_VAR_MACRO_NAMES) and resolved fresh on
-      // every generation by the interceptor below via resolveDynamicVarMacros
-      // — that one doesn't need userId, so it can actually be dynamic.
-      // Everything else (user/char/random/roll/pick/setvar/...) genuinely
-      // can't be: api.macros.resolve requires userId, which only this
-      // function (MessageContentProcessorCtx) has — the interceptor's
-      // context, per Lumiverse host source (interceptor-pipeline.ts,
-      // generate.service.ts), is {chatId, connectionId, personaId,
-      // generationType} with no userId at all for an operator-scoped
-      // extension. So those stay frozen at /inject time; this is a hard
-      // host-API limit, not a choice. Falls back to the raw body on failure.
-      const resolvedBody = await resolveMacroText(body, ctx.chatId, undefined, ctx.userId, DYNAMIC_VAR_MACRO_NAMES);
+      // EXCEPT the names in DEFERRED_MACRO_NAMES, which are deliberately left
+      // as literal text here and resolved fresh on every generation by the
+      // interceptor below: getvar/getchatvar via resolveDynamicVarMacros,
+      // random/roll/pick/newline/input via resolveLocalDynamicMacros. Both of
+      // those need only (chatId, key) or nothing at all — no userId — so they
+      // can actually run inside the interceptor, unlike the full macro engine.
+      // Everything else (user/char/group/setvar/...) genuinely can't be:
+      // api.macros.resolve requires userId, which only this function
+      // (MessageContentProcessorCtx) has — the interceptor's context, per
+      // Lumiverse host source (interceptor-pipeline.ts, generate.service.ts),
+      // is {chatId, connectionId, personaId, generationType} with no userId
+      // at all for an operator-scoped extension. So those stay frozen at
+      // /inject time; this is a hard host-API limit, not a choice. Falls
+      // back to the raw body on failure.
+      const resolvedBody = await resolveMacroText(body, ctx.chatId, undefined, ctx.userId, DEFERRED_MACRO_NAMES);
       const id = args.id ?? Math.random().toString(36).slice(2, 10);
       const spec: InjectSpec = {
         id,
@@ -192,6 +204,15 @@ function installInjectInterceptor(): void {
     const surviving: InjectSpec[] = [];
     const breakdown: Array<{ messageIndex: number; name: string }> = [];
 
+    // {{input}} resolves to the last user message — already sitting right
+    // here in `messages` (the interceptor's first argument), no host
+    // lookup needed. Computed once: `messages` doesn't change across the
+    // loop below (only the `result` splice copy does).
+    let lastUserMessage = '';
+    for (let i = messages.length - 1; i >= 0; i--) {
+      if (messages[i].role === 'user') { lastUserMessage = messages[i].content ?? ''; break; }
+    }
+
     for (const spec of injects) {
       // Dynamic path — re-resolves {{getvar::x}}/{{getchatvar::x}} fresh on
       // every generation. Uses api.variables.local.get/chat.get directly,
@@ -199,6 +220,11 @@ function installInjectInterceptor(): void {
       // inside the interceptor, unlike the full macro engine. This is what
       // makes /inject content non-static for the variable-getter macros.
       let resolvedContent = await resolveDynamicVarMacros(spec.content, ctx.chatId);
+      // Same idea for {{random}}/{{roll}}/{{pick}}/{{newline}}/{{input}} —
+      // these need no host lookup at all (pure Math.random(), or data
+      // already in `messages`), so they resolve synchronously and locally
+      // right here, fresh every generation, with no userId dependency.
+      resolvedContent = resolveLocalDynamicMacros(resolvedContent, lastUserMessage);
       // Forward-compat fallback: any OTHER macro type left in spec.content
       // (shouldn't normally happen — those are resolved once at /inject
       // time in processMessageContent, see above) only resolves here if a
