@@ -126,10 +126,28 @@ export async function processMessageContent(
     while ((im = INJECT_CMD_RE.exec(content)) !== null) {
       const { args, content: body } = parseInjectArgs(im[1] ?? '');
       if (!body.trim()) continue;
+      // Resolve {{macros}} in the inject body NOW, at /inject command time —
+      // not in the interceptor below. Checked against Lumiverse host source
+      // (src/spindle/interceptor-pipeline.ts, src/services/generate.service.ts):
+      // the interceptor's `context` argument is built from `SpindleContext`
+      // ({chatId, connectionId, personaId, generationType}) and userId is
+      // passed to interceptorPipeline.run() as a *separate* parameter that
+      // is never forwarded into context or into the handler call. So
+      // `ctx.userId` inside installInjectInterceptor below is always
+      // undefined for an operator-scoped extension like Vishrun — there is
+      // no way to get a userId there, and api.macros.resolve hard-requires
+      // one ("userId is required for operator-scoped extensions",
+      // worker-host.ts resolveEffectiveUserId). MessageContentProcessorCtx
+      // (this function), by contrast, genuinely has userId. So resolve here,
+      // once, and store the already-resolved text — the inject re-fires
+      // every generation from storage either way, this just changes *when*
+      // the macro is evaluated (at /inject time vs at every later
+      // generation). Falls back to the raw body on any failure.
+      const resolvedBody = await resolveMacroText(body, ctx.chatId, undefined, ctx.userId);
       const id = args.id ?? Math.random().toString(36).slice(2, 10);
       const spec: InjectSpec = {
         id,
-        content: body,
+        content: resolvedBody,
         role: (args.role === 'user' || args.role === 'assistant') ? args.role : 'system',
         depth: Math.max(0, parseInt(args.depth ?? '0', 10) || 0),
         position: (args.position === 'before' || args.position === 'after') ? args.position : 'chat',
@@ -179,13 +197,16 @@ function installInjectInterceptor(): void {
     const breakdown: Array<{ messageIndex: number; name: string }> = [];
 
     for (const spec of injects) {
-      // spec.content is the raw text stored by /inject — author-typed, so it
-      // may contain `{{getvar::x}}` etc. This was previously spliced straight
-      // into the LLM message unresolved (the prompt literally contained the
-      // macro string). Resolve it here, same engine call the widget render
-      // path uses, so /inject content gets the same macro support as the
-      // rest of vishrun. Falls back to the raw text on any failure — never
-      // blocks the generation over a bad macro.
+      // spec.content is already macro-resolved — see processMessageContent's
+      // /inject handling above, which does the resolve at command-time
+      // because (unlike here) it actually has ctx.userId available. This
+      // ctx.userId check is intentionally kept as a no-op-safe fallback: if
+      // a future Lumiverse host version starts threading userId through
+      // SpindleContext / interceptorPipeline.run into the handler call, this
+      // will start re-resolving on every generation for free. As of this
+      // host version it never fires (context is { chatId, connectionId,
+      // personaId, generationType } — no userId), so this is a guaranteed
+      // pass-through of the already-resolved spec.content.
       const resolvedContent = ctx.userId
         ? await resolveMacroText(spec.content, ctx.chatId, ctx.characterId, ctx.userId)
         : spec.content;
