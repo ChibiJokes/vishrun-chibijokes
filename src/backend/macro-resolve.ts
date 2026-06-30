@@ -46,12 +46,19 @@ const VALID_MACRO_NAMES = [
   'roll',
   'pick',
 ];
-const VALID_MACRO_RE = new RegExp(`^\\{\\{(?:${VALID_MACRO_NAMES.join('|')})(?:::|\\}\\})`);
+// `i` flag: SillyTavern macros are case-insensitive ({{GetVar}}, {{getVar}},
+// {{GETVAR}} all resolve in vanilla ST). Without it, any non-lowercase
+// spelling fails this allowlist check, gets masked as "not a real macro",
+// and is restored verbatim — i.e. it silently renders as the raw
+// `{{GetVar::...}}` string instead of resolving. That's indistinguishable
+// from a genuinely broken macro from the user's perspective, so case
+// must not gate this check.
+const VALID_MACRO_RE = new RegExp(`^\\{\\{(?:${VALID_MACRO_NAMES.join('|')})(?:::|\\}\\})`, 'i');
 
 const NUL = String.fromCharCode(0);
 const SENTINEL_RE = new RegExp(`${NUL}VSHMSK(\\d+)${NUL}`, 'g');
 
-export function maskInvalidMacros(template: string): { masked: string; masks: string[] } {
+function maskInvalidMacros(template: string): { masked: string; masks: string[] } {
   const masks: string[] = [];
   const masked = template.split(NUL).join('').replace(/\{\{[^{}]+\}\}/g, (match) => {
     if (VALID_MACRO_RE.test(match)) return match; // real macro — let the engine handle it
@@ -62,7 +69,7 @@ export function maskInvalidMacros(template: string): { masked: string; masks: st
   return { masked, masks };
 }
 
-export function unmaskInvalidMacros(text: string, masks: string[]): string {
+function unmaskInvalidMacros(text: string, masks: string[]): string {
   if (masks.length === 0) return text;
   return text.replace(SENTINEL_RE, (_m, idx: string) => masks[Number(idx)] ?? '');
 }
@@ -78,7 +85,10 @@ export function unmaskInvalidMacros(text: string, masks: string[]): string {
 // addvar/incvar/decvar (arithmetic ops on existing vars) and nested {{...}}
 // values are NOT handled here — they pass through to the engine with
 // commit:false and no-op. Re-enable if a card in scope needs them.
-const SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/g;
+// `i` flag for the same reason as VALID_MACRO_RE above (ST macros are
+// case-insensitive); `kind` is lowercased at capture time below since
+// applySetvarOp does an exact-string `op.kind === 'setvar'` comparison.
+const SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/gi;
 const NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 
 // Per-chat promise queue. Serializes applyAndStripSetvars across concurrent
@@ -97,7 +107,7 @@ export async function applyAndStripSetvars(
   const matches: SetvarMatch[] = [];
   for (const m of template.matchAll(SETVAR_RE)) {
     const [match, kind, name, value] = m;
-    matches.push({ start: m.index!, end: m.index! + match.length, kind, name, value });
+    matches.push({ start: m.index!, end: m.index! + match.length, kind: kind.toLowerCase(), name, value });
   }
   if (matches.length === 0) return template;
 
@@ -154,40 +164,6 @@ async function runApplyAndStripSetvars(
   }
   out += template.slice(cursor);
   return out;
-}
-
-// ─── Direct backend entry point (no frontend round-trip) ────────────────────
-//
-// Same pipeline as the resolve_macros RPC above (setvar persist+strip, mask,
-// engine resolve, unmask), but callable straight from other backend modules
-// — e.g. the /inject prompt interceptor, which runs entirely backend-side
-// during prompt assembly and has no frontend request to round-trip through.
-export async function resolveInjectTemplate(
-  template: string,
-  chatId: string,
-  userId: string,
-  characterId?: string,
-  vars: VarsApi = api.variables,
-): Promise<string> {
-  try {
-    const stripped = await applyAndStripSetvars(template, chatId, userId, vars);
-    const { masked, masks } = maskInvalidMacros(stripped);
-    const { text, diagnostics } = await api.macros.resolve(masked, {
-      chatId,
-      characterId,
-      userId,
-      commit: false,
-    });
-    if (diagnostics.length > 0) {
-      varsLog.debug(`inject resolve produced ${diagnostics.length} diagnostic(s):`, diagnostics[0]?.message);
-    }
-    return unmaskInvalidMacros(text, masks);
-  } catch (err) {
-    // Same fallback contract as resolve_macros: never throw into the prompt
-    // assembly path, just hand back the raw template unresolved.
-    varsLog.warn('inject resolve failed:', err instanceof Error ? err.message : String(err));
-    return template;
-  }
 }
 
 export function installMacroResolveHandler(): void {
