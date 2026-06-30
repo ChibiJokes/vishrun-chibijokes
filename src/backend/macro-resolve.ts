@@ -84,19 +84,6 @@ export const LOCAL_DYNAMIC_MACRO_NAMES: ReadonlySet<string> = new Set([
   'random', 'roll', 'pick', 'newline', 'input',
 ]);
 
-// setvar/setchatvar specifically — NOT setgvar/setglobalvar. applySetvarOp
-// (setvar-ops.ts) writes setvar/setchatvar via vars.local.set/vars.chat.set,
-// which — like the getvar/getchatvar reads above — take only (chatId, key,
-// value), no userId. So these can be deferred at /inject time and re-applied
-// fresh every generation with zero host-lookup wall, exactly like the
-// DYNAMIC_VAR_MACRO_NAMES pair. setgvar/setglobalvar are deliberately left
-// out: those are already disabled upstream of this (see setvar-ops.ts header
-// comment — the global var read/write paths don't agree on where the value
-// lives), so deferring them would just mean a literal `{{setgvar::...}}`
-// sits in the prompt every generation instead of vanishing once. Not this
-// extension's bug to route around.
-export const DYNAMIC_SETVAR_MACRO_NAMES: ReadonlySet<string> = new Set(['setvar', 'setchatvar']);
-
 function maskInvalidMacros(
   template: string,
   deferNames: ReadonlySet<string> = new Set(),
@@ -155,14 +142,11 @@ export async function applyAndStripSetvars(
   chatId: string,
   userId: string,
   vars: VarsApi = api.variables,
-  deferNames: ReadonlySet<string> = new Set(),
 ): Promise<string> {
   const matches: SetvarMatch[] = [];
   for (const m of template.matchAll(SETVAR_RE)) {
     const [match, kind, name, value] = m;
-    const lkind = kind.toLowerCase();
-    if (deferNames.has(lkind)) continue; // held back — left literal for caller to resolve later
-    matches.push({ start: m.index!, end: m.index! + match.length, kind: lkind, name, value });
+    matches.push({ start: m.index!, end: m.index! + match.length, kind: kind.toLowerCase(), name, value });
   }
   if (matches.length === 0) return template;
 
@@ -239,7 +223,7 @@ export async function resolveMacroText(
   deferNames: ReadonlySet<string> = new Set(),
 ): Promise<string> {
   try {
-    const stripped = await applyAndStripSetvars(original, chatId, userId, api.variables, deferNames);
+    const stripped = await applyAndStripSetvars(original, chatId, userId);
     const { masked, masks } = maskInvalidMacros(stripped, deferNames);
     const { text, diagnostics } = await api.macros.resolve(masked, {
       chatId,
