@@ -51,7 +51,7 @@ const VALID_MACRO_RE = new RegExp(`^\\{\\{(?:${VALID_MACRO_NAMES.join('|')})(?::
 const NUL = String.fromCharCode(0);
 const SENTINEL_RE = new RegExp(`${NUL}VSHMSK(\\d+)${NUL}`, 'g');
 
-function maskInvalidMacros(template: string): { masked: string; masks: string[] } {
+export function maskInvalidMacros(template: string): { masked: string; masks: string[] } {
   const masks: string[] = [];
   const masked = template.split(NUL).join('').replace(/\{\{[^{}]+\}\}/g, (match) => {
     if (VALID_MACRO_RE.test(match)) return match; // real macro — let the engine handle it
@@ -62,7 +62,7 @@ function maskInvalidMacros(template: string): { masked: string; masks: string[] 
   return { masked, masks };
 }
 
-function unmaskInvalidMacros(text: string, masks: string[]): string {
+export function unmaskInvalidMacros(text: string, masks: string[]): string {
   if (masks.length === 0) return text;
   return text.replace(SENTINEL_RE, (_m, idx: string) => masks[Number(idx)] ?? '');
 }
@@ -154,6 +154,40 @@ async function runApplyAndStripSetvars(
   }
   out += template.slice(cursor);
   return out;
+}
+
+// ─── Direct backend entry point (no frontend round-trip) ────────────────────
+//
+// Same pipeline as the resolve_macros RPC above (setvar persist+strip, mask,
+// engine resolve, unmask), but callable straight from other backend modules
+// — e.g. the /inject prompt interceptor, which runs entirely backend-side
+// during prompt assembly and has no frontend request to round-trip through.
+export async function resolveInjectTemplate(
+  template: string,
+  chatId: string,
+  userId: string,
+  characterId?: string,
+  vars: VarsApi = api.variables,
+): Promise<string> {
+  try {
+    const stripped = await applyAndStripSetvars(template, chatId, userId, vars);
+    const { masked, masks } = maskInvalidMacros(stripped);
+    const { text, diagnostics } = await api.macros.resolve(masked, {
+      chatId,
+      characterId,
+      userId,
+      commit: false,
+    });
+    if (diagnostics.length > 0) {
+      varsLog.debug(`inject resolve produced ${diagnostics.length} diagnostic(s):`, diagnostics[0]?.message);
+    }
+    return unmaskInvalidMacros(text, masks);
+  } catch (err) {
+    // Same fallback contract as resolve_macros: never throw into the prompt
+    // assembly path, just hand back the raw template unresolved.
+    varsLog.warn('inject resolve failed:', err instanceof Error ? err.message : String(err));
+    return template;
+  }
 }
 
 export function installMacroResolveHandler(): void {
