@@ -7,7 +7,6 @@ import type {
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
-import { resolveInjectTemplate as resolveInjectTemplateDefault } from './macro-resolve';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -17,7 +16,7 @@ const EMPTY_REPLACEMENT = '_(variables updated)_';
 // the macro environment's snapshot of chat_variables back to the DB after the
 // interceptor has already updated them, clobbering the turn decrement.
 
-export interface InjectSpec {
+interface InjectSpec {
   id: string;
   content: string;
   role: 'system' | 'user' | 'assistant';
@@ -166,28 +165,12 @@ export async function processMessageContent(
 // each active entry into the assembled message array at the right depth.
 // Turn-counted entries are decremented and removed when they expire.
 
-export interface InjectInterceptorDeps {
-  readInjects?: typeof readInjects;
-  writeInjects?: typeof writeInjects;
-  resolveTemplate?: typeof resolveInjectTemplateDefault;
-}
-
-/**
- * Builds the registerInterceptor handler. Exported (rather than inlined in
- * installInjectInterceptor) so tests can exercise the splicing + macro
- * resolution logic with fake deps, the same DI pattern processMessageContent
- * already uses, without needing a live spindle.macros.resolve.
- */
-export function buildInjectInterceptorHandler(deps: InjectInterceptorDeps = {}) {
-  const read = deps.readInjects ?? readInjects;
-  const write = deps.writeInjects ?? writeInjects;
-  const resolveTemplate = deps.resolveTemplate ?? resolveInjectTemplateDefault;
-
-  return async (messages: LlmMessageDTO[], context: unknown): Promise<InterceptorResultDTO> => {
-    const ctx = context as { chatId?: string; userId?: string; characterId?: string };
+function installInjectInterceptor(): void {
+  api.registerInterceptor(async (messages: LlmMessageDTO[], context: unknown): Promise<InterceptorResultDTO> => {
+    const ctx = context as { chatId?: string };
     if (!ctx.chatId) return { messages };
 
-    const injects = await read(ctx.chatId);
+    const injects = await readInjects(ctx.chatId);
     if (injects.length === 0) return { messages };
 
     const result: LlmMessageDTO[] = [...messages];
@@ -195,11 +178,7 @@ export function buildInjectInterceptorHandler(deps: InjectInterceptorDeps = {}) 
     const breakdown: Array<{ messageIndex: number; name: string }> = [];
 
     for (const spec of injects) {
-      // Resolve {{getvar::...}}, {{char}}, etc. through the same macro engine
-      // widgets use, before the text ever reaches the LLM. Falls back to the
-      // raw spec.content on failure (resolveInjectTemplate's own contract).
-      const resolvedContent = await resolveTemplate(spec.content, ctx.chatId, ctx.userId ?? '', ctx.characterId);
-      const msg: LlmMessageDTO = { role: spec.role, content: resolvedContent };
+      const msg: LlmMessageDTO = { role: spec.role, content: spec.content };
       let insertAt: number;
 
       if (spec.position === 'before') {
@@ -235,15 +214,11 @@ export function buildInjectInterceptorHandler(deps: InjectInterceptorDeps = {}) 
     }
 
     if (surviving.length !== injects.length) {
-      await write(ctx.chatId, surviving);
+      await writeInjects(ctx.chatId, surviving);
     }
 
     return { messages: result, breakdown };
-  };
-}
-
-function installInjectInterceptor(): void {
-  api.registerInterceptor(buildInjectInterceptorHandler());
+  });
 }
 
 export function installMessageContentProcessor(): void {
