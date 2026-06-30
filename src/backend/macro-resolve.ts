@@ -166,6 +166,41 @@ async function runApplyAndStripSetvars(
   return out;
 }
 
+// Resolve `{{macro}}` syntax in a single piece of text via the Lumiverse
+// macro engine, with setvar persistence + invalid-macro masking applied
+// first. Shared by installMacroResolveHandler (frontend widget templates)
+// and the /inject prompt interceptor in message-content-processor.ts (the
+// stored spec.content for a /inject is plain user-typed text and was never
+// being run through this at all — it went straight from storage onto the
+// LLM message, so `{{getchatvar::x}}` etc. inside an /inject body rendered
+// as the literal string in the prompt). Never throws: falls back to the
+// raw original text on any failure, same fallback contract as the widget
+// path (resolve_macros_response on error).
+export async function resolveMacroText(
+  original: string,
+  chatId: string,
+  characterId: string | undefined,
+  userId: string,
+): Promise<string> {
+  try {
+    const stripped = await applyAndStripSetvars(original, chatId, userId);
+    const { masked, masks } = maskInvalidMacros(stripped);
+    const { text, diagnostics } = await api.macros.resolve(masked, {
+      chatId,
+      characterId,
+      userId,
+      commit: false,
+    });
+    if (diagnostics.length > 0) {
+      varsLog.debug(`resolve produced ${diagnostics.length} diagnostic(s):`, diagnostics[0]?.message);
+    }
+    return unmaskInvalidMacros(text, masks);
+  } catch (err) {
+    varsLog.warn('resolve failed:', err instanceof Error ? err.message : String(err));
+    return original;
+  }
+}
+
 export function installMacroResolveHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (!isResolveMacrosRequest(payload)) return;
@@ -173,34 +208,15 @@ export function installMacroResolveHandler(): void {
     void (async () => {
       const results: string[] = new Array(templates.length);
       for (let i = 0; i < templates.length; i++) {
-        const original = templates[i];
-        try {
-          // Persist + strip setvars first so subsequent {{getvar}} on the same
-          // chat (and within this same template) reads the freshly set value
-          // when the engine resolves. addvar/etc. and disabled gvars pass
-          // through to the engine no-op via commit:false.
-          const stripped = await applyAndStripSetvars(original, chatId, userId);
-          const { masked, masks } = maskInvalidMacros(stripped);
-          // userId — required for operator-scoped extensions (which is how Vishrun
-          // installs); the host injects it as onFrontendMessage's 2nd arg.
-          // commit:false — `{{setvar}}` that happens to appear in widget HTML
-          // must not persist during a render pass; only the slash interceptor writes.
-          const { text, diagnostics } = await api.macros.resolve(masked, {
-            chatId,
-            characterId,
-            userId,
-            commit: false,
-          });
-          if (diagnostics.length > 0) {
-            varsLog.debug(`resolve produced ${diagnostics.length} diagnostic(s):`, diagnostics[0]?.message);
-          }
-          results[i] = unmaskInvalidMacros(text, masks);
-        } catch (err) {
-          // Fall back to the raw ORIGINAL (not the masked one — never hand the
-          // frontend sentinels). Widget renders unresolved, same as pre-MVU-lite.
-          varsLog.warn('resolve failed:', err instanceof Error ? err.message : String(err));
-          results[i] = original;
-        }
+        // Persist + strip setvars first so subsequent {{getvar}} on the same
+        // chat (and within this same template) reads the freshly set value
+        // when the engine resolves. addvar/etc. and disabled gvars pass
+        // through to the engine no-op via commit:false.
+        // userId — required for operator-scoped extensions (which is how Vishrun
+        // installs); the host injects it as onFrontendMessage's 2nd arg.
+        // commit:false — `{{setvar}}` that happens to appear in widget HTML
+        // must not persist during a render pass; only the slash interceptor writes.
+        results[i] = await resolveMacroText(templates[i], chatId, characterId, userId);
       }
       api.sendToFrontend({ type: 'resolve_macros_response', requestId, results }, userId);
     })();
