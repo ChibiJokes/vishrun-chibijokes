@@ -58,9 +58,30 @@ const VALID_MACRO_RE = new RegExp(`^\\{\\{(?:${VALID_MACRO_NAMES.join('|')})(?::
 const NUL = String.fromCharCode(0);
 const SENTINEL_RE = new RegExp(`${NUL}VSHMSK(\\d+)${NUL}`, 'g');
 
-function maskInvalidMacros(template: string): { masked: string; masks: string[] } {
+// Macro names whose `{{macro}}` form gets resolved directly against
+// api.variables.* instead of the full api.macros.resolve engine — see
+// resolveDynamicVarMacros below. Both of these read APIs accept only
+// (chatId, key), no userId, so they're callable from the interceptor
+// (which has no userId) and can re-resolve on every single generation
+// instead of being frozen at /inject time.
+export const DYNAMIC_VAR_MACRO_NAMES: ReadonlySet<string> = new Set(['getvar', 'getchatvar']);
+
+function maskInvalidMacros(
+  template: string,
+  deferNames: ReadonlySet<string> = new Set(),
+): { masked: string; masks: string[] } {
   const masks: string[] = [];
   const masked = template.split(NUL).join('').replace(/\{\{[^{}]+\}\}/g, (match) => {
+    const nameMatch = match.match(/^\{\{\s*([A-Za-z_@$][\w@$]*)/);
+    const name = nameMatch ? nameMatch[1].toLowerCase() : '';
+    if (deferNames.has(name)) {
+      // Intentionally held back — caller wants this name left literal
+      // (e.g. /inject-time resolve deferring getvar/getchatvar so they
+      // survive into storage and get resolved fresh at generation time).
+      const idx = masks.length;
+      masks.push(match);
+      return `${NUL}VSHMSK${idx}${NUL}`;
+    }
     if (VALID_MACRO_RE.test(match)) return match; // real macro — let the engine handle it
     const idx = masks.length;
     masks.push(match);
@@ -181,10 +202,11 @@ export async function resolveMacroText(
   chatId: string,
   characterId: string | undefined,
   userId: string,
+  deferNames: ReadonlySet<string> = new Set(),
 ): Promise<string> {
   try {
     const stripped = await applyAndStripSetvars(original, chatId, userId);
-    const { masked, masks } = maskInvalidMacros(stripped);
+    const { masked, masks } = maskInvalidMacros(stripped, deferNames);
     const { text, diagnostics } = await api.macros.resolve(masked, {
       chatId,
       characterId,
@@ -199,6 +221,48 @@ export async function resolveMacroText(
     varsLog.warn('resolve failed:', err instanceof Error ? err.message : String(err));
     return original;
   }
+}
+
+// Resolve ONLY {{getvar::x}} / {{getchatvar::x}} via the direct variable-read
+// APIs (api.variables.local.get / .chat.get), which need just (chatId, key) —
+// no userId. This is what makes /inject content dynamic: called fresh from
+// the interceptor on every single generation (the interceptor never has a
+// userId, so the full api.macros.resolve engine is unreachable there — see
+// the comment in message-content-processor.ts installInjectInterceptor).
+// Per-call cache so a key referenced twice in one inject body only does one
+// round-trip. Leaves a macro literal on lookup failure (no worse than today).
+const DYNAMIC_VAR_RE = /\{\{\s*(getvar|getchatvar)\s*::\s*([^:}]*?)\s*\}\}/gi;
+
+export async function resolveDynamicVarMacros(text: string, chatId: string): Promise<string> {
+  if (!text.includes('{{')) return text;
+  DYNAMIC_VAR_RE.lastIndex = 0;
+  if (!DYNAMIC_VAR_RE.test(text)) return text;
+
+  const cache = new Map<string, string>();
+  DYNAMIC_VAR_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  const lookups: Array<Promise<void>> = [];
+  while ((m = DYNAMIC_VAR_RE.exec(text)) !== null) {
+    const kind = m[1].toLowerCase();
+    const key = m[2];
+    const cacheKey = `${kind}::${key}`;
+    if (cache.has(cacheKey)) continue;
+    cache.set(cacheKey, ''); // reserve, filled below — dedupes concurrent identical lookups
+    lookups.push(
+      (kind === 'getvar' ? api.variables.local.get(chatId, key) : api.variables.chat.get(chatId, key))
+        .then((value) => { cache.set(cacheKey, value ?? ''); })
+        .catch((err) => {
+          varsLog.warn('dynamic var resolve failed:', { kind, key, err: err instanceof Error ? err.message : String(err) });
+          cache.set(cacheKey, `{{${kind}::${key}}}`); // leave literal on failure
+        }),
+    );
+  }
+  await Promise.all(lookups);
+
+  return text.replace(DYNAMIC_VAR_RE, (full, kind: string, key: string) => {
+    const v = cache.get(`${kind.toLowerCase()}::${key}`);
+    return v !== undefined ? v : full;
+  });
 }
 
 export function installMacroResolveHandler(): void {
