@@ -7,7 +7,7 @@ import type {
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
-import { resolveMacroText } from './macro-resolve';
+import { resolveMacroText, resolveDynamicVarMacros, DYNAMIC_VAR_MACRO_NAMES } from './macro-resolve';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -127,23 +127,19 @@ export async function processMessageContent(
       const { args, content: body } = parseInjectArgs(im[1] ?? '');
       if (!body.trim()) continue;
       // Resolve {{macros}} in the inject body NOW, at /inject command time —
-      // not in the interceptor below. Checked against Lumiverse host source
-      // (src/spindle/interceptor-pipeline.ts, src/services/generate.service.ts):
-      // the interceptor's `context` argument is built from `SpindleContext`
-      // ({chatId, connectionId, personaId, generationType}) and userId is
-      // passed to interceptorPipeline.run() as a *separate* parameter that
-      // is never forwarded into context or into the handler call. So
-      // `ctx.userId` inside installInjectInterceptor below is always
-      // undefined for an operator-scoped extension like Vishrun — there is
-      // no way to get a userId there, and api.macros.resolve hard-requires
-      // one ("userId is required for operator-scoped extensions",
-      // worker-host.ts resolveEffectiveUserId). MessageContentProcessorCtx
-      // (this function), by contrast, genuinely has userId. So resolve here,
-      // once, and store the already-resolved text — the inject re-fires
-      // every generation from storage either way, this just changes *when*
-      // the macro is evaluated (at /inject time vs at every later
-      // generation). Falls back to the raw body on any failure.
-      const resolvedBody = await resolveMacroText(body, ctx.chatId, undefined, ctx.userId);
+      // EXCEPT {{getvar}}/{{getchatvar}}, which are deliberately left as
+      // literal text here (DYNAMIC_VAR_MACRO_NAMES) and resolved fresh on
+      // every generation by the interceptor below via resolveDynamicVarMacros
+      // — that one doesn't need userId, so it can actually be dynamic.
+      // Everything else (user/char/random/roll/pick/setvar/...) genuinely
+      // can't be: api.macros.resolve requires userId, which only this
+      // function (MessageContentProcessorCtx) has — the interceptor's
+      // context, per Lumiverse host source (interceptor-pipeline.ts,
+      // generate.service.ts), is {chatId, connectionId, personaId,
+      // generationType} with no userId at all for an operator-scoped
+      // extension. So those stay frozen at /inject time; this is a hard
+      // host-API limit, not a choice. Falls back to the raw body on failure.
+      const resolvedBody = await resolveMacroText(body, ctx.chatId, undefined, ctx.userId, DYNAMIC_VAR_MACRO_NAMES);
       const id = args.id ?? Math.random().toString(36).slice(2, 10);
       const spec: InjectSpec = {
         id,
@@ -197,19 +193,21 @@ function installInjectInterceptor(): void {
     const breakdown: Array<{ messageIndex: number; name: string }> = [];
 
     for (const spec of injects) {
-      // spec.content is already macro-resolved — see processMessageContent's
-      // /inject handling above, which does the resolve at command-time
-      // because (unlike here) it actually has ctx.userId available. This
-      // ctx.userId check is intentionally kept as a no-op-safe fallback: if
-      // a future Lumiverse host version starts threading userId through
-      // SpindleContext / interceptorPipeline.run into the handler call, this
-      // will start re-resolving on every generation for free. As of this
-      // host version it never fires (context is { chatId, connectionId,
-      // personaId, generationType } — no userId), so this is a guaranteed
-      // pass-through of the already-resolved spec.content.
-      const resolvedContent = ctx.userId
-        ? await resolveMacroText(spec.content, ctx.chatId, ctx.characterId, ctx.userId)
-        : spec.content;
+      // Dynamic path — re-resolves {{getvar::x}}/{{getchatvar::x}} fresh on
+      // every generation. Uses api.variables.local.get/chat.get directly,
+      // which take only (chatId, key) — no userId — so this actually works
+      // inside the interceptor, unlike the full macro engine. This is what
+      // makes /inject content non-static for the variable-getter macros.
+      let resolvedContent = await resolveDynamicVarMacros(spec.content, ctx.chatId);
+      // Forward-compat fallback: any OTHER macro type left in spec.content
+      // (shouldn't normally happen — those are resolved once at /inject
+      // time in processMessageContent, see above) only resolves here if a
+      // future host version starts threading userId into the interceptor's
+      // context. Today ctx.userId is always undefined here, so this is a
+      // guaranteed no-op pass-through.
+      if (ctx.userId) {
+        resolvedContent = await resolveMacroText(resolvedContent, ctx.chatId, ctx.characterId, ctx.userId);
+      }
       const msg: LlmMessageDTO = { role: spec.role, content: resolvedContent };
       let insertAt: number;
 
