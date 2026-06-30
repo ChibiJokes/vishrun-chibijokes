@@ -7,6 +7,7 @@ import type {
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
+import { resolveMacroText } from './macro-resolve';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -167,7 +168,7 @@ export async function processMessageContent(
 
 function installInjectInterceptor(): void {
   api.registerInterceptor(async (messages: LlmMessageDTO[], context: unknown): Promise<InterceptorResultDTO> => {
-    const ctx = context as { chatId?: string };
+    const ctx = context as { chatId?: string; characterId?: string; userId?: string };
     if (!ctx.chatId) return { messages };
 
     const injects = await readInjects(ctx.chatId);
@@ -178,7 +179,17 @@ function installInjectInterceptor(): void {
     const breakdown: Array<{ messageIndex: number; name: string }> = [];
 
     for (const spec of injects) {
-      const msg: LlmMessageDTO = { role: spec.role, content: spec.content };
+      // spec.content is the raw text stored by /inject — author-typed, so it
+      // may contain `{{getvar::x}}` etc. This was previously spliced straight
+      // into the LLM message unresolved (the prompt literally contained the
+      // macro string). Resolve it here, same engine call the widget render
+      // path uses, so /inject content gets the same macro support as the
+      // rest of vishrun. Falls back to the raw text on any failure — never
+      // blocks the generation over a bad macro.
+      const resolvedContent = ctx.userId
+        ? await resolveMacroText(spec.content, ctx.chatId, ctx.characterId, ctx.userId)
+        : spec.content;
+      const msg: LlmMessageDTO = { role: spec.role, content: resolvedContent };
       let insertAt: number;
 
       if (spec.position === 'before') {
