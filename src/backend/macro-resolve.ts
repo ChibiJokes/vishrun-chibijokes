@@ -66,6 +66,24 @@ const SENTINEL_RE = new RegExp(`${NUL}VSHMSK(\\d+)${NUL}`, 'g');
 // instead of being frozen at /inject time.
 export const DYNAMIC_VAR_MACRO_NAMES: ReadonlySet<string> = new Set(['getvar', 'getchatvar']);
 
+// Macro names that resolve with zero host lookup at all — no chatId,
+// characterId, or userId needed, just local computation (Math.random()) or
+// data the interceptor already has in hand (the message array). Unlike
+// DYNAMIC_VAR_MACRO_NAMES these never touch api.* — see resolveLocalDynamicMacros.
+//
+// {{user}}/{{char}}/{{group}} are NOT here: those need personas.get /
+// characters.get, and the host (worker-host.ts handlePersonasGet et al.)
+// hard-requires a resolved userId — "userId is required for operator-scoped
+// extensions" — which the interceptor's context never carries (confirmed
+// against interceptor-pipeline.ts: handler(messages, context) never receives
+// the userId argument that run() takes; generate.service.ts's spindleContext
+// is only {chatId, connectionId, personaId, generationType}). That's a hard
+// host-API ceiling for an operator-scoped extension, not something fixable
+// from this side.
+export const LOCAL_DYNAMIC_MACRO_NAMES: ReadonlySet<string> = new Set([
+  'random', 'roll', 'pick', 'newline', 'input',
+]);
+
 function maskInvalidMacros(
   template: string,
   deferNames: ReadonlySet<string> = new Set(),
@@ -262,6 +280,66 @@ export async function resolveDynamicVarMacros(text: string, chatId: string): Pro
   return text.replace(DYNAMIC_VAR_RE, (full, kind: string, key: string) => {
     const v = cache.get(`${kind.toLowerCase()}::${key}`);
     return v !== undefined ? v : full;
+  });
+}
+
+// Resolve {{random}}, {{roll}}, {{pick}}, {{newline}}, {{input}} purely
+// locally — no api.* call, no userId, no async. Mirrors Lumiverse's own
+// handlers exactly (src/macros/definitions/entropy.ts and primitives.ts):
+// `random` does numeric-range-or-list-pick, `roll` is NdS dice notation
+// capped at 100 dice, `pick` is uniform-random over its arg list, `newline`
+// is a literal "\n", and `input` is the last user message — which the
+// interceptor already has as the first element of its `messages` argument,
+// so no lookup is needed for it either. Synchronous and side-effect-free,
+// so (unlike resolveDynamicVarMacros) it can run directly in the hot path.
+const LOCAL_DYNAMIC_RE = /\{\{\s*(random|roll|pick|newline|input)\s*(?:::([^}]*))?\}\}/gi;
+
+function rollDice(notation: string): string {
+  const match = notation.match(/^(\d+)d(\d+)$/i);
+  if (!match) return '0';
+  const count = Math.min(parseInt(match[1], 10), 100);
+  const sides = parseInt(match[2], 10);
+  if (sides < 1 || count < 1) return '0';
+  let total = 0;
+  for (let i = 0; i < count; i++) total += Math.floor(Math.random() * sides) + 1;
+  return String(total);
+}
+
+function splitArgs(argStr: string | undefined): string[] {
+  if (argStr === undefined || argStr === '') return [];
+  return argStr.split('::');
+}
+
+function randomMacro(argStr: string | undefined): string {
+  const args = splitArgs(argStr);
+  if (args.length === 0) return String(Math.round(Math.random()));
+  const allNumeric = args.length <= 2 && args.every((a) => a.trim() !== '' && !isNaN(Number(a)));
+  if (allNumeric) {
+    const min = parseInt(args[0], 10) || 0;
+    const max = parseInt(args[1], 10) || 1;
+    if (max < min) return String(min);
+    return String(Math.floor(Math.random() * (max - min + 1)) + min);
+  }
+  return args[Math.floor(Math.random() * args.length)];
+}
+
+function pickMacro(argStr: string | undefined): string {
+  const args = splitArgs(argStr);
+  if (args.length === 0) return '';
+  return args[Math.floor(Math.random() * args.length)];
+}
+
+export function resolveLocalDynamicMacros(text: string, lastUserMessage: string): string {
+  if (!text.includes('{{')) return text;
+  return text.replace(LOCAL_DYNAMIC_RE, (full, name: string, argStr: string | undefined) => {
+    switch (name.toLowerCase()) {
+      case 'newline': return '\n';
+      case 'input': return lastUserMessage;
+      case 'roll': return rollDice((argStr ?? '1d6').trim());
+      case 'random': return randomMacro(argStr);
+      case 'pick': return pickMacro(argStr);
+      default: return full;
+    }
   });
 }
 
