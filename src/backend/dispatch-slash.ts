@@ -1,6 +1,16 @@
 import { api, varsLog } from './common';
 import { parseSetvarChain, type SetvarKind } from './parsers/setvar';
 import { applySetvarOp, type VarsApi } from './setvar-ops';
+import { resolveMacroText, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES } from './macro-resolve';
+
+// Same deferral set as message-content-processor.ts's /inject path — keep
+// getvar/getchatvar/random/roll/pick/newline/input literal here so the
+// interceptor re-resolves them fresh every generation instead of freezing
+// them at dispatch time.
+const DEFERRED_MACRO_NAMES: ReadonlySet<string> = new Set([
+  ...DYNAMIC_VAR_MACRO_NAMES,
+  ...LOCAL_DYNAMIC_MACRO_NAMES,
+]);
 
 // Frontend → backend: dispatch a slash-command payload that the iframe shim
 // caught from a card's `pushToSillyTavern` fallback (which would otherwise hit
@@ -131,10 +141,17 @@ export async function dispatchSlashText(
     const body = text.replace(/^\s*\/inject\s*/i, '');
     const { args, content } = parseInjectArgs(body);
     if (content.trim()) {
+      // Resolve {{user}}/{{char}}/{{group}}/{{setvar}}/etc. now, same as the
+      // typed-in-chat /inject path — this is the one call site here that has
+      // userId, so it's the only place these can ever resolve. Without this
+      // they were saved as raw literal text forever (the interceptor that
+      // re-resolves on every generation has no userId, so it can't pick up
+      // the slack the way it does for getvar/random/etc.).
+      const resolvedContent = await resolveMacroText(content.trim(), chatId, undefined, userId, DEFERRED_MACRO_NAMES);
       const id = args.id ?? Math.random().toString(36).slice(2, 10);
       const spec: InjectSpec = {
         id,
-        content: content.trim(),
+        content: resolvedContent,
         role: (args.role === 'user' || args.role === 'assistant') ? args.role : 'system',
         depth: Math.max(0, parseInt(args.depth ?? '0', 10) || 0),
         position: (args.position === 'before' || args.position === 'after') ? args.position : 'chat',
