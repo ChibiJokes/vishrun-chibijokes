@@ -80,6 +80,7 @@ const FLUSHINJECT_RE = /\/flushinject\b/i;
 const DEFERRED_MACRO_NAMES: ReadonlySet<string> = new Set([
   ...DYNAMIC_VAR_MACRO_NAMES,
   ...LOCAL_DYNAMIC_MACRO_NAMES,
+  'user', 'char', 'group',
 ]);
 
 const SELF_CLOSING_CUSTOM_RE = /<([A-Z][a-zA-Z0-9_-]*)(\s[^>]*)?\s*\/>/g;
