@@ -234,7 +234,7 @@ function installInjectInterceptor(): void {
       // context. Today ctx.userId is always undefined here, so this is a
       // guaranteed no-op pass-through.
       if (ctx.userId) {
-        resolvedContent = await resolveMacroText(resolvedContent, ctx.chatId, ctx.characterId, ctx.userId);
+        resolvedContent = await resolveMacroText(resolvedContent, ctx.chatId, ctx.characterId, ctx.userId, GROUP_MACRO_NAME);
       }
       const msg: LlmMessageDTO = { role: spec.role, content: resolvedContent };
       let insertAt: number;
