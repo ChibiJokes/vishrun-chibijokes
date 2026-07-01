@@ -84,6 +84,8 @@ export const LOCAL_DYNAMIC_MACRO_NAMES: ReadonlySet<string> = new Set([
   'random', 'roll', 'pick', 'newline', 'input',
 ]);
 
+export const GROUP_MACRO_NAME: ReadonlySet<string> = new Set(['group']);
+
 function maskInvalidMacros(
   template: string,
   deferNames: ReadonlySet<string> = new Set(),
@@ -341,6 +343,36 @@ export function resolveLocalDynamicMacros(text: string, lastUserMessage: string)
       default: return full;
     }
   });
+}
+
+const GROUP_MACRO_RE = /\{\{\s*group\s*\}\}/gi;
+
+export async function resolveGroupMacro(text: string, chatId: string, userId: string): Promise<string> {
+  if (!text.includes('{{')) return text;
+  GROUP_MACRO_RE.lastIndex = 0;
+  if (!GROUP_MACRO_RE.test(text)) return text;
+
+  try {
+    const chat = await api.chats.get(chatId, userId);
+    if (!chat?.metadata?.group || !Array.isArray(chat.metadata.character_ids)) {
+      return text.replace(GROUP_MACRO_RE, '');
+    }
+    const names = await Promise.all(
+      (chat.metadata.character_ids as string[]).map(async (id) => {
+        try {
+          const c = await api.characters.get(id, userId);
+          return c?.name;
+        } catch {
+          return undefined;
+        }
+      }),
+    );
+    const joined = names.filter((n): n is string => !!n).join(', ');
+    return text.replace(GROUP_MACRO_RE, joined);
+  } catch (err) {
+    varsLog.warn('group macro resolve failed:', err instanceof Error ? err.message : String(err));
+    return text;
+  }
 }
 
 export function installMacroResolveHandler(): void {
