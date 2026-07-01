@@ -7,7 +7,7 @@ import type {
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
-import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES } from './macro-resolve';
+import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, resolveGroupMacro, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES, GROUP_MACRO_NAME } from './macro-resolve';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
