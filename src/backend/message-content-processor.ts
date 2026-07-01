@@ -7,7 +7,7 @@ import type {
 import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
-import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, resolveGroupMacro, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES, GROUP_MACRO_NAME } from './macro-resolve';
+import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES } from './macro-resolve';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -80,7 +80,6 @@ const FLUSHINJECT_RE = /\/flushinject\b/i;
 const DEFERRED_MACRO_NAMES: ReadonlySet<string> = new Set([
   ...DYNAMIC_VAR_MACRO_NAMES,
   ...LOCAL_DYNAMIC_MACRO_NAMES,
-  'user', 'char', 'group',
 ]);
 
 const SELF_CLOSING_CUSTOM_RE = /<([A-Z][a-zA-Z0-9_-]*)(\s[^>]*)?\s*\/>/g;
@@ -226,7 +225,6 @@ function installInjectInterceptor(): void {
       // already in `messages`), so they resolve synchronously and locally
       // right here, fresh every generation, with no userId dependency.
       resolvedContent = resolveLocalDynamicMacros(resolvedContent, lastUserMessage);
-      resolvedContent = await resolveGroupMacro(resolvedContent, ctx.chatId, ctx.userId ?? '');
       // Forward-compat fallback: any OTHER macro type left in spec.content
       // (shouldn't normally happen — those are resolved once at /inject
       // time in processMessageContent, see above) only resolves here if a
@@ -234,7 +232,7 @@ function installInjectInterceptor(): void {
       // context. Today ctx.userId is always undefined here, so this is a
       // guaranteed no-op pass-through.
       if (ctx.userId) {
-        resolvedContent = await resolveMacroText(resolvedContent, ctx.chatId, ctx.characterId, ctx.userId, GROUP_MACRO_NAME);
+        resolvedContent = await resolveMacroText(resolvedContent, ctx.chatId, ctx.characterId, ctx.userId);
       }
       const msg: LlmMessageDTO = { role: spec.role, content: resolvedContent };
       let insertAt: number;
