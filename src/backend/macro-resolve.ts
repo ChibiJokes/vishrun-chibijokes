@@ -350,17 +350,18 @@ export function installMacroResolveHandler(): void {
     void (async () => {
       const results: string[] = new Array(templates.length);
       for (let i = 0; i < templates.length; i++) {
-        // Persist + strip setvars first so subsequent {{getvar}} on the same
-        // chat (and within this same template) reads the freshly set value
-        // when the engine resolves. addvar/etc. and disabled gvars pass
-        // through to the engine no-op via commit:false.
-        // userId — required for operator-scoped extensions (which is how Vishrun
-        // installs); the host injects it as onFrontendMessage's 2nd arg.
-        // commit:false — `{{setvar}}` that happens to appear in widget HTML
-        // must not persist during a render pass; only the slash interceptor writes.
         results[i] = await resolveMacroText(templates[i], chatId, characterId, userId);
       }
+      
+      // 1. Send the HTML response back FIRST. This un-locks the frontend UI shield.
       api.sendToFrontend({ type: 'resolve_macros_response', requestId, results }, userId);
+      
+      // 2. Now that the UI is unlocked, we wait 100ms for it to finish drawing the HTML, 
+      // then we send a safe reactivity ping to force the variables to visually update!
+      setTimeout(() => {
+        void api.variables.local.set(chatId, '__vishrun_sync', Date.now().toString());
+      }, 100);
+      
     })();
   });
 }
