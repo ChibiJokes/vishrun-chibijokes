@@ -29,11 +29,17 @@ export async function applySetvarOp(
   vars: VarsApi = api.variables,
 ): Promise<boolean> {
   if (op.kind === 'setvar') {
+    // 1. Await the change so backend memory stays perfectly synchronized
     await vars.local.set(chatId, op.name, op.value);
+    // 2. Fire a redundant update 50ms later to punch through the UI render lock
+    setTimeout(() => { void vars.local.set(chatId, op.name, op.value); }, 50);
     return true;
   }
   if (op.kind === 'setchatvar') {
+    // 1. Await the change so backend memory stays perfectly synchronized
     await vars.chat.set(chatId, op.name, op.value);
+    // 2. Fire a redundant update 50ms later to punch through the UI render lock
+    setTimeout(() => { void vars.chat.set(chatId, op.name, op.value); }, 50);
     return true;
   }
   // setgvar / setglobalvar — disabled, see header comment.
