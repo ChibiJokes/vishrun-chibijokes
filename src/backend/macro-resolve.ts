@@ -193,16 +193,11 @@ async function runApplyAndStripSetvars(
     }
   }
 
-  let out = '';
-  let cursor = 0;
-  for (let i = 0; i < matches.length; i++) {
-    const { start, end } = matches[i];
-    out += template.slice(cursor, start);
-    if (!stripFlags[i]) out += template.slice(start, end);
-    cursor = end;
-  }
-  out += template.slice(cursor);
-  return out;
+// FIX: We no longer strip the setvars from the template!
+  // By leaving them in, Lumiverse's host engine processes them and stores the new value 
+  // in its immediate short-term memory. This guarantees that any {{getchatvar}} in this 
+  // exact same widget sees the new value instantly, completely bypassing the database lag!
+  return template;
 }
 
 // Resolve `{{macro}}` syntax in a single piece of text via the Lumiverse
