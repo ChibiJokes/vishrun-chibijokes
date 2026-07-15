@@ -28,22 +28,16 @@ export async function applySetvarOp(
   userId: string,
   vars: VarsApi = api.variables,
 ): Promise<boolean> {
-  if (op.kind === 'setvar') {
-    // 1. Immediate sync update for backend memory
+if (op.kind === 'setvar') {
     await vars.local.set(chatId, op.name, op.value);
-    
-    // 2. Cascade updates to guarantee we hit a frame where the UI is unlocked.
-    setTimeout(() => { void vars.local.set(chatId, op.name, op.value); }, 100);
-    setTimeout(() => { void vars.local.set(chatId, op.name, op.value); }, 500);
+    // Dummy ping to bypass DB deduplication and force UI refresh
+    setTimeout(() => { void vars.local.set(chatId, '__vishrun_sync', Date.now().toString()); }, 150);
     return true;
   }
   if (op.kind === 'setchatvar') {
-    // 1. Immediate sync update for backend memory
     await vars.chat.set(chatId, op.name, op.value);
-    
-    // 2. Cascade updates to guarantee we hit a frame where the UI is unlocked.
-    setTimeout(() => { void vars.chat.set(chatId, op.name, op.value); }, 100);
-    setTimeout(() => { void vars.chat.set(chatId, op.name, op.value); }, 500);
+    // Dummy ping to bypass DB deduplication and force UI refresh
+    setTimeout(() => { void vars.chat.set(chatId, '__vishrun_sync', Date.now().toString()); }, 150);
     return true;
   }
   // setgvar / setglobalvar — disabled, see header comment.
