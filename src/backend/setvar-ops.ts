@@ -29,17 +29,21 @@ export async function applySetvarOp(
   vars: VarsApi = api.variables,
 ): Promise<boolean> {
   if (op.kind === 'setvar') {
-    // 1. Await the change so backend memory stays perfectly synchronized
+    // 1. Immediate sync update for backend memory
     await vars.local.set(chatId, op.name, op.value);
-    // 2. Fire a redundant update 50ms later to punch through the UI render lock
-    setTimeout(() => { void vars.local.set(chatId, op.name, op.value); }, 50);
+    
+    // 2. Cascade updates to guarantee we hit a frame where the UI is unlocked.
+    setTimeout(() => { void vars.local.set(chatId, op.name, op.value); }, 100);
+    setTimeout(() => { void vars.local.set(chatId, op.name, op.value); }, 500);
     return true;
   }
   if (op.kind === 'setchatvar') {
-    // 1. Await the change so backend memory stays perfectly synchronized
+    // 1. Immediate sync update for backend memory
     await vars.chat.set(chatId, op.name, op.value);
-    // 2. Fire a redundant update 50ms later to punch through the UI render lock
-    setTimeout(() => { void vars.chat.set(chatId, op.name, op.value); }, 50);
+    
+    // 2. Cascade updates to guarantee we hit a frame where the UI is unlocked.
+    setTimeout(() => { void vars.chat.set(chatId, op.name, op.value); }, 100);
+    setTimeout(() => { void vars.chat.set(chatId, op.name, op.value); }, 500);
     return true;
   }
   // setgvar / setglobalvar — disabled, see header comment.
