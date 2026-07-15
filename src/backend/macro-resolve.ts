@@ -224,12 +224,7 @@ export async function resolveMacroText(
 ): Promise<string> {
   try {
     const stripped = await applyAndStripSetvars(original, chatId, userId);
-    
-    // FIX: Manually resolve getvar/getchatvar against the live database BEFORE handing 
-    // off to the host macro engine. This bypasses Lumiverse's stale variable cache!
-    const liveVarsResolved = await resolveDynamicVarMacros(stripped, chatId);
-    
-    const { masked, masks } = maskInvalidMacros(liveVarsResolved, deferNames);
+    const { masked, masks } = maskInvalidMacros(stripped, deferNames);
     const { text, diagnostics } = await api.macros.resolve(masked, {
       chatId,
       characterId,
