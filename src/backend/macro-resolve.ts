@@ -182,11 +182,6 @@ async function runApplyAndStripSetvars(
     if (!NAME_RE.test(name)) continue;
     const currentBag = kind === 'setvar' ? localBag : kind === 'setchatvar' ? chatBag : null;
     if (currentBag && currentBag[name] === value) {
-      // Backend knows the value, but we must ping the dummy variable anyway
-      // just in case the frontend missed the initial render update.
-      const targetApi = kind === 'setvar' ? vars.local : vars.chat;
-      setTimeout(() => { void targetApi.set(chatId, '__vishrun_sync', Date.now().toString()); }, 150);
-      
       stripFlags[i] = true;
       continue;
     }
@@ -229,7 +224,12 @@ export async function resolveMacroText(
 ): Promise<string> {
   try {
     const stripped = await applyAndStripSetvars(original, chatId, userId);
-    const { masked, masks } = maskInvalidMacros(stripped, deferNames);
+    
+    // FIX: Manually resolve getvar/getchatvar against the live database BEFORE handing 
+    // off to the host macro engine. This bypasses Lumiverse's stale variable cache!
+    const liveVarsResolved = await resolveDynamicVarMacros(stripped, chatId);
+    
+    const { masked, masks } = maskInvalidMacros(liveVarsResolved, deferNames);
     const { text, diagnostics } = await api.macros.resolve(masked, {
       chatId,
       characterId,
