@@ -28,16 +28,12 @@ export async function applySetvarOp(
   userId: string,
   vars: VarsApi = api.variables,
 ): Promise<boolean> {
-if (op.kind === 'setvar') {
+  if (op.kind === 'setvar') {
     await vars.local.set(chatId, op.name, op.value);
-    // Dummy ping to bypass DB deduplication and force UI refresh
-    setTimeout(() => { void vars.local.set(chatId, '__vishrun_sync', Date.now().toString()); }, 150);
     return true;
   }
   if (op.kind === 'setchatvar') {
     await vars.chat.set(chatId, op.name, op.value);
-    // Dummy ping to bypass DB deduplication and force UI refresh
-    setTimeout(() => { void vars.chat.set(chatId, '__vishrun_sync', Date.now().toString()); }, 150);
     return true;
   }
   // setgvar / setglobalvar — disabled, see header comment.
