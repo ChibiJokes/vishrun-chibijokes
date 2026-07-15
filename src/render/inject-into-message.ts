@@ -267,6 +267,11 @@ async function resolveMacrosForMessage(
 
   try {
     const resolved = await resolveMacrosBatch(ctx, chatId, characterId, templates);
+    
+    // FIX: Pause for 150ms to allow the backend to sync the new variables to the frontend.
+    // This ensures `fetchVariablesSnapshot` grabs the FRESH data for your scripts instead of the old data!
+    await new Promise((resolve) => setTimeout(resolve, 150));
+    
     templates.forEach((t, i) => {
       map.set(t, resolved[i]);
       resolutionCache.set(t, resolved[i]); // global cache, survives across processNode passes
