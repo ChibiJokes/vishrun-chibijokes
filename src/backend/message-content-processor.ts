@@ -115,14 +115,16 @@ export async function processMessageContent(
   const parsed = parseSetvarChain(content);
   if (parsed) {
     for (const { kind, key, value } of parsed.pairs) {
-      try {
-        await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
-      } catch (err) {
-        varsLog.warn(
-          `setvar failed for "${kind}::${key}":`,
-          err instanceof Error ? err.message : String(err),
-        );
-      }
+      setTimeout(async () => {
+        try {
+          await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
+        } catch (err) {
+          varsLog.warn(
+            `setvar failed for "${kind}::${key}":`,
+            err instanceof Error ? err.message : String(err),
+          );
+        }
+      }, 0);
     }
     content = parsed.strippedContent;
   }
@@ -280,4 +282,4 @@ function installInjectInterceptor(): void {
 export function installMessageContentProcessor(): void {
   api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
   installInjectInterceptor();
-  }
+}
