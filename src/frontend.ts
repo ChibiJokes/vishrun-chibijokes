@@ -198,10 +198,80 @@ export function setup(ctx: SpindleFrontendContext) {
 
   let lastPresetId: string = '__default__';
 
+  // Tracks cleanup for a deferred loadFor when activeChatId changes but
+  // characterId isn't populated yet (Lumiverse calls setActiveCharacter()
+  // after the chat API fetch completes, emitting no WS event). Cancelled on
+  // teardown and on any subsequent navigation that supersedes the deferred one.
+  let cancelPendingNavLoad: (() => void) | null = null;
+
+  function scheduleDeferredLoadFor(expectedChatId: string): void {
+    // Cancel any prior deferred load that hasn't fired yet.
+    if (cancelPendingNavLoad) {
+      cancelPendingNavLoad();
+      cancelPendingNavLoad = null;
+    }
+
+    let settled = false;
+
+    const resolve = () => {
+      if (settled) return;
+      settled = true;
+      window.removeEventListener('lumiverse:chat-items-populated', resolve);
+      clearTimeout(fallback);
+      cancelPendingNavLoad = null;
+      // Verify we're still on the same chat before loading.
+      const active = ctx.getActiveChat();
+      if (active.chatId === expectedChatId) {
+        console.log('[vishrun:diag] deferred loadFor resolved, characterId:', active.characterId);
+        void loadFor(active.characterId ?? null);
+      }
+    };
+
+    // Primary trigger: fires after Lumiverse renders messages (by which point
+    // setActiveCharacter has already been called with the real character ID).
+    window.addEventListener('lumiverse:chat-items-populated', resolve, { once: true });
+
+    // Fallback: if chat-items-populated never arrives (edge case), unblock after 3s.
+    const fallback = setTimeout(resolve, 3000);
+
+    cancelPendingNavLoad = () => {
+      settled = true;
+      window.removeEventListener('lumiverse:chat-items-populated', resolve);
+      clearTimeout(fallback);
+      cancelPendingNavLoad = null;
+    };
+  }
+
   const unsubSettingsUpdated = ctx.events.on('SETTINGS_UPDATED', (payload: unknown) => {
     const p = (payload || {}) as { key?: string };
     if (p.key === 'activeChatId' || p.key === 'activeCharacterId') {
-      void loadFor(ctx.getActiveChat().characterId ?? null);
+      // Cancel any in-flight deferred load from a previous navigation.
+      if (cancelPendingNavLoad) {
+        cancelPendingNavLoad();
+      }
+
+      const { characterId, chatId } = ctx.getActiveChat();
+
+      if (!chatId) {
+        // Navigating away from all chats — clear immediately.
+        void loadFor(null);
+        return;
+      }
+
+      if (characterId) {
+        // Character already known (navigation snapshot was staged, or the
+        // activeCharacterId setting changed directly). Load immediately.
+        void loadFor(characterId);
+        return;
+      }
+
+      // chatId is set but characterId is null. This is the post-update path:
+      // Lumiverse calls setActiveChat(chatId, null) then asynchronously fetches
+      // the chat and calls setActiveCharacter(id) — with no WS event in between.
+      // Defer until lumiverse:chat-items-populated signals that the character
+      // and messages are ready.
+      console.log('[vishrun:diag] SETTINGS_UPDATED activeChatId with null characterId — deferring loadFor until chat-items-populated');
+      scheduleDeferredLoadFor(chatId);
       return;
     }
     // Bare WS event (no key) = batch settings flush. Fires when user switches
@@ -234,6 +304,9 @@ export function setup(ctx: SpindleFrontendContext) {
   }
 
   return () => {
+    if (cancelPendingNavLoad) {
+      cancelPendingNavLoad();
+    }
     unsubChatChanged();
     unsubSettingsUpdated();
     unsubMessageSwiped();
