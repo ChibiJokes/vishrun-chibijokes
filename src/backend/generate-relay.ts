@@ -30,6 +30,28 @@ interface GenerateRelayRequest {
   tool_choice?: unknown;
 }
 
+
+interface GenerateRelayCancelRequest {
+  type: 'vsh_generate_cancel';
+  requestId: string;
+}
+
+interface PendingGenerateRelay {
+  userId: string;
+  controller: AbortController;
+}
+
+const pendingGenerateRelays = new Map<string, PendingGenerateRelay>();
+
+function isGenerateRelayCancelRequest(p: unknown): p is GenerateRelayCancelRequest {
+  return (
+    !!p &&
+    typeof p === 'object' &&
+    (p as { type?: unknown }).type === 'vsh_generate_cancel' &&
+    typeof (p as { requestId?: unknown }).requestId === 'string'
+  );
+}
+
 function isGenerateRelayRequest(p: unknown): p is GenerateRelayRequest {
   return (
     !!p &&
@@ -42,15 +64,24 @@ function isGenerateRelayRequest(p: unknown): p is GenerateRelayRequest {
 
 export function installGenerateRelayHandler(): void {
   api.onFrontendMessage((payload, userId) => {
+    if (isGenerateRelayCancelRequest(payload)) {
+      const pending = pendingGenerateRelays.get(payload.requestId);
+      if (pending && pending.userId === userId) pending.controller.abort();
+      return;
+    }
+
     if (!isGenerateRelayRequest(payload)) return;
 
     const { requestId, messages, provider, model, connection_id, parameters, tools, tool_choice } = payload;
+    const controller = new AbortController();
+    pendingGenerateRelays.set(requestId, { userId, controller });
 
     const input: Record<string, unknown> = {
       provider: provider || '',
       model: model || '',
       messages,
       userId,
+      signal: controller.signal,
     };
     if (connection_id) input.connection_id = connection_id;
     if (parameters) input.parameters = parameters;
@@ -84,15 +115,20 @@ export function installGenerateRelayHandler(): void {
         );
       },
       (err: unknown) => {
+        const name = err instanceof Error ? err.name : '';
+        const message = err instanceof Error ? err.message : String(err);
         api.sendToFrontend(
           {
             type: 'vsh_generate_error',
             requestId,
-            error: err instanceof Error ? err.message : String(err),
+            error: name === 'AbortError' ? `AbortError: ${message || 'Generation aborted'}` : message,
           },
           userId,
         );
       },
-    );
+    ).finally(() => {
+      const pending = pendingGenerateRelays.get(requestId);
+      if (pending?.controller === controller) pendingGenerateRelays.delete(requestId);
+    });
   });
 }
