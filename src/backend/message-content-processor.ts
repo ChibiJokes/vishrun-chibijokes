@@ -8,6 +8,7 @@ import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
 import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES } from './macro-resolve';
+import { waitForPreGeneration } from './pre-generation-bridge';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -196,8 +197,10 @@ export async function processMessageContent(
 
 function installInjectInterceptor(): void {
   api.registerInterceptor(async (messages: LlmMessageDTO[], context: unknown): Promise<InterceptorResultDTO> => {
-    const ctx = context as { chatId?: string; characterId?: string; userId?: string };
+    const ctx = context as { chatId?: string; characterId?: string; userId?: string; generationType?: string; signal?: AbortSignal };
     if (!ctx.chatId) return { messages };
+
+    await waitForPreGeneration(ctx);
 
     const injects = await readInjects(ctx.chatId);
     if (injects.length === 0) return { messages };
