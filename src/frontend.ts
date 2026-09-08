@@ -25,6 +25,15 @@ interface MessageEventPayload {
   previousSwipeId?: number;
 }
 
+interface PreGenerationRequest {
+  requestId: string;
+  chatId: string;
+  generationType?: string;
+  signal: AbortSignal;
+}
+
+type PreGenerationHandler = (request: PreGenerationRequest) => void | Promise<void>;
+
 export function setup(ctx: SpindleFrontendContext) {
   const hooks = installMessageHooks(ctx);
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
@@ -36,11 +45,65 @@ export function setup(ctx: SpindleFrontendContext) {
   // localhost-only). Requests go: window → ctx.sendToBackend() → worker
   // → api.generate.raw() over IPC → result back here → resolve promise.
   const pendingGenerates = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  const preGenerationHandlers = new Set<PreGenerationHandler>();
+  const preGenerationControllers = new Map<string, AbortController>();
+
+  const syncPreGenerationSubscription = () => {
+    ctx.sendToBackend({
+      type: 'vsh_pre_generation_subscription',
+      active: preGenerationHandlers.size > 0,
+    });
+  };
+
+  (window as any).__vishrunRegisterPreGeneration = (handler: unknown) => {
+    if (typeof handler !== 'function') throw new TypeError('Pre-generation handler must be a function');
+    const typedHandler = handler as PreGenerationHandler;
+    preGenerationHandlers.add(typedHandler);
+    syncPreGenerationSubscription();
+    return () => {
+      preGenerationHandlers.delete(typedHandler);
+      syncPreGenerationSubscription();
+    };
+  };
+
+  const runPreGenerationHandlers = async (requestId: string, chatId: string, generationType?: string) => {
+    const controller = new AbortController();
+    preGenerationControllers.set(requestId, controller);
+
+    let error: string | undefined;
+    try {
+      const handlers = Array.from(preGenerationHandlers);
+      if (handlers.length > 0) {
+        const results = await Promise.allSettled(handlers.map((handler) => handler({
+          requestId,
+          chatId,
+          ...(generationType ? { generationType } : {}),
+          signal: controller.signal,
+        })));
+        const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+        if (failures.length > 0) {
+          error = failures.map((failure) => failure.reason instanceof Error ? failure.reason.message : String(failure.reason)).join('; ');
+        }
+      }
+    } finally {
+      preGenerationControllers.delete(requestId);
+      ctx.sendToBackend({
+        type: 'vsh_pre_generation_complete',
+        requestId,
+        ...(error ? { error } : {}),
+      });
+    }
+  };
 
   const unsubBackendMsg = ctx.onBackendMessage((msg: unknown) => {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; requestId?: string; result?: unknown; error?: string };
-    if (m.type === 'vsh_generate_result' && m.requestId) {
+    const m = msg as { type?: string; requestId?: string; result?: unknown; error?: string; chatId?: string; generationType?: string };
+    if (m.type === 'vsh_pre_generation_request' && m.requestId && m.chatId) {
+      void runPreGenerationHandlers(m.requestId, m.chatId, m.generationType);
+    } else if (m.type === 'vsh_pre_generation_cancel' && m.requestId) {
+      preGenerationControllers.get(m.requestId)?.abort();
+      preGenerationControllers.delete(m.requestId);
+    } else if (m.type === 'vsh_generate_result' && m.requestId) {
       pendingGenerates.get(m.requestId)?.resolve(m.result);
       pendingGenerates.delete(m.requestId);
     } else if (m.type === 'vsh_generate_error' && m.requestId) {
@@ -310,7 +373,12 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubMessageEdited();
     unsubMvuDisplayStrip();
     unsubStatusBarInject();
+    ctx.sendToBackend({ type: 'vsh_pre_generation_subscription', active: false });
+    preGenerationHandlers.clear();
+    for (const controller of preGenerationControllers.values()) controller.abort();
+    preGenerationControllers.clear();
     unsubBackendMsg();
+    delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunGenerate;
     hooks.dispose();
     ctx.dom.cleanup();
