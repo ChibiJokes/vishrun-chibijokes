@@ -44,9 +44,16 @@ export function setup(ctx: SpindleFrontendContext) {
   // that need LLM access on hosted Lumiverse (where /generate/raw is
   // localhost-only). Requests go: window → ctx.sendToBackend() → worker
   // → api.generate.raw() over IPC → result back here → resolve promise.
-  const pendingGenerates = new Map<string, { resolve: (v: unknown) => void; reject: (e: Error) => void }>();
+  type PendingGenerate = {
+    resolve: (v: unknown) => void;
+    reject: (e: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+    signal?: AbortSignal;
+    abortHandler?: () => void;
+  };
+  const pendingGenerates = new Map<string, PendingGenerate>();
   const preGenerationHandlers = new Set<PreGenerationHandler>();
-  const preGenerationControllers = new Map<string, AbortController>();
+  const preGenerationControllers = new Map<string, { controller: AbortController; chatId: string }>();
 
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
@@ -68,7 +75,7 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const runPreGenerationHandlers = async (requestId: string, chatId: string, generationType?: string) => {
     const controller = new AbortController();
-    preGenerationControllers.set(requestId, controller);
+    preGenerationControllers.set(requestId, { controller, chatId });
 
     let error: string | undefined;
     try {
@@ -101,28 +108,74 @@ export function setup(ctx: SpindleFrontendContext) {
     if (m.type === 'vsh_pre_generation_request' && m.requestId && m.chatId) {
       void runPreGenerationHandlers(m.requestId, m.chatId, m.generationType);
     } else if (m.type === 'vsh_pre_generation_cancel' && m.requestId) {
-      preGenerationControllers.get(m.requestId)?.abort();
+      preGenerationControllers.get(m.requestId)?.controller.abort();
       preGenerationControllers.delete(m.requestId);
     } else if (m.type === 'vsh_generate_result' && m.requestId) {
-      pendingGenerates.get(m.requestId)?.resolve(m.result);
+      const pending = pendingGenerates.get(m.requestId);
+      if (!pending) return;
       pendingGenerates.delete(m.requestId);
+      clearTimeout(pending.timer);
+      if (pending.signal && pending.abortHandler) pending.signal.removeEventListener('abort', pending.abortHandler);
+      pending.resolve(m.result);
     } else if (m.type === 'vsh_generate_error' && m.requestId) {
-      pendingGenerates.get(m.requestId)?.reject(new Error(m.error || 'Generation failed'));
+      const pending = pendingGenerates.get(m.requestId);
+      if (!pending) return;
       pendingGenerates.delete(m.requestId);
+      clearTimeout(pending.timer);
+      if (pending.signal && pending.abortHandler) pending.signal.removeEventListener('abort', pending.abortHandler);
+      const err = m.error?.startsWith('AbortError')
+        ? new DOMException(m.error.replace(/^AbortError:?\s*/, '') || 'Generation aborted', 'AbortError')
+        : new Error(m.error || 'Generation failed');
+      pending.reject(err);
     }
   });
 
-  (window as any).__vishrunGenerate = (opts: unknown) => {
+  const unsubGenerationStopped = ctx.events.on('GENERATION_STOPPED', (payload: unknown) => {
+    const stoppedChatId = (payload as { chatId?: string } | null)?.chatId;
+    for (const { controller, chatId } of preGenerationControllers.values()) {
+      if (!stoppedChatId || !chatId || String(stoppedChatId) === String(chatId)) controller.abort();
+    }
+  });
+
+  (window as any).__vishrunGenerate = (opts: unknown, signalArg?: AbortSignal) => {
     const requestId = crypto.randomUUID();
+    const raw = (opts && typeof opts === 'object') ? (opts as Record<string, unknown>) : {};
+    const embeddedSignal = raw.signal as AbortSignal | undefined;
+    const signal = signalArg || embeddedSignal;
+    const { signal: _omitSignal, ...serializableOpts } = raw;
+    void _omitSignal;
+
     return new Promise((resolve, reject) => {
-      pendingGenerates.set(requestId, { resolve, reject });
-      ctx.sendToBackend({ type: 'vsh_generate', requestId, ...(opts as object) });
-      setTimeout(() => {
-        if (pendingGenerates.has(requestId)) {
-          pendingGenerates.delete(requestId);
-          reject(new Error('Generation timed out'));
-        }
+      if (signal?.aborted) {
+        reject(new DOMException('Generation aborted', 'AbortError'));
+        return;
+      }
+
+      const timer = setTimeout(() => {
+        const pending = pendingGenerates.get(requestId);
+        if (!pending) return;
+        pendingGenerates.delete(requestId);
+        if (pending.signal && pending.abortHandler) pending.signal.removeEventListener('abort', pending.abortHandler);
+        ctx.sendToBackend({ type: 'vsh_generate_cancel', requestId });
+        pending.reject(new Error('Generation timed out'));
       }, 120000);
+
+      const pending: PendingGenerate = { resolve, reject, timer, signal };
+      if (signal) {
+        pending.abortHandler = () => {
+          const active = pendingGenerates.get(requestId);
+          if (!active) return;
+          pendingGenerates.delete(requestId);
+          clearTimeout(active.timer);
+          signal.removeEventListener('abort', pending.abortHandler!);
+          ctx.sendToBackend({ type: 'vsh_generate_cancel', requestId });
+          active.reject(new DOMException('Generation aborted', 'AbortError'));
+        };
+        signal.addEventListener('abort', pending.abortHandler, { once: true });
+      }
+
+      pendingGenerates.set(requestId, pending);
+      ctx.sendToBackend({ type: 'vsh_generate', requestId, ...serializableOpts });
     });
   };
 
@@ -375,8 +428,16 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubStatusBarInject();
     ctx.sendToBackend({ type: 'vsh_pre_generation_subscription', active: false });
     preGenerationHandlers.clear();
-    for (const controller of preGenerationControllers.values()) controller.abort();
+    for (const { controller } of preGenerationControllers.values()) controller.abort();
     preGenerationControllers.clear();
+    unsubGenerationStopped();
+    for (const [requestId, pending] of pendingGenerates) {
+      clearTimeout(pending.timer);
+      if (pending.signal && pending.abortHandler) pending.signal.removeEventListener('abort', pending.abortHandler);
+      ctx.sendToBackend({ type: 'vsh_generate_cancel', requestId });
+      pending.reject(new DOMException('Extension stopped', 'AbortError'));
+    }
+    pendingGenerates.clear();
     unsubBackendMsg();
     delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunGenerate;
