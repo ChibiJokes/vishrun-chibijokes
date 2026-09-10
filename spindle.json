@@ -12,6 +12,7 @@
     "chats",
     "characters",
     "unsafe_eval",
+    "context_handler",
     "interceptor",
     "generation",
     "world_books"
