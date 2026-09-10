@@ -25,11 +25,22 @@ interface MessageEventPayload {
   previousSwipeId?: number;
 }
 
+interface ActivatedWorldInfoSummary {
+  id: string;
+  comment?: string;
+  keys?: string[];
+  source?: string;
+  score?: number;
+  bookId?: string;
+  bookSource?: string;
+}
+
 interface PreGenerationRequest {
   requestId: string;
   chatId: string;
   generationType?: string;
-  activatedWorldInfo?: unknown;
+  activatedWorldInfo: ActivatedWorldInfoSummary[];
+  getWorldInfoEntries: () => Promise<unknown[]>;
   signal: AbortSignal;
 }
 
@@ -53,6 +64,7 @@ export function setup(ctx: SpindleFrontendContext) {
     abortHandler?: () => void;
   };
   const pendingGenerates = new Map<string, PendingGenerate>();
+  const pendingWorldInfoLookups = new Map<string, { resolve: (entries: unknown[]) => void; reject: (error: Error) => void }>();
   const preGenerationHandlers = new Set<PreGenerationHandler>();
   const preGenerationControllers = new Map<string, { controller: AbortController; chatId: string }>();
 
@@ -74,9 +86,46 @@ export function setup(ctx: SpindleFrontendContext) {
     };
   };
 
-  const runPreGenerationHandlers = async (requestId: string, chatId: string, generationType?: string, activatedWorldInfo?: unknown) => {
+  const requestWorldInfoEntries = (requestId: string, signal: AbortSignal): Promise<unknown[]> => {
+    if (signal.aborted) {
+      const reason = signal.reason;
+      return Promise.reject(reason instanceof Error ? reason : new DOMException('Aborted', 'AbortError'));
+    }
+
+    return new Promise<unknown[]>((resolve, reject) => {
+      const onAbort = () => {
+        pendingWorldInfoLookups.delete(requestId);
+        const reason = signal.reason;
+        reject(reason instanceof Error ? reason : new DOMException('Aborted', 'AbortError'));
+      };
+      signal.addEventListener('abort', onAbort, { once: true });
+      pendingWorldInfoLookups.set(requestId, {
+        resolve: entries => {
+          signal.removeEventListener('abort', onAbort);
+          resolve(entries);
+        },
+        reject: error => {
+          signal.removeEventListener('abort', onAbort);
+          reject(error);
+        },
+      });
+      ctx.sendToBackend({ type: 'vsh_pre_generation_world_info_request', requestId });
+    });
+  };
+
+  const runPreGenerationHandlers = async (
+    requestId: string,
+    chatId: string,
+    generationType?: string,
+    activatedWorldInfo: ActivatedWorldInfoSummary[] = [],
+  ) => {
     const controller = new AbortController();
     preGenerationControllers.set(requestId, { controller, chatId });
+    let worldInfoPromise: Promise<unknown[]> | null = null;
+    const getWorldInfoEntries = () => {
+      if (!worldInfoPromise) worldInfoPromise = requestWorldInfoEntries(requestId, controller.signal);
+      return worldInfoPromise;
+    };
 
     let error: string | undefined;
     try {
@@ -87,6 +136,7 @@ export function setup(ctx: SpindleFrontendContext) {
           chatId,
           ...(generationType ? { generationType } : {}),
           activatedWorldInfo,
+          getWorldInfoEntries,
           signal: controller.signal,
         })));
         const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
@@ -96,6 +146,11 @@ export function setup(ctx: SpindleFrontendContext) {
       }
     } finally {
       preGenerationControllers.delete(requestId);
+      const pendingWorldInfo = pendingWorldInfoLookups.get(requestId);
+      if (pendingWorldInfo) {
+        pendingWorldInfoLookups.delete(requestId);
+        pendingWorldInfo.reject(new DOMException('Pre-generation completed', 'AbortError'));
+      }
       ctx.sendToBackend({
         type: 'vsh_pre_generation_complete',
         requestId,
@@ -106,12 +161,28 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubBackendMsg = ctx.onBackendMessage((msg: unknown) => {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; requestId?: string; result?: unknown; error?: string; chatId?: string; generationType?: string; activatedWorldInfo?: unknown };
+    const m = msg as { type?: string; requestId?: string; result?: unknown; entries?: unknown[]; error?: string; chatId?: string; generationType?: string; activatedWorldInfo?: ActivatedWorldInfoSummary[] };
     if (m.type === 'vsh_pre_generation_request' && m.requestId && m.chatId) {
-      void runPreGenerationHandlers(m.requestId, m.chatId, m.generationType, m.activatedWorldInfo);
+      void runPreGenerationHandlers(
+        m.requestId,
+        m.chatId,
+        m.generationType,
+        Array.isArray(m.activatedWorldInfo) ? m.activatedWorldInfo : [],
+      );
+    } else if (m.type === 'vsh_pre_generation_world_info_result' && m.requestId) {
+      const pending = pendingWorldInfoLookups.get(m.requestId);
+      if (!pending) return;
+      pendingWorldInfoLookups.delete(m.requestId);
+      if (m.error) pending.reject(new Error(m.error));
+      else pending.resolve(Array.isArray(m.entries) ? m.entries : []);
     } else if (m.type === 'vsh_pre_generation_cancel' && m.requestId) {
       preGenerationControllers.get(m.requestId)?.controller.abort();
       preGenerationControllers.delete(m.requestId);
+      const pendingWorldInfo = pendingWorldInfoLookups.get(m.requestId);
+      if (pendingWorldInfo) {
+        pendingWorldInfoLookups.delete(m.requestId);
+        pendingWorldInfo.reject(new DOMException('Generation aborted', 'AbortError'));
+      }
     } else if (m.type === 'vsh_generate_result' && m.requestId) {
       const pending = pendingGenerates.get(m.requestId);
       if (!pending) return;
@@ -432,6 +503,8 @@ export function setup(ctx: SpindleFrontendContext) {
     preGenerationHandlers.clear();
     for (const { controller } of preGenerationControllers.values()) controller.abort();
     preGenerationControllers.clear();
+    for (const pending of pendingWorldInfoLookups.values()) pending.reject(new DOMException('Vishrun disposed', 'AbortError'));
+    pendingWorldInfoLookups.clear();
     unsubGenerationStopped();
     for (const [requestId, pending] of pendingGenerates) {
       clearTimeout(pending.timer);
