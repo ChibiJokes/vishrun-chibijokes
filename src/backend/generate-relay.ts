@@ -1,7 +1,7 @@
 import { api } from './common';
 
 /**
- * `vsh_generate` protocol: injected scripts (e.g. Quill) running in the host
+ * `vsh_generate` protocol: injected scripts running in the host
  * document cannot call `/api/v1/generate/raw` on a hosted Lumiverse instance
  * (the endpoint is localhost-only). This handler relays generation requests
  * through the Spindle worker's `spindle.generate.raw()` — which calls
