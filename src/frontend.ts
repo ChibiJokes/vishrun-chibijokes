@@ -29,6 +29,7 @@ interface PreGenerationRequest {
   requestId: string;
   chatId: string;
   generationType?: string;
+  activatedWorldInfo?: unknown;
   signal: AbortSignal;
 }
 
@@ -73,7 +74,7 @@ export function setup(ctx: SpindleFrontendContext) {
     };
   };
 
-  const runPreGenerationHandlers = async (requestId: string, chatId: string, generationType?: string) => {
+  const runPreGenerationHandlers = async (requestId: string, chatId: string, generationType?: string, activatedWorldInfo?: unknown) => {
     const controller = new AbortController();
     preGenerationControllers.set(requestId, { controller, chatId });
 
@@ -85,6 +86,7 @@ export function setup(ctx: SpindleFrontendContext) {
           requestId,
           chatId,
           ...(generationType ? { generationType } : {}),
+          activatedWorldInfo,
           signal: controller.signal,
         })));
         const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
@@ -104,9 +106,9 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubBackendMsg = ctx.onBackendMessage((msg: unknown) => {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; requestId?: string; result?: unknown; error?: string; chatId?: string; generationType?: string };
+    const m = msg as { type?: string; requestId?: string; result?: unknown; error?: string; chatId?: string; generationType?: string; activatedWorldInfo?: unknown };
     if (m.type === 'vsh_pre_generation_request' && m.requestId && m.chatId) {
-      void runPreGenerationHandlers(m.requestId, m.chatId, m.generationType);
+      void runPreGenerationHandlers(m.requestId, m.chatId, m.generationType, m.activatedWorldInfo);
     } else if (m.type === 'vsh_pre_generation_cancel' && m.requestId) {
       preGenerationControllers.get(m.requestId)?.controller.abort();
       preGenerationControllers.delete(m.requestId);
