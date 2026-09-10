@@ -27,6 +27,7 @@ export interface PreGenerationContext {
   chatId?: string;
   userId?: string;
   generationType?: string;
+  activatedWorldInfo?: unknown;
   signal?: AbortSignal;
 }
 
@@ -91,7 +92,7 @@ export function installPreGenerationBridgeHandler(): void {
 }
 
 export async function waitForPreGeneration(context: PreGenerationContext): Promise<void> {
-  const { chatId, userId, generationType, signal } = context;
+  const { chatId, userId, generationType, activatedWorldInfo, signal } = context;
   if (!chatId || !userId || !subscribedUsers.has(userId)) return;
 
   if (signal?.aborted) {
@@ -134,6 +135,7 @@ export async function waitForPreGeneration(context: PreGenerationContext): Promi
       requestId,
       chatId,
       ...(generationType ? { generationType } : {}),
+      activatedWorldInfo,
     }, userId);
   });
 }
