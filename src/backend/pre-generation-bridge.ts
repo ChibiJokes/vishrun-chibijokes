@@ -14,6 +14,21 @@ interface PreGenerationCompleteMessage {
   error?: string;
 }
 
+interface PreGenerationWorldInfoRequestMessage {
+  type: 'vsh_pre_generation_world_info_request';
+  requestId: string;
+}
+
+interface ActivatedWorldInfoSummary {
+  id: string;
+  comment?: string;
+  keys?: string[];
+  source?: string;
+  score?: number;
+  bookId?: string;
+  bookSource?: string;
+}
+
 interface PendingRequest {
   userId: string;
   resolve: () => void;
@@ -21,6 +36,7 @@ interface PendingRequest {
   timer: ReturnType<typeof setTimeout>;
   signal?: AbortSignal;
   abortHandler?: () => void;
+  activatedWorldInfo: ActivatedWorldInfoSummary[];
 }
 
 export interface PreGenerationContext {
@@ -48,6 +64,35 @@ function isCompleteMessage(payload: unknown): payload is PreGenerationCompleteMe
     && typeof (payload as { requestId?: unknown }).requestId === 'string';
 }
 
+function isWorldInfoRequestMessage(payload: unknown): payload is PreGenerationWorldInfoRequestMessage {
+  return !!payload
+    && typeof payload === 'object'
+    && (payload as { type?: unknown }).type === 'vsh_pre_generation_world_info_request'
+    && typeof (payload as { requestId?: unknown }).requestId === 'string';
+}
+
+function normalizeActivatedWorldInfo(value: unknown): ActivatedWorldInfoSummary[] {
+  if (!Array.isArray(value)) return [];
+  const out: ActivatedWorldInfoSummary[] = [];
+  const seen = new Set<string>();
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const raw = item as Record<string, unknown>;
+    const id = typeof raw.id === 'string' ? raw.id : '';
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const entry: ActivatedWorldInfoSummary = { id };
+    if (typeof raw.comment === 'string') entry.comment = raw.comment;
+    if (Array.isArray(raw.keys)) entry.keys = raw.keys.filter((key): key is string => typeof key === 'string');
+    if (typeof raw.source === 'string') entry.source = raw.source;
+    if (typeof raw.score === 'number') entry.score = raw.score;
+    if (typeof raw.bookId === 'string') entry.bookId = raw.bookId;
+    if (typeof raw.bookSource === 'string') entry.bookSource = raw.bookSource;
+    out.push(entry);
+  }
+  return out;
+}
+
 function clearPending(requestId: string): PendingRequest | null {
   const pending = pendingRequests.get(requestId);
   if (!pending) return null;
@@ -66,6 +111,52 @@ function releasePendingForUser(userId: string): void {
   }
 }
 
+async function sendWorldInfoBodies(requestId: string, userId: string, pending: PendingRequest): Promise<void> {
+  try {
+    const results = await Promise.allSettled(
+      pending.activatedWorldInfo.map(async activation => {
+        const entry = await api.world_books.entries.get(activation.id, userId);
+        if (!entry) throw new Error(`Active World Info entry ${activation.id} is unavailable`);
+        if (typeof entry.content !== 'string' || !entry.content.trim()) {
+          throw new Error(`Active World Info entry ${activation.id} has no readable content`);
+        }
+        return { ...entry, ...activation, content: entry.content };
+      }),
+    );
+
+    if (!pendingRequests.has(requestId)) return;
+
+    const failures = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected');
+    if (failures.length > 0) {
+      api.sendToFrontend({
+        type: 'vsh_pre_generation_world_info_result',
+        requestId,
+        entries: [],
+        error: failures
+          .map(result => result.reason instanceof Error ? result.reason.message : String(result.reason))
+          .join('; '),
+      }, userId);
+      return;
+    }
+
+    api.sendToFrontend({
+      type: 'vsh_pre_generation_world_info_result',
+      requestId,
+      entries: results
+        .filter((result): result is PromiseFulfilledResult<Record<string, unknown>> => result.status === 'fulfilled')
+        .map(result => result.value),
+    }, userId);
+  } catch (error) {
+    if (!pendingRequests.has(requestId)) return;
+    api.sendToFrontend({
+      type: 'vsh_pre_generation_world_info_result',
+      requestId,
+      entries: [],
+      error: error instanceof Error ? error.message : String(error),
+    }, userId);
+  }
+}
+
 export function installPreGenerationBridgeHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (isSubscriptionMessage(payload)) {
@@ -75,6 +166,13 @@ export function installPreGenerationBridgeHandler(): void {
         subscribedUsers.delete(userId);
         releasePendingForUser(userId);
       }
+      return;
+    }
+
+    if (isWorldInfoRequestMessage(payload)) {
+      const pending = pendingRequests.get(payload.requestId);
+      if (!pending || pending.userId !== userId) return;
+      void sendWorldInfoBodies(payload.requestId, userId, pending);
       return;
     }
 
@@ -92,7 +190,8 @@ export function installPreGenerationBridgeHandler(): void {
 }
 
 export async function waitForPreGeneration(context: PreGenerationContext): Promise<void> {
-  const { chatId, userId, generationType, activatedWorldInfo, signal } = context;
+  const { chatId, userId, generationType, signal } = context;
+  const activatedWorldInfo = normalizeActivatedWorldInfo(context.activatedWorldInfo);
   if (!chatId || !userId || !subscribedUsers.has(userId)) return;
 
   if (signal?.aborted) {
@@ -116,6 +215,7 @@ export async function waitForPreGeneration(context: PreGenerationContext): Promi
       reject,
       timer,
       signal,
+      activatedWorldInfo,
     };
 
     if (signal) {
