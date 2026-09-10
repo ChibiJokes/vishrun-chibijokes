@@ -5,6 +5,7 @@ import { installDispatchSlashHandler } from './dispatch-slash';
 import { installThHelpersHandler } from './th-helpers';
 import { installGenerateRelayHandler } from './generate-relay';
 import { installPreGenerationBridgeHandler } from './pre-generation-bridge';
+import { installUserMessageBridgeHandler } from './user-message-bridge';
 
 /**
  * Backend worker module. Vishrun is logically frontend-only, but the worker
@@ -24,6 +25,7 @@ installDispatchSlashHandler();
 installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
+installUserMessageBridgeHandler();
 
 export function setup(): void {
   // intentionally empty — registration happens at module top level (above).
