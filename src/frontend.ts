@@ -46,13 +46,32 @@ interface PreGenerationRequest {
 
 type PreGenerationHandler = (request: PreGenerationRequest) => void | Promise<void>;
 
+
+interface UserMessageProcessRequest {
+  requestId: string;
+  chatId: string;
+  generationType?: string;
+  message: { id: string; content: string };
+  signal: AbortSignal;
+}
+
+interface UserMessageProcessResult {
+  content?: string;
+  cancelGeneration?: boolean;
+  removeMessage?: boolean;
+}
+
+type UserMessageProcessHandler = (
+  request: UserMessageProcessRequest,
+) => void | string | UserMessageProcessResult | Promise<void | string | UserMessageProcessResult>;
+
 export function setup(ctx: SpindleFrontendContext) {
   const hooks = installMessageHooks(ctx);
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
 
   // ── Generation relay bridge ──────────────────────────────────────────
-  // Exposes window.__vishrunGenerate for injected scripts (e.g. Quill)
+  // Exposes window.__vishrunGenerate for injected scripts
   // that need LLM access on hosted Lumiverse (where /generate/raw is
   // localhost-only). Requests go: window → ctx.sendToBackend() → worker
   // → api.generate.raw() over IPC → result back here → resolve promise.
@@ -67,12 +86,33 @@ export function setup(ctx: SpindleFrontendContext) {
   const pendingWorldInfoLookups = new Map<string, { resolve: (entries: unknown[]) => void; reject: (error: Error) => void }>();
   const preGenerationHandlers = new Set<PreGenerationHandler>();
   const preGenerationControllers = new Map<string, { controller: AbortController; chatId: string }>();
+  const userMessageHandlers = new Set<UserMessageProcessHandler>();
+  const userMessageControllers = new Map<string, { controller: AbortController; chatId: string }>();
 
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: 'vsh_pre_generation_subscription',
       active: preGenerationHandlers.size > 0,
     });
+  };
+
+
+  const syncUserMessageSubscription = () => {
+    ctx.sendToBackend({
+      type: 'vsh_user_message_subscription',
+      active: userMessageHandlers.size > 0,
+    });
+  };
+
+  (window as any).__vishrunRegisterUserMessageProcessor = (handler: unknown) => {
+    if (typeof handler !== 'function') throw new TypeError('User-message processor must be a function');
+    const typedHandler = handler as UserMessageProcessHandler;
+    userMessageHandlers.add(typedHandler);
+    syncUserMessageSubscription();
+    return () => {
+      userMessageHandlers.delete(typedHandler);
+      syncUserMessageSubscription();
+    };
   };
 
   (window as any).__vishrunRegisterPreGeneration = (handler: unknown) => {
@@ -111,6 +151,63 @@ export function setup(ctx: SpindleFrontendContext) {
       });
       ctx.sendToBackend({ type: 'vsh_pre_generation_world_info_request', requestId });
     });
+  };
+
+
+  const runUserMessageHandlers = async (
+    requestId: string,
+    chatId: string,
+    message: { id: string; content: string },
+    generationType?: string,
+  ) => {
+    const controller = new AbortController();
+    userMessageControllers.set(requestId, { controller, chatId });
+
+    let currentContent = message.content;
+    let cancelGeneration = false;
+    let removeMessage = false;
+    let error: string | undefined;
+
+    try {
+      for (const handler of Array.from(userMessageHandlers)) {
+        if (controller.signal.aborted) break;
+        try {
+          const result = await handler({
+            requestId,
+            chatId,
+            ...(generationType ? { generationType } : {}),
+            message: { id: message.id, content: currentContent },
+            signal: controller.signal,
+          });
+
+          if (typeof result === 'string') {
+            currentContent = result;
+          } else if (result && typeof result === 'object') {
+            if (typeof result.content === 'string') currentContent = result.content;
+            if (result.cancelGeneration === true) cancelGeneration = true;
+            if (result.removeMessage === true) removeMessage = true;
+          }
+
+          if (cancelGeneration) break;
+        } catch (handlerError) {
+          if (controller.signal.aborted) break;
+          const messageText = handlerError instanceof Error ? handlerError.message : String(handlerError);
+          error = error ? `${error}; ${messageText}` : messageText;
+        }
+      }
+    } finally {
+      userMessageControllers.delete(requestId);
+      if (!controller.signal.aborted) {
+        ctx.sendToBackend({
+          type: 'vsh_user_message_complete',
+          requestId,
+          ...(currentContent !== message.content ? { content: currentContent } : {}),
+          ...(cancelGeneration ? { cancelGeneration: true } : {}),
+          ...(removeMessage ? { removeMessage: true } : {}),
+          ...(error ? { error } : {}),
+        });
+      }
+    }
   };
 
   const runPreGenerationHandlers = async (
@@ -161,8 +258,18 @@ export function setup(ctx: SpindleFrontendContext) {
 
   const unsubBackendMsg = ctx.onBackendMessage((msg: unknown) => {
     if (!msg || typeof msg !== 'object') return;
-    const m = msg as { type?: string; requestId?: string; result?: unknown; entries?: unknown[]; error?: string; chatId?: string; generationType?: string; activatedWorldInfo?: ActivatedWorldInfoSummary[] };
-    if (m.type === 'vsh_pre_generation_request' && m.requestId && m.chatId) {
+    const m = msg as { type?: string; requestId?: string; result?: unknown; entries?: unknown[]; error?: string; chatId?: string; generationType?: string; activatedWorldInfo?: ActivatedWorldInfoSummary[]; message?: { id?: string; content?: string } };
+    if (m.type === 'vsh_user_message_request' && m.requestId && m.chatId && m.message && typeof m.message.id === 'string' && typeof m.message.content === 'string') {
+      void runUserMessageHandlers(
+        m.requestId,
+        m.chatId,
+        { id: m.message.id, content: m.message.content },
+        m.generationType,
+      );
+    } else if (m.type === 'vsh_user_message_cancel' && m.requestId) {
+      userMessageControllers.get(m.requestId)?.controller.abort();
+      userMessageControllers.delete(m.requestId);
+    } else if (m.type === 'vsh_pre_generation_request' && m.requestId && m.chatId) {
       void runPreGenerationHandlers(
         m.requestId,
         m.chatId,
@@ -206,6 +313,9 @@ export function setup(ctx: SpindleFrontendContext) {
   const unsubGenerationStopped = ctx.events.on('GENERATION_STOPPED', (payload: unknown) => {
     const stoppedChatId = (payload as { chatId?: string } | null)?.chatId;
     for (const { controller, chatId } of preGenerationControllers.values()) {
+      if (!stoppedChatId || !chatId || String(stoppedChatId) === String(chatId)) controller.abort();
+    }
+    for (const { controller, chatId } of userMessageControllers.values()) {
       if (!stoppedChatId || !chatId || String(stoppedChatId) === String(chatId)) controller.abort();
     }
   });
@@ -500,9 +610,13 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubMvuDisplayStrip();
     unsubStatusBarInject();
     ctx.sendToBackend({ type: 'vsh_pre_generation_subscription', active: false });
+    ctx.sendToBackend({ type: 'vsh_user_message_subscription', active: false });
     preGenerationHandlers.clear();
+    userMessageHandlers.clear();
     for (const { controller } of preGenerationControllers.values()) controller.abort();
     preGenerationControllers.clear();
+    for (const { controller } of userMessageControllers.values()) controller.abort();
+    userMessageControllers.clear();
     for (const pending of pendingWorldInfoLookups.values()) pending.reject(new DOMException('Vishrun disposed', 'AbortError'));
     pendingWorldInfoLookups.clear();
     unsubGenerationStopped();
@@ -515,6 +629,7 @@ export function setup(ctx: SpindleFrontendContext) {
     pendingGenerates.clear();
     unsubBackendMsg();
     delete (window as any).__vishrunRegisterPreGeneration;
+    delete (window as any).__vishrunRegisterUserMessageProcessor;
     delete (window as any).__vishrunGenerate;
     hooks.dispose();
     ctx.dom.cleanup();
