@@ -557,6 +557,7 @@ async function replacePlaceholderMatches(
     }
 
     const frag = document.createDocumentFragment();
+    const insertedWidgets: HTMLElement[] = [];
     let cursor = 0;
     for (const { start, end, match } of ranges) {
       if (start > cursor) {
@@ -580,6 +581,7 @@ async function replacePlaceholderMatches(
       // may fetch the Tailwind bundle (cached after the first use).
       const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
       frag.appendChild(widget);
+      insertedWidgets.push(widget);
       cursor = end;
       count++;
     }
@@ -593,6 +595,17 @@ async function replacePlaceholderMatches(
     // re-renders into the fresh DOM.
     if (tn.parentNode === parent && parent.isConnected) {
       parent.replaceChild(frag, tn);
+
+      // Lumiverse markdown commonly wraps a standalone regex marker in <p>.
+      // If we leave the replacement iframe/div inside that paragraph, the
+      // host `.prose p` margins stack on top of the widget's own spacing.
+      // JS Slash Runner replaces the rendered code block itself, so it does
+      // not inherit those paragraph margins. Hoist widget-only paragraphs to
+      // the MessageContent level to make both hosts lay out the same.
+      const stopAt = findContentRoot(root);
+      for (const widget of insertedWidgets) {
+        if (widget.isConnected) cleanupEmptyAroundWidget(widget, stopAt);
+      }
     } else {
       if (VSH_VISHRUN_DIAG) {
         console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
@@ -753,10 +766,10 @@ async function buildWidget(
     'data-vishrun-widget': scriptName,
     'data-vishrun-script-id': scriptId,
   }) as HTMLElement;
-  // Match the iframe path's vertical breathing room (12px in widget-iframe.ts).
-  // Without this, no-isolation widgets (innerHTML+div path) render flush
-  // against adjacent message text and feel cramped — Step 6 user feedback.
-  wrapper.style.margin = '12px 0';
+  // Match JS Slash Runner: the widget owns its own internal spacing.
+  wrapper.style.margin = '0';
+  wrapper.style.display = 'block';
+  wrapper.style.width = '100%';
   wrapper.innerHTML = html;
   return wrapper;
 }
