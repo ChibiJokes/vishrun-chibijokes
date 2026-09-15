@@ -14,7 +14,6 @@ export interface ThHelpersConstants {
   currentMessageId: string;
   chatId: string;
   messagesSnapshot: SnapshotMessage[];
-  variablesSnapshot?: Record<string, unknown>;
 }
 
 export interface ChatMessageNonSwiped {
@@ -139,12 +138,13 @@ export function createThHelpers(
         opts: opts ?? {},
       });
     },
-    getAllVariables() {
-      return consts.variablesSnapshot ?? {};
+    async getAllVariables() {
+      const result = await bridge.postRequest('th-get-variables-snapshot', {}) as { stat_data?: Record<string, unknown> } | null;
+      return result?.stat_data ?? {};
     },
-    getVariable(key: string) {
-      const vars = consts.variablesSnapshot ?? {};
-      return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
+    async getVariable(key: string) {
+      const vars = await bridge.postRequest('th-get-variables-snapshot', {}) as { stat_data?: Record<string, unknown> } | null;
+      return vars?.stat_data?.[key] ?? null;
     },
     async setVariable(key: string, value: unknown) {
       await bridge.postRequest('th-set-variable', { key, value });
@@ -162,7 +162,6 @@ export function thHelpersShim(consts: ThHelpersConstants): string {
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
     messagesSnapshot: consts.messagesSnapshot,
-    variablesSnapshot: consts.variablesSnapshot ?? {},
   });
   return `<script>(function(){
 var THC = ${constsJson};
@@ -173,11 +172,6 @@ function setup(){
   if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
   window.spindleSandbox.onMessage(function(payload){
     if (!payload || typeof payload !== 'object') return;
-    if (payload.type === 'vsh_th_variables_snapshot') {
-      THC.chatId = typeof payload.chatId === 'string' ? payload.chatId : THC.chatId;
-      THC.variablesSnapshot = (payload.variablesSnapshot && typeof payload.variablesSnapshot === 'object') ? payload.variablesSnapshot : {};
-      return;
-    }
     if (payload.kind !== 'th-response') return;
     var rid = payload.requestId;
     var slot = pending[rid];
@@ -247,11 +241,15 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
 window.getAllVariables = function(){
-  return THC.variablesSnapshot || {};
+  return postRequest('th-get-variables-snapshot', {}).then(function(result){
+    return (result && result.stat_data) ? result.stat_data : {};
+  });
 };
 window.getVariable = function(key){
-  var vars = THC.variablesSnapshot || {};
-  return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
+  return postRequest('th-get-variables-snapshot', {}).then(function(result){
+    var vars = (result && result.stat_data) ? result.stat_data : {};
+    return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
+  });
 };
 window.setVariable = function(key, value){
   return postRequest('th-set-variable', { key: key, value: value });
