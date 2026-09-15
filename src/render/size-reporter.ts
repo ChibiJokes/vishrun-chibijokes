@@ -73,12 +73,70 @@ export function buildSizeReporterShell(): string {
 <script>
 (function() {
   var scheduled = false;
+  var lastOwnSpacing = null;
+
+  function px(value) {
+    var n = parseFloat(value || '0');
+    return isFinite(n) ? n : 0;
+  }
+
+  function visibleElementChildren(body) {
+    var out = [];
+    var children = body.children || [];
+    for (var i = 0; i < children.length; i++) {
+      var el = children[i];
+      var tag = (el.tagName || '').toUpperCase();
+      if (tag === 'SCRIPT' || tag === 'STYLE' || tag === 'LINK' || tag === 'META') continue;
+      try {
+        var cs = getComputedStyle(el);
+        if (cs.display === 'none' || cs.visibility === 'hidden') continue;
+      } catch (e) {}
+      out.push(el);
+    }
+    return out;
+  }
+
+  // JS Slash Runner lets each widget's own body/root spacing breathe. Lumiverse
+  // needs a tiny host-side fallback only for legacy widgets that provide none.
+  // Detect actual computed vertical spacing instead of assuming every card has it.
+  function ownsVerticalSpacing(body) {
+    try {
+      var b = getComputedStyle(body);
+      var bodySpace =
+        px(b.marginTop) + px(b.marginBottom) +
+        px(b.paddingTop) + px(b.paddingBottom);
+      if (bodySpace > 0.5) return true;
+
+      var roots = visibleElementChildren(body);
+      if (!roots.length) return false;
+      var first = getComputedStyle(roots[0]);
+      var last = getComputedStyle(roots[roots.length - 1]);
+      return px(first.marginTop) > 0.5 || px(last.marginBottom) > 0.5;
+    } catch (e) {
+      return false;
+    }
+  }
+
+  function reportLayout(body) {
+    try {
+      if (!window.spindleSandbox || typeof window.spindleSandbox.postMessage !== 'function') return;
+      var own = ownsVerticalSpacing(body);
+      if (own === lastOwnSpacing) return;
+      lastOwnSpacing = own;
+      window.spindleSandbox.postMessage({
+        kind: 'vishrun-layout-metrics',
+        payload: { ownsVerticalSpacing: own }
+      });
+    } catch (e) {}
+  }
 
   function measureAndPost() {
     scheduled = false;
     try {
       var body = document.body;
       if (!body) return;
+
+      reportLayout(body);
 
       var h = body.scrollHeight;
       if (!isFinite(h) || h <= 0) {
@@ -112,7 +170,14 @@ export function buildSizeReporterShell(): string {
         ro.observe(document.body);
       } catch (e) {}
     }
+    if (typeof MutationObserver !== 'undefined' && document.body) {
+      try {
+        var mo = new MutationObserver(postSize);
+        mo.observe(document.body, { childList: true, subtree: true, attributes: true, attributeFilter: ['class', 'style', 'open'] });
+      } catch (e) {}
+    }
     window.addEventListener('load', postSize);
+    window.addEventListener('resize', postSize);
   }
 
   if (document.readyState === 'loading') {
