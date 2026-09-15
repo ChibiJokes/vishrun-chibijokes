@@ -17,7 +17,7 @@
     "generation",
     "world_books"
   ],
-  "interceptorTimeoutMs": 120000,
+  "interceptorTimeoutMs": 300000,
   "entry_frontend": "dist/frontend.js",
   "entry_backend": "dist/backend.js",
   "minimum_lumiverse_version": "0.1.0"
