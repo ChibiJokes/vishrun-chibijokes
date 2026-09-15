@@ -331,22 +331,69 @@ export class ScriptRunner {
   ): void {
     const msg = { type: 'vsh_th_variables', chatId, variables, emitChanged };
     for (const frame of this.frames.values()) {
+      // Same-origin script frames can accept the state synchronously. This is
+      // the closest equivalent to JSLR's direct parent-window bindings and,
+      // importantly, lets a chat switch invalidate the old variable bag before
+      // the browser gets a chance to paint the newly selected chat.
+      try {
+        const frameWindow = (frame.handle.element as HTMLIFrameElement).contentWindow as
+          | (Window & {
+              __vishrunSetVariableState?: (
+                nextChatId: string,
+                nextVariables: Record<string, unknown>,
+                shouldEmitChanged?: boolean,
+              ) => void;
+            })
+          | null;
+        if (typeof frameWindow?.__vishrunSetVariableState === 'function') {
+          frameWindow.__vishrunSetVariableState(chatId, variables, emitChanged);
+          continue;
+        }
+      } catch {
+        // If the iframe is not ready yet, fall back to Spindle's message bridge.
+      }
       try { frame.handle.postMessage(msg); } catch { /* frame torn down */ }
     }
+  }
+
+  private handleActiveChatSettingChanged(data: unknown): void {
+    const payload = data && typeof data === 'object'
+      ? data as { key?: unknown }
+      : null;
+    if (payload?.key !== 'activeChatId') return;
+
+    const nextChatId = this.ctx.getActiveChat().chatId ?? null;
+    if (nextChatId === this.activeChatId) return;
+
+    this.activeChatId = nextChatId;
+    ++this.variableEpoch;
+
+    // Lumiverse publishes activeChatId before the rest of the destination chat
+    // finishes loading. Invalidate synchronously at that boundary so a script
+    // can observe either the new chat's variables or an empty bag, never the
+    // previous chat's variables. The shim emits CHAT_CHANGED only after the
+    // empty state is installed, which clears legacy script-side caches too.
+    this.pushVariableState(nextChatId ?? '', {}, true);
   }
 
   private async handleChatSwitched(data: unknown): Promise<void> {
     const payload = data && typeof data === 'object'
       ? data as { chatId?: unknown }
       : null;
-    const targetChatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+    const targetChatId = typeof payload?.chatId === 'string'
+      ? payload.chatId
+      : this.ctx.getActiveChat().chatId ?? this.activeChatId;
+    const alreadyInvalidated = targetChatId === this.activeChatId;
 
     this.activeChatId = targetChatId;
     const epoch = ++this.variableEpoch;
 
-    // Atomic invalidation: before scripts hear that the chat changed, make
-    // synchronous getAllVariables() incapable of exposing the prior chat.
-    this.pushVariableState(targetChatId ?? '', {}, true);
+    // If SETTINGS_UPDATED already invalidated the departing chat, do not clear
+    // a second time. Otherwise preserve the original safety net for hosts that
+    // emit CHAT_SWITCHED without the settings notification.
+    if (!alreadyInvalidated) {
+      this.pushVariableState(targetChatId ?? '', {}, true);
+    }
     this.broadcast('CHAT_SWITCHED', data);
 
     if (!targetChatId) return;
@@ -411,6 +458,14 @@ export class ScriptRunner {
   }
 
   private installEventBridge(): void {
+    // activeChatId is the earliest authoritative navigation boundary Vishrun
+    // receives. Register this before the normal event bridge so the old chat's
+    // variable state is gone before any later chat event or UI refresh.
+    const unsubSettingsUpdated = this.ctx.events.on('SETTINGS_UPDATED', (data: unknown) => {
+      this.handleActiveChatSettingChanged(data);
+    });
+    this.eventUnsubs.push(unsubSettingsUpdated);
+
     for (const eventName of BRIDGED_EVENTS) {
       const unsub = this.ctx.events.on(eventName, (data: unknown) => {
         if (eventName === 'CHAT_SWITCHED') {
