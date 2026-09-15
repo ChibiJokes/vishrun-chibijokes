@@ -11,7 +11,7 @@ import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-s
 // the bridge here re-emits them through eventSource so handlers fire normally.
 const EVENT_BRIDGE_SHIM = `<script>(function(){
 var ET={
-  CHAT_CHANGED:'CHAT_CHANGED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
+  CHAT_CHANGED:'CHAT_CHANGED',CHAT_SWITCHED:'CHAT_SWITCHED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
   MESSAGE_SENT:'MESSAGE_SENT',GENERATION_STARTED:'GENERATION_STARTED',
   GENERATION_ENDED:'GENERATION_ENDED',GENERATION_STOPPED:'GENERATION_STOPPED',
   CHARACTER_MESSAGE_RENDERED:'CHARACTER_MESSAGE_RENDERED',
@@ -53,7 +53,7 @@ try{window.spindleSandbox.postMessage({kind:'alert',payload:{message:String(msg)
 })()</script>`;
 
 const BRIDGED_EVENTS = [
-  'CHAT_CHANGED','MESSAGE_RECEIVED','MESSAGE_SENT',
+  'CHAT_CHANGED','CHAT_SWITCHED','MESSAGE_RECEIVED','MESSAGE_SENT',
   'GENERATION_STARTED','GENERATION_ENDED','GENERATION_STOPPED',
   'CHARACTER_MESSAGE_RENDERED','USER_MESSAGE_RENDERED',
   'MESSAGE_SWIPED','MESSAGE_EDITED',
@@ -83,12 +83,37 @@ function hashContent(s: string): string {
   return h.toString(36);
 }
 
+function plainRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+/**
+ * JSLR's getAllVariables() is synchronous because it reads live host state.
+ * Spindle does not expose the whole chat metadata bag synchronously, so Vishrun
+ * keeps a host-side mirror keyed to the *explicit* chat id. The old chat is
+ * invalidated before any switch event reaches scripts, so a persistent iframe
+ * can never return variables belonging to a previous chat.
+ */
+function variablesFromMetadata(metadata: unknown): Record<string, unknown> {
+  const meta = plainRecord(metadata);
+  const macro = plainRecord(meta.macro_variables);
+  const globalVars = plainRecord(macro.global);
+  const localVars = plainRecord(macro.local);
+  const chatVars = plainRecord(meta.chat_variables);
+  return { ...globalVars, ...localVars, ...chatVars };
+}
+
 export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
   private reloadMemos = new Map<string, string>();
   private eventUnsubs: Array<() => void> = [];
+  private activeChatId: string | null;
+  private variableEpoch = 0;
 
   constructor(private readonly ctx: SpindleFrontendContext) {
+    this.activeChatId = ctx.getActiveChat().chatId ?? null;
     this.installEventBridge();
   }
 
@@ -141,19 +166,24 @@ export class ScriptRunner {
     const effectiveChatId = chatId ?? '';
 
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
+    let variablesSnapshot: Record<string, unknown> = {};
     if (effectiveChatId) {
-      try {
-        messagesSnapshot = await fetchMessagesSnapshot(
+      const [messages, variables] = await Promise.all([
+        fetchMessagesSnapshot(
           { chatId: effectiveChatId, currentMessageId: '', currentMessageIndex: -1 },
           this.ctx,
-        );
-      } catch { /* non-fatal */ }
+        ).catch(() => [] as Awaited<ReturnType<typeof fetchMessagesSnapshot>>),
+        this.fetchVariablesForChat(effectiveChatId),
+      ]);
+      messagesSnapshot = messages;
+      variablesSnapshot = variables;
+      this.activeChatId = effectiveChatId;
     }
 
     console.log(`[vishrun:script-runner] launching ${scriptsToLaunch.length} script(s)`, scriptsToLaunch.map(s => s.name));
 
     for (const script of scriptsToLaunch) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot);
+      this.launchFrame(script, effectiveChatId, messagesSnapshot, variablesSnapshot);
     }
   }
 
@@ -184,6 +214,7 @@ export class ScriptRunner {
     script: Script,
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
+    variablesSnapshot: Record<string, unknown>,
   ): void {
     try {
       const shim = thHelpersShim({
@@ -191,6 +222,8 @@ export class ScriptRunner {
         currentMessageId: '',
         chatId,
         messagesSnapshot,
+        variablesChatId: chatId,
+        variablesSnapshot,
       });
 
       const srcdoc = [
@@ -269,9 +302,125 @@ export class ScriptRunner {
     this.frames.clear();
   }
 
+  private async fetchVariablesForChat(chatId: string): Promise<Record<string, unknown>> {
+    if (!chatId) return {};
+    try {
+      const response = await fetch(
+        `/api/v1/chats/${encodeURIComponent(chatId)}?_t=${Date.now()}`,
+        { cache: 'no-store', credentials: 'same-origin' },
+      );
+      if (!response.ok) {
+        console.warn('[vishrun:script-runner] variable mirror fetch failed:', response.status);
+        return {};
+      }
+      const chat = await response.json() as { metadata?: unknown };
+      return variablesFromMetadata(chat?.metadata);
+    } catch (err) {
+      console.warn(
+        '[vishrun:script-runner] variable mirror fetch failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+      return {};
+    }
+  }
+
+  private pushVariableState(
+    chatId: string,
+    variables: Record<string, unknown>,
+    emitChanged = false,
+  ): void {
+    const msg = { type: 'vsh_th_variables', chatId, variables, emitChanged };
+    for (const frame of this.frames.values()) {
+      try { frame.handle.postMessage(msg); } catch { /* frame torn down */ }
+    }
+  }
+
+  private async handleChatSwitched(data: unknown): Promise<void> {
+    const payload = data && typeof data === 'object'
+      ? data as { chatId?: unknown }
+      : null;
+    const targetChatId = typeof payload?.chatId === 'string' ? payload.chatId : null;
+
+    this.activeChatId = targetChatId;
+    const epoch = ++this.variableEpoch;
+
+    // Atomic invalidation: before scripts hear that the chat changed, make
+    // synchronous getAllVariables() incapable of exposing the prior chat.
+    this.pushVariableState(targetChatId ?? '', {}, true);
+    this.broadcast('CHAT_SWITCHED', data);
+
+    if (!targetChatId) return;
+
+    const variables = await this.fetchVariablesForChat(targetChatId);
+    if (epoch !== this.variableEpoch || this.activeChatId !== targetChatId) return;
+
+    // Install only if this is still the active chat. The shim emits one local
+    // CHAT_CHANGED after replacement so legacy JSLR scripts refresh from the
+    // now-current synchronous variable bag.
+    this.pushVariableState(targetChatId, variables, true);
+  }
+
+  private async handleChatChanged(data: unknown): Promise<void> {
+    const payload = data && typeof data === 'object'
+      ? data as {
+          chat?: { id?: unknown; metadata?: unknown };
+          chatId?: unknown;
+          changedFields?: unknown;
+        }
+      : null;
+
+    const payloadChatId =
+      typeof payload?.chat?.id === 'string'
+        ? payload.chat.id
+        : typeof payload?.chatId === 'string'
+          ? payload.chatId
+          : this.activeChatId;
+
+    // Ignore changes for chats that are no longer active. This is the same
+    // race guard that prevents a late Chat B update from contaminating Chat C.
+    if (payloadChatId && this.activeChatId && payloadChatId !== this.activeChatId) return;
+
+    if (payload?.chat && payload.chat.metadata && payloadChatId) {
+      ++this.variableEpoch;
+      this.activeChatId = payloadChatId;
+      this.pushVariableState(payloadChatId, variablesFromMetadata(payload.chat.metadata));
+      this.broadcast('CHAT_CHANGED', data);
+      return;
+    }
+
+    const changedFields = Array.isArray(payload?.changedFields)
+      ? payload.changedFields.filter((v): v is string => typeof v === 'string')
+      : [];
+    const variableChange = changedFields.length === 0 || changedFields.some((field) =>
+      field === 'metadata.chat_variables' ||
+      field === 'metadata.macro_variables' ||
+      field.startsWith('metadata.chat_variables.') ||
+      field.startsWith('metadata.macro_variables.')
+    );
+
+    if (!payloadChatId || !variableChange) {
+      this.broadcast('CHAT_CHANGED', data);
+      return;
+    }
+
+    const epoch = ++this.variableEpoch;
+    const variables = await this.fetchVariablesForChat(payloadChatId);
+    if (epoch !== this.variableEpoch || this.activeChatId !== payloadChatId) return;
+    this.pushVariableState(payloadChatId, variables);
+    this.broadcast('CHAT_CHANGED', data);
+  }
+
   private installEventBridge(): void {
     for (const eventName of BRIDGED_EVENTS) {
       const unsub = this.ctx.events.on(eventName, (data: unknown) => {
+        if (eventName === 'CHAT_SWITCHED') {
+          void this.handleChatSwitched(data);
+          return;
+        }
+        if (eventName === 'CHAT_CHANGED') {
+          void this.handleChatChanged(data);
+          return;
+        }
         this.broadcast(eventName, data);
       });
       this.eventUnsubs.push(unsub);
