@@ -11,7 +11,7 @@ import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-s
 // the bridge here re-emits them through eventSource so handlers fire normally.
 const EVENT_BRIDGE_SHIM = `<script>(function(){
 var ET={
-  CHAT_CHANGED:'CHAT_CHANGED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
+  CHAT_CHANGED:'CHAT_CHANGED',CHAT_SWITCHED:'CHAT_SWITCHED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
   MESSAGE_SENT:'MESSAGE_SENT',GENERATION_STARTED:'GENERATION_STARTED',
   GENERATION_ENDED:'GENERATION_ENDED',GENERATION_STOPPED:'GENERATION_STOPPED',
   CHARACTER_MESSAGE_RENDERED:'CHARACTER_MESSAGE_RENDERED',
@@ -87,6 +87,8 @@ export class ScriptRunner {
   private frames = new Map<string, LiveFrame>();
   private reloadMemos = new Map<string, string>();
   private eventUnsubs: Array<() => void> = [];
+  private currentChatId = '';
+  private variableRefreshSerial = 0;
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     this.installEventBridge();
@@ -128,6 +130,20 @@ export class ScriptRunner {
     const scriptsToLaunch = [...scripts]
       .filter(s => !this.frames.has(frameKey(s.scope, s.id)))
       .sort((a, b) => a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
+
+    // Keep already-running Tavern Helper frames on the active chat's variable
+    // snapshot. This lets synchronous JSLR-style getAllVariables() stay current
+    // without forcing otherwise-unchanged scripts to restart on every chat switch.
+    const effectiveChatId = chatId ?? '';
+    if (effectiveChatId !== this.currentChatId) {
+      if (this.frames.size > 0) {
+        const refreshed = await this.refreshVariablesSnapshot(effectiveChatId);
+        if (refreshed) this.broadcast('CHAT_SWITCHED', { chatId: effectiveChatId || null });
+      } else {
+        this.currentChatId = effectiveChatId;
+      }
+    }
+
     if (scriptsToLaunch.length === 0) return;
 
     // Give Lumiverse one tick to finish updating its active-chat state before
@@ -136,24 +152,27 @@ export class ScriptRunner {
     // use the *previous* chat's id on rapid chat switches.
     await new Promise<void>((r) => setTimeout(r, 50));
 
-    // chatId used for getChatMessages snapshot. Use '' when no chat is open —
-    // scripts that don't call getChatMessages still run fine.
-    const effectiveChatId = chatId ?? '';
-
+    // chatId used for snapshots. Use '' when no chat is open.
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
+    let variablesSnapshot: Record<string, unknown> = {};
     if (effectiveChatId) {
       try {
-        messagesSnapshot = await fetchMessagesSnapshot(
-          { chatId: effectiveChatId, currentMessageId: '', currentMessageIndex: -1 },
-          this.ctx,
-        );
+        const [messages, variables] = await Promise.all([
+          fetchMessagesSnapshot(
+            { chatId: effectiveChatId, currentMessageId: '', currentMessageIndex: -1 },
+            this.ctx,
+          ),
+          this.fetchNativeVariablesSnapshot(effectiveChatId),
+        ]);
+        messagesSnapshot = messages;
+        variablesSnapshot = variables;
       } catch { /* non-fatal */ }
     }
 
     console.log(`[vishrun:script-runner] launching ${scriptsToLaunch.length} script(s)`, scriptsToLaunch.map(s => s.name));
 
     for (const script of scriptsToLaunch) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot);
+      this.launchFrame(script, effectiveChatId, messagesSnapshot, variablesSnapshot);
     }
   }
 
@@ -184,6 +203,7 @@ export class ScriptRunner {
     script: Script,
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
+    variablesSnapshot: Record<string, unknown>,
   ): void {
     try {
       const shim = thHelpersShim({
@@ -191,6 +211,7 @@ export class ScriptRunner {
         currentMessageId: '',
         chatId,
         messagesSnapshot,
+        variablesSnapshot,
       });
 
       const srcdoc = [
@@ -272,10 +293,69 @@ export class ScriptRunner {
   private installEventBridge(): void {
     for (const eventName of BRIDGED_EVENTS) {
       const unsub = this.ctx.events.on(eventName, (data: unknown) => {
+        if (eventName === 'CHAT_CHANGED') {
+          void this.refreshVariablesThenBroadcastChatChanged(data);
+          return;
+        }
         this.broadcast(eventName, data);
       });
       this.eventUnsubs.push(unsub);
     }
+  }
+
+  private async refreshVariablesThenBroadcastChatChanged(data: unknown): Promise<void> {
+    const payload = (data || {}) as { chatId?: string | null };
+    const chatId = payload.chatId ?? this.ctx.getActiveChat().chatId ?? '';
+    const refreshed = await this.refreshVariablesSnapshot(chatId);
+    if (!refreshed) return;
+    this.broadcast('CHAT_CHANGED', data);
+  }
+
+  private async fetchNativeVariablesSnapshot(chatId: string): Promise<Record<string, unknown>> {
+    if (!chatId) return {};
+    try {
+      const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}?_t=${Date.now()}`, {
+        credentials: 'same-origin',
+        cache: 'no-store',
+      });
+      if (!response.ok) throw new Error(`chat HTTP ${response.status}`);
+      const chat = await response.json() as {
+        metadata?: {
+          macro_variables?: { local?: Record<string, unknown> };
+          chat_variables?: Record<string, unknown>;
+        };
+      };
+      return {
+        ...(chat.metadata?.macro_variables?.local ?? {}),
+        ...(chat.metadata?.chat_variables ?? {}),
+      };
+    } catch (err) {
+      console.warn(
+        '[vishrun:script-runner] variable snapshot fetch failed:',
+        err instanceof Error ? err.message : String(err),
+      );
+      return {};
+    }
+  }
+
+  private async refreshVariablesSnapshot(chatId: string): Promise<boolean> {
+    const serial = ++this.variableRefreshSerial;
+    let variablesSnapshot: Record<string, unknown> = {};
+
+    if (chatId) {
+      variablesSnapshot = await this.fetchNativeVariablesSnapshot(chatId);
+    }
+
+    // A newer chat/variable refresh won the race. Never let an older response
+    // overwrite the snapshot for the chat the user is currently on.
+    if (serial !== this.variableRefreshSerial) return false;
+
+    this.currentChatId = chatId;
+    const msg = { type: 'vsh_th_variables_snapshot', chatId, variablesSnapshot };
+    for (const frame of this.frames.values()) {
+      try { frame.handle.postMessage(msg); } catch { /* frame torn down */ }
+    }
+    return true;
   }
 
   private broadcast(event: string, data: unknown): void {
