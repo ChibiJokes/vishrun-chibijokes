@@ -173,24 +173,31 @@ var THC = ${constsJson};
 var pending = {};
 var nextId = 0;
 function makeRequestId(){ nextId = (nextId + 1) | 0; return 'th-' + Date.now().toString(36) + '-' + nextId.toString(36); }
+function applyVariableState(nextChatId, nextVars, emitChanged){
+  nextChatId = typeof nextChatId === 'string' ? nextChatId : '';
+  nextVars = nextVars && typeof nextVars === 'object' && !Array.isArray(nextVars) ? nextVars : {};
+  THC.chatId = nextChatId;
+  THC.variablesChatId = nextChatId;
+  THC.variablesSnapshot = nextVars;
+  if (emitChanged && window.eventSource && typeof window.eventSource.emit === 'function') {
+    window.eventSource.emit('CHAT_CHANGED', {
+      chatId: nextChatId,
+      changedFields: ['metadata.macro_variables', 'metadata.chat_variables']
+    });
+  }
+}
+// Same-origin fast path used by ScriptRunner. This deliberately updates state
+// and fires the compatibility event in the same call stack, matching JSLR's
+// direct parent-window binding more closely than an asynchronous postMessage.
+window.__vishrunSetVariableState = function(nextChatId, nextVars, emitChanged){
+  applyVariableState(nextChatId, nextVars, !!emitChanged);
+};
 function setup(){
   if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
   window.spindleSandbox.onMessage(function(payload){
     if (!payload || typeof payload !== 'object') return;
     if (payload.type === 'vsh_th_variables') {
-      var nextChatId = typeof payload.chatId === 'string' ? payload.chatId : '';
-      var nextVars = payload.variables && typeof payload.variables === 'object' && !Array.isArray(payload.variables)
-        ? payload.variables
-        : {};
-      THC.chatId = nextChatId;
-      THC.variablesChatId = nextChatId;
-      THC.variablesSnapshot = nextVars;
-      if (payload.emitChanged && window.eventSource && typeof window.eventSource.emit === 'function') {
-        window.eventSource.emit('CHAT_CHANGED', {
-          chatId: nextChatId,
-          changedFields: ['metadata.macro_variables', 'metadata.chat_variables']
-        });
-      }
+      applyVariableState(payload.chatId, payload.variables, !!payload.emitChanged);
       return;
     }
     if (payload.kind !== 'th-response') return;
