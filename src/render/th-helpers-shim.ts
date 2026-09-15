@@ -14,6 +14,8 @@ export interface ThHelpersConstants {
   currentMessageId: string;
   chatId: string;
   messagesSnapshot: SnapshotMessage[];
+  variablesChatId?: string;
+  variablesSnapshot?: Record<string, unknown>;
 }
 
 export interface ChatMessageNonSwiped {
@@ -138,13 +140,14 @@ export function createThHelpers(
         opts: opts ?? {},
       });
     },
-    async getAllVariables() {
-      const result = await bridge.postRequest('th-get-variables-snapshot', {}) as { stat_data?: Record<string, unknown> } | null;
-      return result?.stat_data ?? {};
+    getAllVariables() {
+      if ((consts.variablesChatId ?? consts.chatId) !== consts.chatId) return {};
+      return { ...(consts.variablesSnapshot ?? {}) };
     },
-    async getVariable(key: string) {
-      const vars = await bridge.postRequest('th-get-variables-snapshot', {}) as { stat_data?: Record<string, unknown> } | null;
-      return vars?.stat_data?.[key] ?? null;
+    getVariable(key: string) {
+      if ((consts.variablesChatId ?? consts.chatId) !== consts.chatId) return null;
+      const vars = consts.variablesSnapshot ?? {};
+      return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
     },
     async setVariable(key: string, value: unknown) {
       await bridge.postRequest('th-set-variable', { key, value });
@@ -152,9 +155,9 @@ export function createThHelpers(
   };
 }
 
-// ES5 shim string injected into the iframe srcdoc head. getChatMessages
-// and the two id helpers resolve synchronously from a baked snapshot;
-// setChatMessage goes through the postMessage bridge to backend
+// ES5 shim string injected into the iframe srcdoc head. getChatMessages,
+// getAllVariables, getVariable, and the id helpers resolve synchronously from
+// host-maintained state; setChatMessage/setVariable still use the backend bridge.
 // (host-side dispatcher posts 'th-response' back keyed by requestId).
 export function thHelpersShim(consts: ThHelpersConstants): string {
   const constsJson = JSON.stringify({
@@ -162,6 +165,8 @@ export function thHelpersShim(consts: ThHelpersConstants): string {
     currentMessageId: consts.currentMessageId,
     chatId: consts.chatId,
     messagesSnapshot: consts.messagesSnapshot,
+    variablesChatId: consts.variablesChatId ?? consts.chatId,
+    variablesSnapshot: consts.variablesSnapshot ?? {},
   });
   return `<script>(function(){
 var THC = ${constsJson};
@@ -172,6 +177,22 @@ function setup(){
   if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
   window.spindleSandbox.onMessage(function(payload){
     if (!payload || typeof payload !== 'object') return;
+    if (payload.type === 'vsh_th_variables') {
+      var nextChatId = typeof payload.chatId === 'string' ? payload.chatId : '';
+      var nextVars = payload.variables && typeof payload.variables === 'object' && !Array.isArray(payload.variables)
+        ? payload.variables
+        : {};
+      THC.chatId = nextChatId;
+      THC.variablesChatId = nextChatId;
+      THC.variablesSnapshot = nextVars;
+      if (payload.emitChanged && window.eventSource && typeof window.eventSource.emit === 'function') {
+        window.eventSource.emit('CHAT_CHANGED', {
+          chatId: nextChatId,
+          changedFields: ['metadata.macro_variables', 'metadata.chat_variables']
+        });
+      }
+      return;
+    }
     if (payload.kind !== 'th-response') return;
     var rid = payload.requestId;
     var slot = pending[rid];
@@ -241,15 +262,18 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
 window.getAllVariables = function(){
-  return postRequest('th-get-variables-snapshot', {}).then(function(result){
-    return (result && result.stat_data) ? result.stat_data : {};
-  });
+  if (THC.variablesChatId !== THC.chatId) return {};
+  var vars = THC.variablesSnapshot || {};
+  var out = {};
+  for (var key in vars) {
+    if (Object.prototype.hasOwnProperty.call(vars, key)) out[key] = vars[key];
+  }
+  return out;
 };
 window.getVariable = function(key){
-  return postRequest('th-get-variables-snapshot', {}).then(function(result){
-    var vars = (result && result.stat_data) ? result.stat_data : {};
-    return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
-  });
+  if (THC.variablesChatId !== THC.chatId) return null;
+  var vars = THC.variablesSnapshot || {};
+  return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
 };
 window.setVariable = function(key, value){
   return postRequest('th-set-variable', { key: key, value: value });
