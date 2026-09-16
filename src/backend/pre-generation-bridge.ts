@@ -1,7 +1,7 @@
 import { api } from './common';
 
 const LOG_PREFIX = '[vishrun:pre-generation]';
-const PRE_GENERATION_TIMEOUT_MS = 300_000;
+const PRE_GENERATION_TIMEOUT_MS = 90_000;
 
 interface PreGenerationSubscriptionMessage {
   type: 'vsh_pre_generation_subscription';

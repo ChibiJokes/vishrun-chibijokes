@@ -197,11 +197,6 @@ export async function processNode(
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
 
-    // Repair any already-mounted widgets that were left inside Lumiverse's
-    // temporary render wrappers by an earlier pass. This is the same DOM
-    // normalization that an edit/cancel remount happened to provide.
-    normalizeExistingWidgetContainers(target);
-
     // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
     // widget HTML before any widget is built. Always returns a map; missing
     // entries → widget renders the raw template (no worse than pre-MVU-lite).
@@ -227,11 +222,6 @@ export async function processNode(
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-
-      // Finalize against the DOM shape Lumiverse actually produced for this
-      // generation. Newly inserted widgets can still be inside chunk-fade
-      // spans / prose paragraphs even if the pre-pass was clean.
-      normalizeExistingWidgetContainers(findContentRoot(root));
     } catch (err) {
       console.debug('[vishrun] processNode render error:', err);
     }
@@ -457,34 +447,11 @@ const MULTILINE_BLOCK_TAGS = new Set([
   'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
 ]);
 
-// Lumiverse temporarily wraps newly-rendered text in animation <span>s while
-// a generation is active. If Vishrun replaces that text with a block widget,
-// the widget can remain trapped inside the inline span (and often a parent <p>)
-// until React later remounts the message. That produces extra line-box / prose
-// spacing. Treat wrapper-only spans as transparent, then apply the existing
-// block-wrapper cleanup. Do not depend on Lumiverse's CSS-module class name: it
-// is hashed and may change between builds.
-const TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(['SPAN']);
-const EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
-
-function normalizeExistingWidgetContainers(target: HTMLElement): void {
-  // Static snapshot is intentional: unwrapping a later widget may also hoist
-  // an earlier sibling, but every still-connected widget gets one cleanup pass.
-  const widgets = Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-widget]'));
-  for (const widget of widgets) {
-    if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
-  }
-}
-
 function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
   let current: Element = widget;
   for (;;) {
     const parent = current.parentElement;
     if (!parent) break;
-
-    // Strip whitespace / BR residue immediately adjacent to the widget first.
-    // This lets a paragraph containing multiple adjacent Vishrun widgets become
-    // wrapper-only after each widget's temporary span has been removed.
     let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
@@ -499,54 +466,27 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
       else break;
       nxt = next;
     }
-
     if (parent === stopAt) break;
-
-    const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
-    const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
-    if ((transparentInline || knownBlock) && containsOnlyWidgetsAndResidue(parent)) {
-      const grandparent = parent.parentNode;
-      if (!grandparent) break;
-
-      // Hoist every Vishrun widget in document order and discard only residue.
-      // Using nodeType/tagName rather than instanceof keeps this safe even when
-      // the host DOM and an extension sandbox come from different JS realms.
-      while (parent.firstChild) {
-        const child = parent.firstChild;
-        if (isEmptyResidue(child)) {
-          parent.removeChild(child);
-        } else {
-          grandparent.insertBefore(child, parent);
-        }
-      }
-      grandparent.removeChild(parent);
+    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
+    if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
+      const gparent = parent.parentNode;
+      if (!gparent) break;
+      gparent.replaceChild(current, parent);
       continue;
     }
-
     break;
   }
 }
 
-function containsOnlyWidgetsAndResidue(container: Element): boolean {
-  return Array.from(container.childNodes).every((node) =>
-    isWidgetNode(node) || isEmptyResidue(node),
-  );
-}
-
-function isWidgetNode(node: Node): boolean {
-  return node.nodeType === Node.ELEMENT_NODE
-    && (node as Element).hasAttribute('data-vishrun-widget');
-}
-
 function isEmptyResidue(node: Node): boolean {
   if (node.nodeType === Node.TEXT_NODE) {
-    return !(node.nodeValue ?? '').replace(EMPTY_RESIDUE_RE, '');
+    return (node.nodeValue ?? '').length === 0;
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as HTMLElement;
     if (el.tagName === 'BR') return true;
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
-    return !(el.textContent ?? '').replace(EMPTY_RESIDUE_RE, '');
+    return (el.textContent ?? '').length === 0;
   }
   return false;
 }

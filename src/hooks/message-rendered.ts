@@ -75,17 +75,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   // Used to anchor depth-0 scripts to a stable identity rather than
   // a DOM position that shifts as Lumi loads/unloads messages on scroll.
   let latestMessageId: string | null = null;
-  // Lumiverse exposes data-display-pending while its async display-regex /
-  // preprocessing pass is still settling. Observe that attribute so Vishrun
-  // can wait for the host's own readiness signal instead of guessing with a
-  // timer, then rescan immediately when Lumiverse clears it.
-  const OBSERVE_OPTS: MutationObserverInit = {
-    childList: true,
-    subtree: true,
-    characterData: true,
-    attributes: true,
-    attributeFilter: ['data-display-pending'],
-  };
+  const OBSERVE_OPTS: MutationObserverInit = { childList: true, subtree: true, characterData: true };
 
   function compiledForActiveCard(): CompiledScript[] | null {
     const card = getActiveCard();
@@ -109,13 +99,8 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
   const node = document.querySelector(sel) as HTMLElement | null; //
   
   if (node) {
-    // 1. Defensively verify the inner Content layer has fully hydrated in the React layout tree.
-    // Lumiverse itself marks MessageContent data-display-pending="true" while
-    // async display preprocessing is unresolved. Do not inject into that
-    // intermediate DOM; the observer below watches the attribute and will
-    // rescan when Lumiverse clears it.
-    const messageContent = node.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-    if (!messageContent || messageContent.getAttribute('data-display-pending') === 'true') {
+    // 1. Defensively verify the inner Content layer has fully hydrated in the React layout tree
+    if (!node.querySelector('[data-component="MessageContent"]')) {
       if (retriesLeft > 0) {
         requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
       }
@@ -164,9 +149,6 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       const total = nodes.length;
       const tasks: Promise<unknown>[] = [];
       nodes.forEach((n, i) => {
-        const messageContent = n.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-        if (messageContent?.getAttribute('data-display-pending') === 'true') return;
-
         const depthFromLatest = total - 1 - i;
         const nodeMessageId = n.getAttribute('data-message-id');
         const scriptsForMessage = compiled.filter((s) => {
