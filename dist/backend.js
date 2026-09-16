@@ -1324,6 +1324,46 @@ function shapeSnapshotMessage(msg) {
     extra: msg.extra ?? {}
   };
 }
+var chatVariableMutationTail = new Map;
+function queueChatVariableMutation(chatId, work) {
+  const previous = chatVariableMutationTail.get(chatId) ?? Promise.resolve();
+  const next = previous.then(work, work);
+  chatVariableMutationTail.set(chatId, next);
+  next.then(() => {
+    if (chatVariableMutationTail.get(chatId) === next)
+      chatVariableMutationTail.delete(chatId);
+  }, () => {
+    if (chatVariableMutationTail.get(chatId) === next)
+      chatVariableMutationTail.delete(chatId);
+  });
+  return next;
+}
+function plainRecord(value) {
+  return value && typeof value === "object" && !Array.isArray(value) ? value : {};
+}
+function normalizeChatVariableValue(value) {
+  if (typeof value === "string")
+    return value;
+  if (value === undefined)
+    return "";
+  if (value === null)
+    return "null";
+  if (typeof value === "number" || typeof value === "boolean" || typeof value === "bigint")
+    return String(value);
+  try {
+    const encoded = JSON.stringify(value);
+    return encoded === undefined ? String(value) : encoded;
+  } catch {
+    return String(value);
+  }
+}
+function normalizeChatVariables(value) {
+  const input = plainRecord(value);
+  const out = {};
+  for (const [key, item] of Object.entries(input))
+    out[key] = normalizeChatVariableValue(item);
+  return out;
+}
 async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
   const msg0 = messages[0];
   let charId = null;
@@ -1375,6 +1415,66 @@ async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats
     log.warn("getVariablesSnapshot failed:", err instanceof Error ? err.message : String(err));
     return emptyMvuData();
   }
+}
+async function handleGetChatVariablesSnapshot(chatId, variables = api.variables.chat) {
+  if (!chatId)
+    return {};
+  try {
+    return await variables.list(chatId);
+  } catch (err) {
+    log.warn("getChatVariablesSnapshot failed:", err instanceof Error ? err.message : String(err));
+    return {};
+  }
+}
+async function handleReplaceChatVariables(body, chatId, variables = api.variables.chat) {
+  const desired = normalizeChatVariables(body.variables);
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    for (const key of Object.keys(current)) {
+      if (!Object.prototype.hasOwnProperty.call(desired, key))
+        await variables.delete(chatId, key);
+    }
+    for (const [key, value] of Object.entries(desired)) {
+      if (current[key] !== value)
+        await variables.set(chatId, key, value);
+    }
+    return await variables.list(chatId);
+  });
+}
+async function handlePatchChatVariables(body, chatId, variables = api.variables.chat) {
+  const patch = normalizeChatVariables(body.variables);
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    for (const [key, value] of Object.entries(patch)) {
+      if (current[key] === value)
+        continue;
+      await variables.set(chatId, key, value);
+    }
+    return await variables.list(chatId);
+  });
+}
+async function handleInsertChatVariables(body, chatId, variables = api.variables.chat) {
+  const additions = normalizeChatVariables(body.variables);
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    for (const [key, value] of Object.entries(additions)) {
+      if (Object.prototype.hasOwnProperty.call(current, key))
+        continue;
+      await variables.set(chatId, key, value);
+    }
+    return await variables.list(chatId);
+  });
+}
+async function handleDeleteChatVariable(body, chatId, variables = api.variables.chat) {
+  const path = typeof body.path === "string" ? body.path : "";
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    const deleteOccurred = !!path && Object.prototype.hasOwnProperty.call(current, path);
+    if (deleteOccurred)
+      await variables.delete(chatId, path);
+    const next = await variables.list(chatId);
+    return { variables: next, delete_occurred: deleteOccurred };
+  });
 }
 async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = api.chat) {
   const fieldValues = body.fieldValues ?? {};
@@ -1431,6 +1531,21 @@ function installThHelpersHandler() {
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-get-variables-snapshot") {
           const result = await handleGetVariablesSnapshot(chatId, userId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
+        } else if (op === "th-get-chat-variables-snapshot") {
+          const result = await handleGetChatVariablesSnapshot(chatId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
+        } else if (op === "th-replace-chat-variables") {
+          const result = await handleReplaceChatVariables(body, chatId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
+        } else if (op === "th-patch-chat-variables") {
+          const result = await handlePatchChatVariables(body, chatId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
+        } else if (op === "th-insert-chat-variables") {
+          const result = await handleInsertChatVariables(body, chatId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
+        } else if (op === "th-delete-chat-variable") {
+          const result = await handleDeleteChatVariable(body, chatId);
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

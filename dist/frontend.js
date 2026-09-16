@@ -805,11 +805,20 @@ var MVU_TOKENS = [
 var LODASH_TOKEN = /(?:^|[^a-zA-Z_$.\w])_\s*\.[a-zA-Z]/;
 var JQUERY_TOKEN = /(?:^|[^a-zA-Z_$.\w])\$\s*\(/;
 var JQUERY_NAMED_TOKEN = /\bjQuery\s*[(.]/;
+var CHAT_VARIABLE_HELPER_TOKENS = [
+  /\bgetVariables\s*\(/,
+  /\breplaceVariables\s*\(/,
+  /\bupdateVariablesWith\s*\(/,
+  /\binsertOrAssignVariables\s*\(/,
+  /\binsertVariables\s*\(/,
+  /\bdeleteVariable\s*\(/
+];
 var HELPERS_LIGHT_TOKENS = [
   /\bgetChatMessages\s*\(/,
   /\bsetChatMessage\s*\(/,
   /\bgetCurrentMessageId\s*\(/,
-  /\bgetChatId\s*\(/
+  /\bgetChatId\s*\(/,
+  ...CHAT_VARIABLE_HELPER_TOKENS
 ];
 var SLASH_TOKEN = /\btriggerSlash\s*\(/;
 function extractScriptBodies(html) {
@@ -858,6 +867,12 @@ function classifyImpl(html) {
     return "tavern-slash";
   return "static";
 }
+function usesChatVariableHelpers(html) {
+  const body = extractScriptBodies(html);
+  if (!body)
+    return false;
+  return CHAT_VARIABLE_HELPER_TOKENS.some((re) => re.test(body));
+}
 function shouldInjectThHelpersShim(env) {
   return env === "tavern-helpers-light" || env === "tavern-jq" || env === "tavern-mvu";
 }
@@ -879,19 +894,63 @@ function thHelpersShim(consts) {
     chatId: consts.chatId,
     messagesSnapshot: consts.messagesSnapshot,
     variablesChatId: consts.variablesChatId ?? consts.chatId,
-    variablesSnapshot: consts.variablesSnapshot ?? {}
+    variablesSnapshot: consts.variablesSnapshot ?? {},
+    variablesBaseSnapshot: consts.variablesBaseSnapshot,
+    chatVariablesChatId: consts.chatVariablesSnapshot !== undefined ? consts.chatVariablesChatId ?? consts.chatId : undefined,
+    chatVariablesSnapshot: consts.chatVariablesSnapshot
   });
   return `<script>(function(){
 var THC = ${constsJson};
 var pending = {};
 var nextId = 0;
 function makeRequestId(){ nextId = (nextId + 1) | 0; return 'th-' + Date.now().toString(36) + '-' + nextId.toString(36); }
-function applyVariableState(nextChatId, nextVars, emitChanged){
+function isRecord(value){ return !!value && typeof value === 'object' && !Array.isArray(value); }
+function cloneRecord(value){
+  value = isRecord(value) ? value : {};
+  if (typeof structuredClone === 'function') {
+    try { return structuredClone(value); } catch (e) {}
+  }
+  try { return JSON.parse(JSON.stringify(value)); } catch (e) {}
+  var out = {};
+  for (var key in value) if (Object.prototype.hasOwnProperty.call(value, key)) out[key] = value[key];
+  return out;
+}
+function assertChatOption(option){
+  option = option || { type: 'chat' };
+  if (!option || option.type !== 'chat') throw new Error("Vishrun currently supports getVariables-style APIs only for { type: 'chat' }");
+  return option;
+}
+function getChatSnapshot(){
+  if (THC.chatVariablesChatId !== THC.chatId) return {};
+  return cloneRecord(THC.chatVariablesSnapshot || {});
+}
+function getAllSnapshot(){
+  if (THC.variablesChatId !== THC.chatId) return {};
+  var separated = THC.variablesBaseSnapshot !== undefined || THC.chatVariablesSnapshot !== undefined;
+  if (!separated) return cloneRecord(THC.variablesSnapshot || {});
+  var out = cloneRecord(THC.variablesBaseSnapshot || {});
+  var chat = getChatSnapshot();
+  for (var key in chat) if (Object.prototype.hasOwnProperty.call(chat, key)) out[key] = chat[key];
+  return out;
+}
+function applyChatVariables(nextVars, expectedChatId){
+  nextVars = isRecord(nextVars) ? nextVars : {};
+  if (typeof expectedChatId === 'string' && THC.chatId !== expectedChatId) return cloneRecord(nextVars);
+  THC.chatVariablesChatId = THC.chatId;
+  THC.chatVariablesSnapshot = cloneRecord(nextVars);
+  return cloneRecord(THC.chatVariablesSnapshot);
+}
+function applyVariableState(nextChatId, nextBaseVars, nextChatVars, nextCombinedVars, emitChanged){
   nextChatId = typeof nextChatId === 'string' ? nextChatId : '';
-  nextVars = nextVars && typeof nextVars === 'object' && !Array.isArray(nextVars) ? nextVars : {};
+  nextBaseVars = isRecord(nextBaseVars) ? nextBaseVars : {};
+  nextChatVars = isRecord(nextChatVars) ? nextChatVars : {};
+  nextCombinedVars = isRecord(nextCombinedVars) ? nextCombinedVars : {};
   THC.chatId = nextChatId;
   THC.variablesChatId = nextChatId;
-  THC.variablesSnapshot = nextVars;
+  THC.chatVariablesChatId = nextChatId;
+  THC.variablesBaseSnapshot = nextBaseVars;
+  THC.chatVariablesSnapshot = nextChatVars;
+  THC.variablesSnapshot = nextCombinedVars;
   if (emitChanged && window.eventSource && typeof window.eventSource.emit === 'function') {
     window.eventSource.emit('CHAT_CHANGED', {
       chatId: nextChatId,
@@ -902,15 +961,15 @@ function applyVariableState(nextChatId, nextVars, emitChanged){
 // Same-origin fast path used by ScriptRunner. This deliberately updates state
 // and fires the compatibility event in the same call stack, matching JSLR's
 // direct parent-window binding more closely than an asynchronous postMessage.
-window.__vishrunSetVariableState = function(nextChatId, nextVars, emitChanged){
-  applyVariableState(nextChatId, nextVars, !!emitChanged);
+window.__vishrunSetVariableState = function(nextChatId, nextBaseVars, nextChatVars, nextCombinedVars, emitChanged){
+  applyVariableState(nextChatId, nextBaseVars, nextChatVars, nextCombinedVars, !!emitChanged);
 };
 function setup(){
   if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
   window.spindleSandbox.onMessage(function(payload){
     if (!payload || typeof payload !== 'object') return;
     if (payload.type === 'vsh_th_variables') {
-      applyVariableState(payload.chatId, payload.variables, !!payload.emitChanged);
+      applyVariableState(payload.chatId, payload.variablesBase, payload.chatVariables, payload.variables, !!payload.emitChanged);
       return;
     }
     if (payload.kind !== 'th-response') return;
@@ -981,22 +1040,71 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
-window.getAllVariables = function(){
-  if (THC.variablesChatId !== THC.chatId) return {};
-  var vars = THC.variablesSnapshot || {};
-  var out = {};
-  for (var key in vars) {
-    if (Object.prototype.hasOwnProperty.call(vars, key)) out[key] = vars[key];
-  }
-  return out;
-};
+window.getAllVariables = function(){ return getAllSnapshot(); };
 window.getVariable = function(key){
-  if (THC.variablesChatId !== THC.chatId) return null;
-  var vars = THC.variablesSnapshot || {};
+  var vars = getAllSnapshot();
   return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
 };
 window.setVariable = function(key, value){
   return postRequest('th-set-variable', { key: key, value: value });
+};
+window.getVariables = function(option){
+  assertChatOption(option || { type: 'chat' });
+  return getChatSnapshot();
+};
+window.replaceVariables = function(variables, option){
+  assertChatOption(option || { type: 'chat' });
+  if (!isRecord(variables)) return Promise.reject(new TypeError('replaceVariables expects an object'));
+  var requested = cloneRecord(variables);
+  var expectedChatId = THC.chatId;
+  return postRequest('th-replace-chat-variables', { variables: requested, chatId: expectedChatId }).then(function(result){
+    applyChatVariables(isRecord(result) ? result : requested, expectedChatId);
+  });
+};
+window.updateVariablesWith = function(updater, option){
+  assertChatOption(option || { type: 'chat' });
+  if (typeof updater !== 'function') return Promise.reject(new TypeError('updateVariablesWith expects a function'));
+  var expectedChatId = THC.chatId;
+  var result;
+  try { result = updater(getChatSnapshot()); } catch (e) { return Promise.reject(e); }
+  return Promise.resolve(result).then(function(next){
+    if (!isRecord(next)) throw new TypeError('updateVariablesWith callback must return an object');
+    var requested = cloneRecord(next);
+    return postRequest('th-replace-chat-variables', { variables: requested, chatId: expectedChatId }).then(function(persisted){
+      return applyChatVariables(isRecord(persisted) ? persisted : requested, expectedChatId);
+    });
+  });
+};
+window.insertOrAssignVariables = function(variables, option){
+  assertChatOption(option || { type: 'chat' });
+  if (!isRecord(variables)) return Promise.reject(new TypeError('insertOrAssignVariables expects an object'));
+  var expectedChatId = THC.chatId;
+  var fallback = getChatSnapshot();
+  for (var key in variables) if (Object.prototype.hasOwnProperty.call(variables, key)) fallback[key] = variables[key];
+  return postRequest('th-patch-chat-variables', { variables: variables, chatId: expectedChatId }).then(function(result){
+    return applyChatVariables(isRecord(result) ? result : fallback, expectedChatId);
+  });
+};
+window.insertVariables = function(variables, option){
+  assertChatOption(option || { type: 'chat' });
+  if (!isRecord(variables)) return Promise.reject(new TypeError('insertVariables expects an object'));
+  var expectedChatId = THC.chatId;
+  var current = getChatSnapshot();
+  var fallback = cloneRecord(variables);
+  for (var key in current) if (Object.prototype.hasOwnProperty.call(current, key)) fallback[key] = current[key];
+  return postRequest('th-insert-chat-variables', { variables: variables, chatId: expectedChatId }).then(function(result){
+    return applyChatVariables(isRecord(result) ? result : fallback, expectedChatId);
+  });
+};
+window.deleteVariable = function(variablePath, option){
+  assertChatOption(option || { type: 'chat' });
+  var expectedChatId = THC.chatId;
+  return postRequest('th-delete-chat-variable', { path: String(variablePath), chatId: expectedChatId }).then(function(result){
+    if (isRecord(result) && isRecord(result.variables)) {
+      return { variables: applyChatVariables(result.variables, expectedChatId), delete_occurred: result.delete_occurred === true };
+    }
+    return { variables: getChatSnapshot(), delete_occurred: false };
+  });
 };
 })();</script>`;
 }
@@ -1027,7 +1135,7 @@ function nextBackendRequestId() {
   }
   return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
 }
-function dispatchThRequest(frame, request, context, ctx) {
+function dispatchThRequest(frame, request, context, ctx, onResponse) {
   const { requestId, op, body } = request;
   let settled = false;
   let unsub = null;
@@ -1046,6 +1154,9 @@ function dispatchThRequest(frame, request, context, ctx) {
       } catch {}
       unsub = null;
     }
+    try {
+      onResponse?.(resp);
+    } catch {}
     try {
       frame.postMessage({ kind: "th-response", requestId, ok: resp.ok, result: resp.result, error: resp.error });
     } catch {}
@@ -1186,6 +1297,62 @@ function computeMessageIndexInChat(messageId, doc = document) {
       return i;
   }
   return -1;
+}
+function fetchChatVariablesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
+  return new Promise((resolve) => {
+    const requestId = nextBackendRequestId();
+    let settled = false;
+    let unsub = null;
+    let timer = null;
+    const finish = (value) => {
+      if (settled)
+        return;
+      settled = true;
+      if (timer !== null) {
+        clearTimeout(timer);
+        timer = null;
+      }
+      if (unsub) {
+        try {
+          unsub();
+        } catch {}
+        unsub = null;
+      }
+      resolve(value);
+    };
+    unsub = ctx.onBackendMessage((payload) => {
+      if (!isThHelpersResponse(payload, requestId))
+        return;
+      if (payload.ok && payload.result && typeof payload.result === "object" && !Array.isArray(payload.result)) {
+        finish(payload.result);
+        return;
+      }
+      if (payload.ok && payload.result && typeof payload.result === "object") {
+        console.warn("[vishrun:th-helpers] chat variables snapshot malformed");
+      } else if (!payload.ok) {
+        console.warn("[vishrun:th-helpers] chat variables snapshot fetch failed:", payload.error || "unknown error");
+      }
+      finish({});
+    });
+    timer = setTimeout(() => {
+      console.warn("[vishrun:th-helpers] chat variables snapshot fetch timed out");
+      finish({});
+    }, timeoutMs);
+    try {
+      ctx.sendToBackend({
+        type: "th_helpers_request",
+        requestId,
+        op: "th-get-chat-variables-snapshot",
+        chatId: context.chatId,
+        currentMessageId: context.currentMessageId,
+        currentMessageIndex: context.currentMessageIndex,
+        body: {}
+      });
+    } catch (err) {
+      console.warn("[vishrun:th-helpers] chat variables sendToBackend threw:", err instanceof Error ? err.message : String(err));
+      finish({});
+    }
+  });
 }
 
 // src/vendor/jquery-3.5.1.min.js
@@ -1696,6 +1863,7 @@ function resolveCurrentMessageIndex(messageId, snapshot, domIndex) {
 }
 async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   const env = classifyWidgetEnvironment(html);
+  const needsChatVariables = usesChatVariableHelpers(html);
   const active = ctx.getActiveChat();
   const chatId = active.chatId ?? "";
   const domIndex = computeMessageIndexInChat(messageId);
@@ -1708,9 +1876,10 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
       triggerKey
     }));
   }
-  const [messagesSnapshot, variablesSnapshot] = await Promise.all([
+  const [messagesSnapshot, variablesSnapshot, chatVariablesSnapshot] = await Promise.all([
     shouldInjectThHelpersShim(env) ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
-    shouldInjectMvuShim(env) ? fetchVariablesSnapshot(snapshotContext, ctx) : Promise.resolve({ stat_data: {} })
+    shouldInjectMvuShim(env) ? fetchVariablesSnapshot(snapshotContext, ctx) : Promise.resolve({ stat_data: {} }),
+    needsChatVariables ? fetchChatVariablesSnapshot(snapshotContext, ctx) : Promise.resolve({})
   ]);
   const resolved = resolveCurrentMessageIndex(messageId, messagesSnapshot, domIndex);
   const currentMessageIndex = resolved.index;
@@ -1727,7 +1896,8 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     messageId,
     currentMessageIndex,
     messagesSnapshot,
-    variablesSnapshot
+    variablesSnapshot,
+    chatVariablesSnapshot
   });
   const frame = ctx.dom.createSandboxFrame({
     html: srcdoc,
@@ -1834,7 +2004,10 @@ function buildHeadInjection(iframeCtx) {
     currentMessageIndex: iframeCtx.currentMessageIndex,
     currentMessageId: iframeCtx.messageId,
     chatId: iframeCtx.chatId,
-    messagesSnapshot: iframeCtx.messagesSnapshot
+    messagesSnapshot: iframeCtx.messagesSnapshot,
+    variablesBaseSnapshot: {},
+    chatVariablesChatId: iframeCtx.chatId,
+    chatVariablesSnapshot: iframeCtx.chatVariablesSnapshot
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
   return jsRunnerLayoutReset() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
@@ -4831,13 +5004,30 @@ function hashContent(s) {
 function plainRecord(value) {
   return value && typeof value === "object" && !Array.isArray(value) ? value : {};
 }
-function variablesFromMetadata(metadata) {
+function emptyVariableState() {
+  return { base: {}, chat: {}, all: {} };
+}
+function variableStateFromMetadata(metadata) {
   const meta = plainRecord(metadata);
   const macro = plainRecord(meta.macro_variables);
   const globalVars = plainRecord(macro.global);
   const localVars = plainRecord(macro.local);
   const chatVars = plainRecord(meta.chat_variables);
-  return { ...globalVars, ...localVars, ...chatVars };
+  const base = { ...globalVars, ...localVars };
+  const chat = { ...chatVars };
+  return { base, chat, all: { ...base, ...chat } };
+}
+function chatVariablesFromMutationResult(op, result) {
+  if (!result || typeof result !== "object" || Array.isArray(result))
+    return null;
+  const record = result;
+  if (op === "th-delete-chat-variable") {
+    return record.variables && typeof record.variables === "object" && !Array.isArray(record.variables) ? record.variables : null;
+  }
+  return record;
+}
+function isChatVariableMutationOp(op) {
+  return op === "th-replace-chat-variables" || op === "th-patch-chat-variables" || op === "th-insert-chat-variables" || op === "th-delete-chat-variable";
 }
 
 class ScriptRunner {
@@ -4847,6 +5037,8 @@ class ScriptRunner {
   eventUnsubs = [];
   activeChatId;
   variableEpoch = 0;
+  variableStateChatId = null;
+  variableState = emptyVariableState();
   constructor(ctx) {
     this.ctx = ctx;
     this.activeChatId = ctx.getActiveChat().chatId ?? null;
@@ -4874,19 +5066,21 @@ class ScriptRunner {
     await new Promise((r) => setTimeout(r, 50));
     const effectiveChatId = chatId ?? "";
     let messagesSnapshot = [];
-    let variablesSnapshot = {};
+    let variableState = emptyVariableState();
     if (effectiveChatId) {
       const [messages, variables] = await Promise.all([
         fetchMessagesSnapshot({ chatId: effectiveChatId, currentMessageId: "", currentMessageIndex: -1 }, this.ctx).catch(() => []),
-        this.fetchVariablesForChat(effectiveChatId)
+        this.fetchVariableStateForChat(effectiveChatId)
       ]);
       messagesSnapshot = messages;
-      variablesSnapshot = variables;
+      variableState = variables;
       this.activeChatId = effectiveChatId;
+      this.variableStateChatId = effectiveChatId;
+      this.variableState = variableState;
     }
     console.log(`[vishrun:script-runner] launching ${scriptsToLaunch.length} script(s)`, scriptsToLaunch.map((s) => s.name));
     for (const script of scriptsToLaunch) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot, variablesSnapshot);
+      this.launchFrame(script, effectiveChatId, messagesSnapshot, variableState);
     }
   }
   reload(scriptId) {
@@ -4911,7 +5105,7 @@ class ScriptRunner {
       frame.container.remove();
     } catch {}
   }
-  launchFrame(script, chatId, messagesSnapshot, variablesSnapshot) {
+  launchFrame(script, chatId, messagesSnapshot, variableState) {
     try {
       const shim = thHelpersShim({
         currentMessageIndex: -1,
@@ -4919,7 +5113,10 @@ class ScriptRunner {
         chatId,
         messagesSnapshot,
         variablesChatId: chatId,
-        variablesSnapshot
+        variablesSnapshot: variableState.all,
+        variablesBaseSnapshot: variableState.base,
+        chatVariablesChatId: chatId,
+        chatVariablesSnapshot: variableState.chat
       });
       const srcdoc = [
         EVENT_BRIDGE_SHIM,
@@ -4952,7 +5149,6 @@ ${script.content}
         "overflow:hidden"
       ].join(";");
       container.appendChild(handle.element);
-      document.body.appendChild(container);
       this.frames.set(frameKey(script.scope, script.id), {
         scriptId: script.id,
         scriptName: script.name,
@@ -4970,8 +5166,19 @@ ${script.content}
           handleClipboardWriteText(p.payload, this.ctx);
         } else if (p.kind === "alert") {
           handleHostAlert(p.payload);
+        } else if (isThRequest(payload)) {
+          const requestedChatId = typeof payload.body.chatId === "string" ? payload.body.chatId : "";
+          const requestChatId = requestedChatId || this.ctx.getActiveChat().chatId || this.activeChatId || "";
+          dispatchThRequest(handle, payload, { chatId: requestChatId, currentMessageId: "", currentMessageIndex: -1 }, this.ctx, (response) => {
+            if (!response.ok || !isChatVariableMutationOp(payload.op))
+              return;
+            const nextChatVariables = chatVariablesFromMutationResult(payload.op, response.result);
+            if (nextChatVariables)
+              this.applyDirectChatVariableState(requestChatId, nextChatVariables);
+          });
         }
       });
+      document.body.appendChild(container);
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error("[vishrun:script-runner] failed to launch:", script.name, err);
@@ -4986,29 +5193,49 @@ ${script.content}
     }
     this.frames.clear();
   }
-  async fetchVariablesForChat(chatId) {
+  async fetchVariableStateForChat(chatId) {
     if (!chatId)
-      return {};
+      return emptyVariableState();
     try {
       const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}?_t=${Date.now()}`, { cache: "no-store", credentials: "same-origin" });
       if (!response.ok) {
         console.warn("[vishrun:script-runner] variable mirror fetch failed:", response.status);
-        return {};
+        return emptyVariableState();
       }
       const chat = await response.json();
-      return variablesFromMetadata(chat?.metadata);
+      return variableStateFromMetadata(chat?.metadata);
     } catch (err) {
       console.warn("[vishrun:script-runner] variable mirror fetch failed:", err instanceof Error ? err.message : String(err));
-      return {};
+      return emptyVariableState();
     }
   }
-  pushVariableState(chatId, variables, emitChanged = false) {
-    const msg = { type: "vsh_th_variables", chatId, variables, emitChanged };
+  applyDirectChatVariableState(chatId, chatVariables) {
+    if (!chatId || this.activeChatId !== chatId || this.variableStateChatId !== chatId)
+      return;
+    const base = { ...this.variableState.base };
+    const chat = { ...chatVariables };
+    this.pushVariableState(chatId, { base, chat, all: { ...base, ...chat } });
+  }
+  pushVariableState(chatId, state, emitChanged = false) {
+    this.variableStateChatId = chatId || null;
+    this.variableState = {
+      base: { ...state.base },
+      chat: { ...state.chat },
+      all: { ...state.all }
+    };
+    const msg = {
+      type: "vsh_th_variables",
+      chatId,
+      variables: this.variableState.all,
+      variablesBase: this.variableState.base,
+      chatVariables: this.variableState.chat,
+      emitChanged
+    };
     for (const frame of this.frames.values()) {
       try {
         const frameWindow = frame.handle.element.contentWindow;
         if (typeof frameWindow?.__vishrunSetVariableState === "function") {
-          frameWindow.__vishrunSetVariableState(chatId, variables, emitChanged);
+          frameWindow.__vishrunSetVariableState(chatId, this.variableState.base, this.variableState.chat, this.variableState.all, emitChanged);
           continue;
         }
       } catch {}
@@ -5026,7 +5253,7 @@ ${script.content}
       return;
     this.activeChatId = nextChatId;
     ++this.variableEpoch;
-    this.pushVariableState(nextChatId ?? "", {}, true);
+    this.pushVariableState(nextChatId ?? "", emptyVariableState(), true);
   }
   async handleChatSwitched(data) {
     const payload = data && typeof data === "object" ? data : null;
@@ -5035,12 +5262,12 @@ ${script.content}
     this.activeChatId = targetChatId;
     const epoch = ++this.variableEpoch;
     if (!alreadyInvalidated) {
-      this.pushVariableState(targetChatId ?? "", {}, true);
+      this.pushVariableState(targetChatId ?? "", emptyVariableState(), true);
     }
     this.broadcast("CHAT_SWITCHED", data);
     if (!targetChatId)
       return;
-    const variables = await this.fetchVariablesForChat(targetChatId);
+    const variables = await this.fetchVariableStateForChat(targetChatId);
     if (epoch !== this.variableEpoch || this.activeChatId !== targetChatId)
       return;
     this.pushVariableState(targetChatId, variables, true);
@@ -5053,7 +5280,7 @@ ${script.content}
     if (payload?.chat && payload.chat.metadata && payloadChatId) {
       ++this.variableEpoch;
       this.activeChatId = payloadChatId;
-      this.pushVariableState(payloadChatId, variablesFromMetadata(payload.chat.metadata));
+      this.pushVariableState(payloadChatId, variableStateFromMetadata(payload.chat.metadata));
       this.broadcast("CHAT_CHANGED", data);
       return;
     }
@@ -5064,7 +5291,7 @@ ${script.content}
       return;
     }
     const epoch = ++this.variableEpoch;
-    const variables = await this.fetchVariablesForChat(payloadChatId);
+    const variables = await this.fetchVariableStateForChat(payloadChatId);
     if (epoch !== this.variableEpoch || this.activeChatId !== payloadChatId)
       return;
     this.pushVariableState(payloadChatId, variables);
