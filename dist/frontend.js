@@ -3111,7 +3111,6 @@ async function processNode(root, scripts, ctx) {
       return 0;
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
-    normalizeExistingWidgetContainers(target);
     const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     let total = 0;
     try {
@@ -3125,7 +3124,6 @@ async function processNode(root, scripts, ctx) {
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-      normalizeExistingWidgetContainers(findContentRoot(root));
     } catch (err) {
       console.debug("[vishrun] processNode render error:", err);
     }
@@ -3306,13 +3304,6 @@ var MULTILINE_BLOCK_TAGS = new Set([
 ]);
 var TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(["SPAN"]);
 var EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
-function normalizeExistingWidgetContainers(target) {
-  const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
-  for (const widget of widgets) {
-    if (widget.isConnected)
-      cleanupEmptyAroundWidget(widget, target);
-  }
-}
 function cleanupEmptyAroundWidget(widget, stopAt) {
   let current = widget;
   for (;; ) {
@@ -3660,8 +3651,42 @@ function installMessageHooks(ctx) {
   let pendingRecords = [];
   let bodyWatcher = null;
   let latestMessageId = null;
-  const generatedReadyWatchers = new Map;
+  const newestPendingObservers = new Map;
   const OBSERVE_OPTS = { childList: true, subtree: true, characterData: true };
+  function processNewestWhenDisplayReady(messageId, retriesLeft = MAX_RAF_RETRIES) {
+    const sel = buildMessageSelector(messageId);
+    const node = document.querySelector(sel);
+    if (!node) {
+      if (retriesLeft > 0) {
+        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
+      }
+      return;
+    }
+    const content = node.querySelector('[data-component="MessageContent"]');
+    if (!content) {
+      if (retriesLeft > 0) {
+        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
+      }
+      return;
+    }
+    if (content.getAttribute("data-display-pending") !== "true") {
+      processMessageById(messageId, MAX_RAF_RETRIES);
+      return;
+    }
+    newestPendingObservers.get(messageId)?.disconnect();
+    const readyObserver = new MutationObserver(() => {
+      if (content.getAttribute("data-display-pending") === "true")
+        return;
+      readyObserver.disconnect();
+      newestPendingObservers.delete(messageId);
+      processMessageById(messageId, MAX_RAF_RETRIES);
+    });
+    newestPendingObservers.set(messageId, readyObserver);
+    readyObserver.observe(content, {
+      attributes: true,
+      attributeFilter: ["data-display-pending"]
+    });
+  }
   function compiledForActiveCard() {
     const card = getActiveCard();
     if (!card)
@@ -3676,51 +3701,6 @@ function installMessageHooks(ctx) {
     if (!active)
       return true;
     return active === chatId;
-  }
-  function clearGeneratedReadyWatcher(messageId) {
-    const watcher = generatedReadyWatchers.get(messageId);
-    if (!watcher)
-      return;
-    watcher.disconnect();
-    generatedReadyWatchers.delete(messageId);
-  }
-  function processGeneratedMessageWhenReady(messageId, retriesLeft = MAX_RAF_RETRIES) {
-    const node = document.querySelector(buildMessageSelector(messageId));
-    if (!node) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processGeneratedMessageWhenReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-    const messageContent = node.querySelector('[data-component="MessageContent"]');
-    if (!messageContent) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processGeneratedMessageWhenReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-    if (messageContent.getAttribute("data-display-pending") !== "true") {
-      clearGeneratedReadyWatcher(messageId);
-      processMessageById(messageId, 0);
-      return;
-    }
-    if (generatedReadyWatchers.has(messageId))
-      return;
-    const watcher = new MutationObserver(() => {
-      const currentNode = document.querySelector(buildMessageSelector(messageId));
-      const currentContent = currentNode?.querySelector('[data-component="MessageContent"]');
-      if (!currentContent || currentContent.getAttribute("data-display-pending") === "true")
-        return;
-      clearGeneratedReadyWatcher(messageId);
-      processMessageById(messageId, 0);
-    });
-    watcher.observe(node, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ["data-display-pending"]
-    });
-    generatedReadyWatchers.set(messageId, watcher);
   }
   function processMessageById(messageId, retriesLeft = MAX_RAF_RETRIES) {
     const compiled = compiledForActiveCard();
@@ -3881,8 +3861,6 @@ function installMessageHooks(ctx) {
       observer = null;
       observedTarget = null;
     }
-    generatedReadyWatchers.forEach((watcher) => watcher.disconnect());
-    generatedReadyWatchers.clear();
   }
   function rescanAll() {
     const compiledNow = compiledForActiveCard();
@@ -3918,7 +3896,7 @@ function installMessageHooks(ctx) {
     if (!p.messageId)
       return;
     latestMessageId = p.messageId;
-    processGeneratedMessageWhenReady(p.messageId, MAX_RAF_RETRIES);
+    processNewestWhenDisplayReady(p.messageId, MAX_RAF_RETRIES);
   });
   const unsubChatChanged = ctx.events.on("CHAT_CHANGED", (payload) => {
     const p = payload || {};
@@ -3934,6 +3912,9 @@ function installMessageHooks(ctx) {
       detachObserver();
       teardownTagInterceptors();
       clearEditingMessageIds();
+      for (const pending of newestPendingObservers.values())
+        pending.disconnect();
+      newestPendingObservers.clear();
       unsubGenEnded();
       unsubChatChanged();
     }
