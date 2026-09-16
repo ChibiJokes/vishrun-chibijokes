@@ -46,31 +46,6 @@ function nextBackendRequestId(): string {
   return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
 }
 
-// A large chat can build hundreds of scripted widgets in the same render pass.
-// Astra's executable-widget fallback intentionally gives all of them the
-// helpers shim, so without coalescing each iframe would request the same full
-// chat snapshot independently. Keep only the request that is currently in
-// flight. The entry is removed as soon as it settles, so later edits/swipes
-// still fetch fresh state instead of reusing a stale cache.
-const messagesSnapshotInflight = new Map<string, Promise<SnapshotMessage[]>>();
-const variablesSnapshotInflight = new Map<string, Promise<MvuData>>();
-
-function coalesceInflight<T>(
-  map: Map<string, Promise<T>>,
-  key: string,
-  factory: () => Promise<T>,
-): Promise<T> {
-  const existing = map.get(key);
-  if (existing) return existing;
-
-  const request = factory();
-  map.set(key, request);
-  void request.finally(() => {
-    if (map.get(key) === request) map.delete(key);
-  });
-  return request;
-}
-
 export function dispatchThRequest(
   frame: SpindleSandboxFrameHandle,
   request: ThRequestFromIframe,
@@ -154,25 +129,6 @@ export function fetchMessagesSnapshot(
   ctx: SpindleFrontendContext,
   timeoutMs: number = TH_TIMEOUT_MS,
 ): Promise<SnapshotMessage[]> {
-  if (!context.chatId) {
-    return fetchMessagesSnapshotUncoalesced(context, ctx, timeoutMs);
-  }
-  return coalesceInflight(
-    messagesSnapshotInflight,
-    context.chatId,
-    () => fetchMessagesSnapshotUncoalesced(context, ctx, timeoutMs),
-  );
-}
-
-function fetchMessagesSnapshotUncoalesced(
-  context: {
-    chatId: string;
-    currentMessageId: string;
-    currentMessageIndex: number;
-  },
-  ctx: SpindleFrontendContext,
-  timeoutMs: number,
-): Promise<SnapshotMessage[]> {
   return new Promise((resolve) => {
     const requestId = nextBackendRequestId();
     let settled = false;
@@ -247,25 +203,6 @@ export function fetchVariablesSnapshot(
   },
   ctx: SpindleFrontendContext,
   timeoutMs: number = TH_TIMEOUT_MS,
-): Promise<MvuData> {
-  if (!context.chatId) {
-    return fetchVariablesSnapshotUncoalesced(context, ctx, timeoutMs);
-  }
-  return coalesceInflight(
-    variablesSnapshotInflight,
-    context.chatId,
-    () => fetchVariablesSnapshotUncoalesced(context, ctx, timeoutMs),
-  );
-}
-
-function fetchVariablesSnapshotUncoalesced(
-  context: {
-    chatId: string;
-    currentMessageId: string;
-    currentMessageIndex: number;
-  },
-  ctx: SpindleFrontendContext,
-  timeoutMs: number,
 ): Promise<MvuData> {
   return new Promise((resolve) => {
     const requestId = nextBackendRequestId();

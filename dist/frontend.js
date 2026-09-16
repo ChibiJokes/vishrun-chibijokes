@@ -339,7 +339,6 @@ function chatVariableState(chatId, metadata) {
   return { chatId, variables, allVariables: { ...record(macro.global), ...record(macro.local), ...variables } };
 }
 var listeners = new WeakMap;
-var chatVariableFetchInflight = new Map;
 function publishChatVariableState(ctx, state) {
   for (const listener of listeners.get(ctx) ?? []) {
     try {
@@ -349,34 +348,22 @@ function publishChatVariableState(ctx, state) {
     }
   }
 }
-function fetchChatVariableState(chatId) {
+async function fetchChatVariableState(chatId) {
   if (!chatId)
-    return Promise.resolve(chatVariableState("", {}));
-  const existing = chatVariableFetchInflight.get(chatId);
-  if (existing)
-    return existing;
-  const request = (async () => {
-    try {
-      const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
-        cache: "no-store",
-        credentials: "same-origin"
-      });
-      if (!response.ok)
-        throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
-      const chat = await response.json();
-      return chatVariableState(chatId, chat?.metadata);
-    } catch (err) {
-      console.warn("[vishrun:variables]", err);
-      return { ...chatVariableState(chatId, {}), ready: false };
-    }
-  })();
-  chatVariableFetchInflight.set(chatId, request);
-  request.finally(() => {
-    if (chatVariableFetchInflight.get(chatId) === request) {
-      chatVariableFetchInflight.delete(chatId);
-    }
-  });
-  return request;
+    return chatVariableState("", {});
+  try {
+    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
+      cache: "no-store",
+      credentials: "same-origin"
+    });
+    if (!response.ok)
+      throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
+    const chat = await response.json();
+    return chatVariableState(chatId, chat?.metadata);
+  } catch (err) {
+    console.warn("[vishrun:variables]", err);
+    return { ...chatVariableState(chatId, {}), ready: false };
+  }
 }
 function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
   let state = initial;
@@ -444,8 +431,7 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
   });
   const switched = ctx.events.on("CHAT_SWITCHED", switchChat);
   frame.element.addEventListener("load", deliver);
-  if (initial.ready === false)
-    refresh();
+  refresh();
   return () => {
     destroyed = true;
     ++epoch;
@@ -1522,20 +1508,6 @@ function nextBackendRequestId() {
   }
   return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
 }
-var messagesSnapshotInflight = new Map;
-var variablesSnapshotInflight = new Map;
-function coalesceInflight(map, key, factory) {
-  const existing = map.get(key);
-  if (existing)
-    return existing;
-  const request = factory();
-  map.set(key, request);
-  request.finally(() => {
-    if (map.get(key) === request)
-      map.delete(key);
-  });
-  return request;
-}
 function dispatchThRequest(frame, request, context, ctx) {
   const { requestId, op, body } = request;
   const backendRequestId = op === "th-replace-chat-variables" ? nextBackendRequestId() : requestId;
@@ -1590,12 +1562,6 @@ function dispatchThRequest(frame, request, context, ctx) {
   }
 }
 function fetchMessagesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
-  if (!context.chatId) {
-    return fetchMessagesSnapshotUncoalesced(context, ctx, timeoutMs);
-  }
-  return coalesceInflight(messagesSnapshotInflight, context.chatId, () => fetchMessagesSnapshotUncoalesced(context, ctx, timeoutMs));
-}
-function fetchMessagesSnapshotUncoalesced(context, ctx, timeoutMs) {
   return new Promise((resolve) => {
     const requestId = nextBackendRequestId();
     let settled = false;
@@ -1648,12 +1614,6 @@ function fetchMessagesSnapshotUncoalesced(context, ctx, timeoutMs) {
   });
 }
 function fetchVariablesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
-  if (!context.chatId) {
-    return fetchVariablesSnapshotUncoalesced(context, ctx, timeoutMs);
-  }
-  return coalesceInflight(variablesSnapshotInflight, context.chatId, () => fetchVariablesSnapshotUncoalesced(context, ctx, timeoutMs));
-}
-function fetchVariablesSnapshotUncoalesced(context, ctx, timeoutMs) {
   return new Promise((resolve) => {
     const requestId = nextBackendRequestId();
     let settled = false;

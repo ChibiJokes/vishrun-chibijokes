@@ -22,12 +22,6 @@ export function chatVariableState(chatId: string, metadata: unknown): ChatVariab
 type Listener = (state: ChatVariableState) => void;
 const listeners = new WeakMap<SpindleFrontendContext, Set<Listener>>();
 
-// Coalesce concurrent reads for the same chat. A full historical render can
-// create many iframes at once; they all need the same metadata snapshot.
-// This is intentionally in-flight-only, not a persistent cache, so a later
-// read after an edit/write still reaches Lumiverse for fresh metadata.
-const chatVariableFetchInflight = new Map<string, Promise<ChatVariableState>>();
-
 // The write response publishes before the caller's Promise resolves. Native
 // CHAT_CHANGED handles macro writes and changes made outside Vishrun.
 export function publishChatVariableState(ctx: SpindleFrontendContext, state: ChatVariableState): void {
@@ -36,35 +30,21 @@ export function publishChatVariableState(ctx: SpindleFrontendContext, state: Cha
   }
 }
 
-export function fetchChatVariableState(chatId: string): Promise<ChatVariableState> {
-  if (!chatId) return Promise.resolve(chatVariableState('', {}));
-
-  const existing = chatVariableFetchInflight.get(chatId);
-  if (existing) return existing;
-
-  const request = (async (): Promise<ChatVariableState> => {
-    try {
-      const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
-        cache: 'no-store', credentials: 'same-origin',
-      });
-      if (!response.ok) throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
-      const chat = await response.json();
-      return chatVariableState(chatId, chat?.metadata);
-    } catch (err) {
-      // A failed mirror read must not prevent unrelated widget/script code from
-      // loading, nor let an updater replace persisted data with an empty bag.
-      console.warn('[vishrun:variables]', err);
-      return { ...chatVariableState(chatId, {}), ready: false };
-    }
-  })();
-
-  chatVariableFetchInflight.set(chatId, request);
-  void request.finally(() => {
-    if (chatVariableFetchInflight.get(chatId) === request) {
-      chatVariableFetchInflight.delete(chatId);
-    }
-  });
-  return request;
+export async function fetchChatVariableState(chatId: string): Promise<ChatVariableState> {
+  if (!chatId) return chatVariableState('', {});
+  try {
+    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
+      cache: 'no-store', credentials: 'same-origin',
+    });
+    if (!response.ok) throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
+    const chat = await response.json();
+    return chatVariableState(chatId, chat?.metadata);
+  } catch (err) {
+    // A failed mirror read must not prevent unrelated widget/script code from
+    // loading, nor let an updater replace persisted data with an empty bag.
+    console.warn('[vishrun:variables]', err);
+    return { ...chatVariableState(chatId, {}), ready: false };
+  }
 }
 
 export function bindChatVariableState(
@@ -131,11 +111,7 @@ export function bindChatVariableState(
   // Re-deliver the latest state after srcdoc initializes, including events
   // received between createSandboxFrame and the iframe's load event.
   frame.element.addEventListener('load', deliver);
-  // buildWidgetIframe already fetched this state before creating the frame.
-  // Do not immediately issue the same GET once per iframe. If that initial
-  // fetch failed (ready === false), retry in the background; later
-  // CHAT_CHANGED / chat-switch events still refresh normally.
-  if (initial.ready === false) void refresh();
+  void refresh();
   return () => {
     destroyed = true;
     ++epoch;
