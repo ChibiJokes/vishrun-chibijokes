@@ -152,10 +152,7 @@ window.Mvu = {
   parseMessage: function(){ return Promise.resolve(undefined); },
   isDuringExtraAnalysis: function(){ return false; }
 };
-window.getAllVariables = function(){
-  if (typeof window.getVariables !== 'function') return MVUC.variablesSnapshot;
-  return Object.assign({}, window.getVariables({ type: 'chat' }), MVUC.variablesSnapshot);
-};
+window.getAllVariables = function(){ return MVUC.variablesSnapshot; };
 window.waitGlobalInitialized = function(name){
   if (name === 'Mvu') return Promise.resolve();
   return new Promise(function(){});

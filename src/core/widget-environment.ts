@@ -28,7 +28,6 @@ const JQUERY_TOKEN = /(?:^|[^a-zA-Z_$.\w])\$\s*\(/;
 const JQUERY_NAMED_TOKEN = /\bjQuery\s*[(.]/;
 
 const HELPERS_LIGHT_TOKENS: readonly RegExp[] = [
-  /\b(?:getVariables|replaceVariables|updateVariablesWith|insertOrAssignVariables|insertVariables|deleteVariable)\b/,
   /\bgetChatMessages\s*\(/,
   /\bsetChatMessage\s*\(/,
   /\bgetCurrentMessageId\s*\(/,
