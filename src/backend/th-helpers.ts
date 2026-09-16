@@ -1,6 +1,7 @@
 import type { ChatMessageDTO, SpindleAPI } from 'lumiverse-spindle-types';
 import { api } from './common';
 import { computeVariablesSnapshot, emptyMvuData, type MvuData } from './mvu-parser';
+import { dispatchSlashText } from './dispatch-slash';
 
 const LOG_PREFIX = '[vishrun:th-helpers]';
 const log = {
@@ -11,7 +12,7 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-create-chat-messages' | 'th-get-variables-snapshot' | 'th-set-variable' | 'th-replace-chat-variables';
+  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-create-chat-messages' | 'th-trigger-slash' | 'th-get-variables-snapshot' | 'th-set-variable' | 'th-replace-chat-variables';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -317,6 +318,23 @@ export async function handleCreateChatMessages(
   };
 }
 
+export async function handleTriggerSlash(
+  body: Record<string, unknown>,
+  chatId: string,
+  userId: string,
+): Promise<string> {
+  const command = body.command;
+  if (typeof command !== 'string') throw new TypeError('triggerSlash command must be a string');
+  const result = await dispatchSlashText(command, chatId, userId);
+  if (!result.handled) {
+    throw new Error(`Unsupported slash command in Vishrun triggerSlash: ${command}`);
+  }
+  // JSLR resolves to the slash executor pipe string. Vishrun's existing
+  // internal slash handlers do not expose a pipe value, so handled commands
+  // resolve to the equivalent empty string instead of touching the clipboard.
+  return '';
+}
+
 export async function handleSetChatMessage(
   body: Record<string, unknown>,
   chatId: string,
@@ -429,6 +447,9 @@ export function installThHelpersHandler(): void {
           response = { type: 'th_helpers_response', requestId, ok: true, result: undefined };
         } else if (op === 'th-create-chat-messages') {
           const result = await handleCreateChatMessages(body, chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-trigger-slash') {
+          const result = await handleTriggerSlash(body, chatId, userId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-replace-chat-variables') {
           const result = await handleReplaceChatVariables(body, chatId, userId);

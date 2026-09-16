@@ -79,6 +79,8 @@ export interface ThHelpersHandle {
     chatMessages: ChatMessageCreating[],
     options?: CreateChatMessagesOption,
   ): Promise<void>;
+  triggerSlash(command: string): Promise<string>;
+  triggerSlashWithResult(command: string): Promise<string>;
   getAllVariables(): Record<string, unknown>;
   getVariable(key: string): unknown;
   setVariable(key: string, value: unknown): Promise<void>;
@@ -168,6 +170,14 @@ export function createThHelpers(
         chatMessages,
         options: options ?? {},
       });
+    },
+    async triggerSlash(command) {
+      if (typeof command !== 'string') throw new TypeError('triggerSlash command must be a string');
+      return String(await bridge.postRequest('th-trigger-slash', { command }) ?? '');
+    },
+    async triggerSlashWithResult(command) {
+      if (typeof command !== 'string') throw new TypeError('triggerSlash command must be a string');
+      return String(await bridge.postRequest('th-trigger-slash', { command }) ?? '');
     },
     getAllVariables() {
       if ((consts.variablesChatId ?? consts.chatId) !== consts.chatId) return {};
@@ -383,6 +393,13 @@ function rollbackCreatedMessages(chatId, created){
     return hostJsonFetch(path, { method: 'DELETE', credentials: 'include' }).catch(function(){ return undefined; });
   }));
 }
+window.triggerSlash = function(command){
+  if (typeof command !== 'string') return Promise.reject(new TypeError('triggerSlash command must be a string'));
+  return postRequest('th-trigger-slash', { command: command }).then(function(result){
+    return result == null ? '' : String(result);
+  });
+};
+window.triggerSlashWithResult = window.triggerSlash;
 window.createChatMessages = function(chatMessages, options){
   if (!Array.isArray(chatMessages)) return Promise.reject(new TypeError('chat_messages must be an array'));
   var normalized;
