@@ -2,8 +2,8 @@ import type { SnapshotMessage } from '../backend/th-helpers';
 
 // TS twin of the ES5 shim string in thHelpersShim() below. The twin is
 // testable with happy-dom; the string runs in the sandbox iframe.
-// Read APIs stay synchronous from host-maintained snapshots. Mutations use
-// the backend bridge because Lumiverse's persisted chat-variable API is async.
+// getChatMessages and the two id helpers are sync per the JSR contract;
+// setChatMessage stays async via the backend round-trip.
 
 export interface ThHelpersBridge {
   postRequest(kind: string, payload: Record<string, unknown>): Promise<unknown>;
@@ -16,9 +16,6 @@ export interface ThHelpersConstants {
   messagesSnapshot: SnapshotMessage[];
   variablesChatId?: string;
   variablesSnapshot?: Record<string, unknown>;
-  variablesBaseSnapshot?: Record<string, unknown>;
-  chatVariablesChatId?: string;
-  chatVariablesSnapshot?: Record<string, unknown>;
 }
 
 export interface ChatMessageNonSwiped {
@@ -47,15 +44,6 @@ export interface ChatMessageSwiped {
   swipes_info: Record<string, unknown>[];
 }
 
-export interface ChatVariableOption {
-  type: 'chat';
-}
-
-export interface DeleteVariableResult {
-  variables: Record<string, unknown>;
-  delete_occurred: boolean;
-}
-
 export interface ThHelpersHandle {
   getCurrentMessageId(): number;
   getChatId(): string;
@@ -71,24 +59,6 @@ export interface ThHelpersHandle {
   getAllVariables(): Record<string, unknown>;
   getVariable(key: string): unknown;
   setVariable(key: string, value: unknown): Promise<void>;
-  getVariables(option?: ChatVariableOption): Record<string, unknown>;
-  replaceVariables(
-    variables: Record<string, unknown>,
-    option?: ChatVariableOption,
-  ): Promise<void>;
-  updateVariablesWith(
-    updater: (variables: Record<string, unknown>) => Record<string, unknown> | Promise<Record<string, unknown>>,
-    option?: ChatVariableOption,
-  ): Promise<Record<string, unknown>>;
-  insertOrAssignVariables(
-    variables: Record<string, unknown>,
-    option?: ChatVariableOption,
-  ): Promise<Record<string, unknown>>;
-  insertVariables(
-    variables: Record<string, unknown>,
-    option?: ChatVariableOption,
-  ): Promise<Record<string, unknown>>;
-  deleteVariable(variablePath: string, option?: ChatVariableOption): Promise<DeleteVariableResult>;
 }
 
 function resolveRangeToIndex(
@@ -142,54 +112,6 @@ function shapeFromSnapshot(
   };
 }
 
-function isPlainRecord(value: unknown): value is Record<string, unknown> {
-  return !!value && typeof value === 'object' && !Array.isArray(value);
-}
-
-function cloneRecord(value: Record<string, unknown>): Record<string, unknown> {
-  if (typeof structuredClone === 'function') {
-    try { return structuredClone(value); } catch { /* JSON fallback below */ }
-  }
-  try { return JSON.parse(JSON.stringify(value)) as Record<string, unknown>; }
-  catch { return { ...value }; }
-}
-
-function assertChatOption(option: ChatVariableOption = { type: 'chat' }): void {
-  if (!option || option.type !== 'chat') {
-    throw new Error("Vishrun currently supports getVariables-style APIs only for { type: 'chat' }");
-  }
-}
-
-function currentChatVariables(consts: ThHelpersConstants): Record<string, unknown> {
-  if ((consts.chatVariablesChatId ?? consts.chatId) !== consts.chatId) return {};
-  return cloneRecord(consts.chatVariablesSnapshot ?? {});
-}
-
-function currentAllVariables(consts: ThHelpersConstants): Record<string, unknown> {
-  if ((consts.variablesChatId ?? consts.chatId) !== consts.chatId) return {};
-  const separated = consts.variablesBaseSnapshot !== undefined || consts.chatVariablesSnapshot !== undefined;
-  if (!separated) return cloneRecord(consts.variablesSnapshot ?? {});
-  return {
-    ...cloneRecord(consts.variablesBaseSnapshot ?? {}),
-    ...currentChatVariables(consts),
-  };
-}
-
-function applyChatVariablesResult(
-  consts: ThHelpersConstants,
-  result: unknown,
-  fallback: Record<string, unknown>,
-  expectedChatId: string,
-): Record<string, unknown> {
-  const next = isPlainRecord(result) ? result : fallback;
-  // A write may finish after the user switches chats. Return the authoritative
-  // result to the caller, but never install Chat A's result into Chat B's mirror.
-  if (consts.chatId !== expectedChatId) return cloneRecord(next);
-  consts.chatVariablesChatId = expectedChatId;
-  consts.chatVariablesSnapshot = cloneRecord(next);
-  return cloneRecord(next);
-}
-
 export function createThHelpers(
   consts: ThHelpersConstants,
   bridge: ThHelpersBridge,
@@ -219,69 +141,24 @@ export function createThHelpers(
       });
     },
     getAllVariables() {
-      return currentAllVariables(consts);
+      if ((consts.variablesChatId ?? consts.chatId) !== consts.chatId) return {};
+      return { ...(consts.variablesSnapshot ?? {}) };
     },
     getVariable(key: string) {
-      const vars = currentAllVariables(consts);
+      if ((consts.variablesChatId ?? consts.chatId) !== consts.chatId) return null;
+      const vars = consts.variablesSnapshot ?? {};
       return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
     },
     async setVariable(key: string, value: unknown) {
       await bridge.postRequest('th-set-variable', { key, value });
     },
-    getVariables(option = { type: 'chat' }) {
-      assertChatOption(option);
-      return currentChatVariables(consts);
-    },
-    async replaceVariables(variables, option = { type: 'chat' }) {
-      assertChatOption(option);
-      if (!isPlainRecord(variables)) throw new TypeError('replaceVariables expects an object');
-      const requested = cloneRecord(variables);
-      const expectedChatId = consts.chatId;
-      const result = await bridge.postRequest('th-replace-chat-variables', { variables: requested, chatId: expectedChatId });
-      applyChatVariablesResult(consts, result, requested, expectedChatId);
-    },
-    async updateVariablesWith(updater, option = { type: 'chat' }) {
-      assertChatOption(option);
-      if (typeof updater !== 'function') throw new TypeError('updateVariablesWith expects a function');
-      const expectedChatId = consts.chatId;
-      const result = await updater(currentChatVariables(consts));
-      if (!isPlainRecord(result)) throw new TypeError('updateVariablesWith callback must return an object');
-      const requested = cloneRecord(result);
-      const persisted = await bridge.postRequest('th-replace-chat-variables', { variables: requested, chatId: expectedChatId });
-      return applyChatVariablesResult(consts, persisted, requested, expectedChatId);
-    },
-    async insertOrAssignVariables(variables, option = { type: 'chat' }) {
-      assertChatOption(option);
-      if (!isPlainRecord(variables)) throw new TypeError('insertOrAssignVariables expects an object');
-      const expectedChatId = consts.chatId;
-      const result = await bridge.postRequest('th-patch-chat-variables', { variables, chatId: expectedChatId });
-      return applyChatVariablesResult(consts, result, { ...currentChatVariables(consts), ...variables }, expectedChatId);
-    },
-    async insertVariables(variables, option = { type: 'chat' }) {
-      assertChatOption(option);
-      if (!isPlainRecord(variables)) throw new TypeError('insertVariables expects an object');
-      const expectedChatId = consts.chatId;
-      const current = currentChatVariables(consts);
-      const result = await bridge.postRequest('th-insert-chat-variables', { variables, chatId: expectedChatId });
-      return applyChatVariablesResult(consts, result, { ...variables, ...current }, expectedChatId);
-    },
-    async deleteVariable(variablePath, option = { type: 'chat' }) {
-      assertChatOption(option);
-      const expectedChatId = consts.chatId;
-      const result = await bridge.postRequest('th-delete-chat-variable', { path: String(variablePath), chatId: expectedChatId });
-      if (isPlainRecord(result) && isPlainRecord(result.variables)) {
-        const variables = applyChatVariablesResult(consts, result.variables, currentChatVariables(consts), expectedChatId);
-        return { variables, delete_occurred: result.delete_occurred === true };
-      }
-      return { variables: currentChatVariables(consts), delete_occurred: false };
-    },
   };
 }
 
-// ES5 shim string injected into the iframe srcdoc head. Read APIs resolve
-// synchronously from host-maintained state. Chat-variable mutations use the
-// backend bridge and then immediately replace the iframe's mirrored chat bag
-// with the authoritative result returned by spindle.variables.chat.
+// ES5 shim string injected into the iframe srcdoc head. getChatMessages,
+// getAllVariables, getVariable, and the id helpers resolve synchronously from
+// host-maintained state; setChatMessage/setVariable still use the backend bridge.
+// (host-side dispatcher posts 'th-response' back keyed by requestId).
 export function thHelpersShim(consts: ThHelpersConstants): string {
   const constsJson = JSON.stringify({
     currentMessageIndex: consts.currentMessageIndex,
@@ -290,64 +167,18 @@ export function thHelpersShim(consts: ThHelpersConstants): string {
     messagesSnapshot: consts.messagesSnapshot,
     variablesChatId: consts.variablesChatId ?? consts.chatId,
     variablesSnapshot: consts.variablesSnapshot ?? {},
-    variablesBaseSnapshot: consts.variablesBaseSnapshot,
-    chatVariablesChatId: consts.chatVariablesSnapshot !== undefined
-      ? (consts.chatVariablesChatId ?? consts.chatId)
-      : undefined,
-    chatVariablesSnapshot: consts.chatVariablesSnapshot,
   });
   return `<script>(function(){
 var THC = ${constsJson};
 var pending = {};
 var nextId = 0;
 function makeRequestId(){ nextId = (nextId + 1) | 0; return 'th-' + Date.now().toString(36) + '-' + nextId.toString(36); }
-function isRecord(value){ return !!value && typeof value === 'object' && !Array.isArray(value); }
-function cloneRecord(value){
-  value = isRecord(value) ? value : {};
-  if (typeof structuredClone === 'function') {
-    try { return structuredClone(value); } catch (e) {}
-  }
-  try { return JSON.parse(JSON.stringify(value)); } catch (e) {}
-  var out = {};
-  for (var key in value) if (Object.prototype.hasOwnProperty.call(value, key)) out[key] = value[key];
-  return out;
-}
-function assertChatOption(option){
-  option = option || { type: 'chat' };
-  if (!option || option.type !== 'chat') throw new Error("Vishrun currently supports getVariables-style APIs only for { type: 'chat' }");
-  return option;
-}
-function getChatSnapshot(){
-  if (THC.chatVariablesChatId !== THC.chatId) return {};
-  return cloneRecord(THC.chatVariablesSnapshot || {});
-}
-function getAllSnapshot(){
-  if (THC.variablesChatId !== THC.chatId) return {};
-  var separated = THC.variablesBaseSnapshot !== undefined || THC.chatVariablesSnapshot !== undefined;
-  if (!separated) return cloneRecord(THC.variablesSnapshot || {});
-  var out = cloneRecord(THC.variablesBaseSnapshot || {});
-  var chat = getChatSnapshot();
-  for (var key in chat) if (Object.prototype.hasOwnProperty.call(chat, key)) out[key] = chat[key];
-  return out;
-}
-function applyChatVariables(nextVars, expectedChatId){
-  nextVars = isRecord(nextVars) ? nextVars : {};
-  if (typeof expectedChatId === 'string' && THC.chatId !== expectedChatId) return cloneRecord(nextVars);
-  THC.chatVariablesChatId = THC.chatId;
-  THC.chatVariablesSnapshot = cloneRecord(nextVars);
-  return cloneRecord(THC.chatVariablesSnapshot);
-}
-function applyVariableState(nextChatId, nextBaseVars, nextChatVars, nextCombinedVars, emitChanged){
+function applyVariableState(nextChatId, nextVars, emitChanged){
   nextChatId = typeof nextChatId === 'string' ? nextChatId : '';
-  nextBaseVars = isRecord(nextBaseVars) ? nextBaseVars : {};
-  nextChatVars = isRecord(nextChatVars) ? nextChatVars : {};
-  nextCombinedVars = isRecord(nextCombinedVars) ? nextCombinedVars : {};
+  nextVars = nextVars && typeof nextVars === 'object' && !Array.isArray(nextVars) ? nextVars : {};
   THC.chatId = nextChatId;
   THC.variablesChatId = nextChatId;
-  THC.chatVariablesChatId = nextChatId;
-  THC.variablesBaseSnapshot = nextBaseVars;
-  THC.chatVariablesSnapshot = nextChatVars;
-  THC.variablesSnapshot = nextCombinedVars;
+  THC.variablesSnapshot = nextVars;
   if (emitChanged && window.eventSource && typeof window.eventSource.emit === 'function') {
     window.eventSource.emit('CHAT_CHANGED', {
       chatId: nextChatId,
@@ -358,15 +189,15 @@ function applyVariableState(nextChatId, nextBaseVars, nextChatVars, nextCombined
 // Same-origin fast path used by ScriptRunner. This deliberately updates state
 // and fires the compatibility event in the same call stack, matching JSLR's
 // direct parent-window binding more closely than an asynchronous postMessage.
-window.__vishrunSetVariableState = function(nextChatId, nextBaseVars, nextChatVars, nextCombinedVars, emitChanged){
-  applyVariableState(nextChatId, nextBaseVars, nextChatVars, nextCombinedVars, !!emitChanged);
+window.__vishrunSetVariableState = function(nextChatId, nextVars, emitChanged){
+  applyVariableState(nextChatId, nextVars, !!emitChanged);
 };
 function setup(){
   if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
   window.spindleSandbox.onMessage(function(payload){
     if (!payload || typeof payload !== 'object') return;
     if (payload.type === 'vsh_th_variables') {
-      applyVariableState(payload.chatId, payload.variablesBase, payload.chatVariables, payload.variables, !!payload.emitChanged);
+      applyVariableState(payload.chatId, payload.variables, !!payload.emitChanged);
       return;
     }
     if (payload.kind !== 'th-response') return;
@@ -437,71 +268,22 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
-window.getAllVariables = function(){ return getAllSnapshot(); };
+window.getAllVariables = function(){
+  if (THC.variablesChatId !== THC.chatId) return {};
+  var vars = THC.variablesSnapshot || {};
+  var out = {};
+  for (var key in vars) {
+    if (Object.prototype.hasOwnProperty.call(vars, key)) out[key] = vars[key];
+  }
+  return out;
+};
 window.getVariable = function(key){
-  var vars = getAllSnapshot();
+  if (THC.variablesChatId !== THC.chatId) return null;
+  var vars = THC.variablesSnapshot || {};
   return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
 };
 window.setVariable = function(key, value){
   return postRequest('th-set-variable', { key: key, value: value });
-};
-window.getVariables = function(option){
-  assertChatOption(option || { type: 'chat' });
-  return getChatSnapshot();
-};
-window.replaceVariables = function(variables, option){
-  assertChatOption(option || { type: 'chat' });
-  if (!isRecord(variables)) return Promise.reject(new TypeError('replaceVariables expects an object'));
-  var requested = cloneRecord(variables);
-  var expectedChatId = THC.chatId;
-  return postRequest('th-replace-chat-variables', { variables: requested, chatId: expectedChatId }).then(function(result){
-    applyChatVariables(isRecord(result) ? result : requested, expectedChatId);
-  });
-};
-window.updateVariablesWith = function(updater, option){
-  assertChatOption(option || { type: 'chat' });
-  if (typeof updater !== 'function') return Promise.reject(new TypeError('updateVariablesWith expects a function'));
-  var expectedChatId = THC.chatId;
-  var result;
-  try { result = updater(getChatSnapshot()); } catch (e) { return Promise.reject(e); }
-  return Promise.resolve(result).then(function(next){
-    if (!isRecord(next)) throw new TypeError('updateVariablesWith callback must return an object');
-    var requested = cloneRecord(next);
-    return postRequest('th-replace-chat-variables', { variables: requested, chatId: expectedChatId }).then(function(persisted){
-      return applyChatVariables(isRecord(persisted) ? persisted : requested, expectedChatId);
-    });
-  });
-};
-window.insertOrAssignVariables = function(variables, option){
-  assertChatOption(option || { type: 'chat' });
-  if (!isRecord(variables)) return Promise.reject(new TypeError('insertOrAssignVariables expects an object'));
-  var expectedChatId = THC.chatId;
-  var fallback = getChatSnapshot();
-  for (var key in variables) if (Object.prototype.hasOwnProperty.call(variables, key)) fallback[key] = variables[key];
-  return postRequest('th-patch-chat-variables', { variables: variables, chatId: expectedChatId }).then(function(result){
-    return applyChatVariables(isRecord(result) ? result : fallback, expectedChatId);
-  });
-};
-window.insertVariables = function(variables, option){
-  assertChatOption(option || { type: 'chat' });
-  if (!isRecord(variables)) return Promise.reject(new TypeError('insertVariables expects an object'));
-  var expectedChatId = THC.chatId;
-  var current = getChatSnapshot();
-  var fallback = cloneRecord(variables);
-  for (var key in current) if (Object.prototype.hasOwnProperty.call(current, key)) fallback[key] = current[key];
-  return postRequest('th-insert-chat-variables', { variables: variables, chatId: expectedChatId }).then(function(result){
-    return applyChatVariables(isRecord(result) ? result : fallback, expectedChatId);
-  });
-};
-window.deleteVariable = function(variablePath, option){
-  assertChatOption(option || { type: 'chat' });
-  var expectedChatId = THC.chatId;
-  return postRequest('th-delete-chat-variable', { path: String(variablePath), chatId: expectedChatId }).then(function(result){
-    if (isRecord(result) && isRecord(result.variables)) {
-      return { variables: applyChatVariables(result.variables, expectedChatId), delete_occurred: result.delete_occurred === true };
-    }
-    return { variables: getChatSnapshot(), delete_occurred: false };
-  });
 };
 })();</script>`;
 }

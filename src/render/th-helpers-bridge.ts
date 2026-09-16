@@ -54,7 +54,6 @@ export function dispatchThRequest(
     currentMessageIndex: number;
   },
   ctx: SpindleFrontendContext,
-  onResponse?: (response: { ok: boolean; result?: unknown; error?: string }) => void,
 ): void {
   const { requestId, op, body } = request;
   let settled = false;
@@ -72,7 +71,6 @@ export function dispatchThRequest(
       try { unsub(); } catch { /* ignore */ }
       unsub = null;
     }
-    try { onResponse?.(resp); } catch { /* observer must not break bridge response */ }
     try {
       frame.postMessage({ kind: 'th-response', requestId, ok: resp.ok, result: resp.result, error: resp.error });
     } catch {
@@ -260,75 +258,4 @@ export function computeMessageIndexInChat(messageId: string, doc: Document = doc
     if (all[i].getAttribute('data-message-id') === messageId) return i;
   }
   return -1;
-}
-
-// Pure persisted chat-variable snapshot used by the JSLR-style getVariables
-// compatibility layer. This is intentionally separate from fetchVariablesSnapshot,
-// which is Vishrun's legacy MVU replay state and must remain untouched.
-export function fetchChatVariablesSnapshot(
-  context: {
-    chatId: string;
-    currentMessageId: string;
-    currentMessageIndex: number;
-  },
-  ctx: SpindleFrontendContext,
-  timeoutMs: number = TH_TIMEOUT_MS,
-): Promise<Record<string, unknown>> {
-  return new Promise((resolve) => {
-    const requestId = nextBackendRequestId();
-    let settled = false;
-    let unsub: (() => void) | null = null;
-    let timer: ReturnType<typeof setTimeout> | null = null;
-
-    const finish = (value: Record<string, unknown>): void => {
-      if (settled) return;
-      settled = true;
-      if (timer !== null) {
-        clearTimeout(timer);
-        timer = null;
-      }
-      if (unsub) {
-        try { unsub(); } catch { /* ignore */ }
-        unsub = null;
-      }
-      resolve(value);
-    };
-
-    unsub = ctx.onBackendMessage((payload) => {
-      if (!isThHelpersResponse(payload, requestId)) return;
-      if (payload.ok && payload.result && typeof payload.result === 'object' && !Array.isArray(payload.result)) {
-        finish(payload.result as Record<string, unknown>);
-        return;
-      }
-      if (payload.ok && payload.result && typeof payload.result === 'object') {
-        console.warn('[vishrun:th-helpers] chat variables snapshot malformed');
-      } else if (!payload.ok) {
-        console.warn('[vishrun:th-helpers] chat variables snapshot fetch failed:', payload.error || 'unknown error');
-      }
-      finish({});
-    });
-
-    timer = setTimeout(() => {
-      console.warn('[vishrun:th-helpers] chat variables snapshot fetch timed out');
-      finish({});
-    }, timeoutMs);
-
-    try {
-      ctx.sendToBackend({
-        type: 'th_helpers_request',
-        requestId,
-        op: 'th-get-chat-variables-snapshot',
-        chatId: context.chatId,
-        currentMessageId: context.currentMessageId,
-        currentMessageIndex: context.currentMessageIndex,
-        body: {},
-      });
-    } catch (err) {
-      console.warn(
-        '[vishrun:th-helpers] chat variables sendToBackend threw:',
-        err instanceof Error ? err.message : String(err),
-      );
-      finish({});
-    }
-  });
 }
