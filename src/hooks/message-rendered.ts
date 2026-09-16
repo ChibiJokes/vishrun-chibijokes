@@ -75,53 +75,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   // Used to anchor depth-0 scripts to a stable identity rather than
   // a DOM position that shifts as Lumi loads/unloads messages on scroll.
   let latestMessageId: string | null = null;
-  const newestPendingObservers = new Map<string, MutationObserver>();
   const OBSERVE_OPTS: MutationObserverInit = { childList: true, subtree: true, characterData: true };
-
-  function processNewestWhenDisplayReady(
-    messageId: string,
-    retriesLeft: number = MAX_RAF_RETRIES,
-  ): void {
-    const sel = buildMessageSelector(messageId);
-    const node = document.querySelector(sel) as HTMLElement | null;
-
-    if (!node) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-
-    const content = node.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-    if (!content) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-
-    // Historical/chat-load scans never come through here. This gate is ONLY
-    // for the just-finished newest generation.
-    if (content.getAttribute('data-display-pending') !== 'true') {
-      processMessageById(messageId, MAX_RAF_RETRIES);
-      return;
-    }
-
-    newestPendingObservers.get(messageId)?.disconnect();
-
-    const readyObserver = new MutationObserver(() => {
-      if (content.getAttribute('data-display-pending') === 'true') return;
-      readyObserver.disconnect();
-      newestPendingObservers.delete(messageId);
-      processMessageById(messageId, MAX_RAF_RETRIES);
-    });
-
-    newestPendingObservers.set(messageId, readyObserver);
-    readyObserver.observe(content, {
-      attributes: true,
-      attributeFilter: ['data-display-pending'],
-    });
-  }
 
   function compiledForActiveCard(): CompiledScript[] | null {
     const card = getActiveCard();
@@ -357,7 +311,7 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     if (!isActiveChat(p.chatId)) return;
     if (!p.messageId) return;
     latestMessageId = p.messageId;
-    processNewestWhenDisplayReady(p.messageId, MAX_RAF_RETRIES);
+    processMessageById(p.messageId, MAX_RAF_RETRIES);
   });
 
   const unsubChatChanged = ctx.events.on('CHAT_CHANGED', (payload: unknown) => {
@@ -378,8 +332,6 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       detachObserver();
       teardownTagInterceptors();
       clearEditingMessageIds();
-      for (const pending of newestPendingObservers.values()) pending.disconnect();
-      newestPendingObservers.clear();
       unsubGenEnded();
       unsubChatChanged();
     },
