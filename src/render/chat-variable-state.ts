@@ -22,29 +22,60 @@ export function chatVariableState(chatId: string, metadata: unknown): ChatVariab
 type Listener = (state: ChatVariableState) => void;
 const listeners = new WeakMap<SpindleFrontendContext, Set<Listener>>();
 
+// Lumiverse's chat endpoint returns the Chat DTO, whose `metadata` member is
+// the complete metadata object for that chat (including keys written by other
+// extensions). Keep one shared DTO-derived variable mirror per chat instead of
+// asking the same endpoint once per iframe. In-flight coalescing also means a
+// mass history render still performs only one initial DTO read for the chat.
+const chatStateCache = new Map<string, ChatVariableState>();
+const chatStateInflight = new Map<string, Promise<ChatVariableState>>();
+
+function cacheChatVariableState(state: ChatVariableState): ChatVariableState {
+  if (state.chatId && state.ready !== false) chatStateCache.set(state.chatId, state);
+  return state;
+}
+
 // The write response publishes before the caller's Promise resolves. Native
 // CHAT_CHANGED handles macro writes and changes made outside Vishrun.
 export function publishChatVariableState(ctx: SpindleFrontendContext, state: ChatVariableState): void {
+  cacheChatVariableState(state);
   for (const listener of listeners.get(ctx) ?? []) {
     try { listener(state); } catch (err) { console.warn('[vishrun:variables]', err); }
   }
 }
 
-export async function fetchChatVariableState(chatId: string): Promise<ChatVariableState> {
-  if (!chatId) return chatVariableState('', {});
-  try {
-    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
-      cache: 'no-store', credentials: 'same-origin',
-    });
-    if (!response.ok) throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
-    const chat = await response.json();
-    return chatVariableState(chatId, chat?.metadata);
-  } catch (err) {
-    // A failed mirror read must not prevent unrelated widget/script code from
-    // loading, nor let an updater replace persisted data with an empty bag.
-    console.warn('[vishrun:variables]', err);
-    return { ...chatVariableState(chatId, {}), ready: false };
+export function fetchChatVariableState(chatId: string, force = false): Promise<ChatVariableState> {
+  if (!chatId) return Promise.resolve(chatVariableState('', {}));
+  if (!force) {
+    const cached = chatStateCache.get(chatId);
+    if (cached) return Promise.resolve(cached);
   }
+  const existing = chatStateInflight.get(chatId);
+  if (existing) return existing;
+
+  const request = (async (): Promise<ChatVariableState> => {
+    try {
+      // This response is Lumiverse's Chat DTO. Read the complete metadata bag
+      // once, then mirror only the variable views Vishrun exposes to widgets.
+      const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
+        cache: 'no-store', credentials: 'same-origin',
+      });
+      if (!response.ok) throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
+      const chat = await response.json();
+      return cacheChatVariableState(chatVariableState(chatId, chat?.metadata));
+    } catch (err) {
+      // A failed mirror read must not prevent unrelated widget/script code from
+      // loading, nor let an updater replace persisted data with an empty bag.
+      console.warn('[vishrun:variables]', err);
+      return { ...chatVariableState(chatId, {}), ready: false };
+    }
+  })();
+
+  chatStateInflight.set(chatId, request);
+  void request.finally(() => {
+    if (chatStateInflight.get(chatId) === request) chatStateInflight.delete(chatId);
+  });
+  return request;
 }
 
 export function bindChatVariableState(
@@ -72,14 +103,14 @@ export function bindChatVariableState(
   const accept = (next: ChatVariableState) => {
     if (next.chatId !== state.chatId) return;
     ++epoch;
-    state = next;
+    state = cacheChatVariableState(next);
     deliver();
   };
   const refresh = async () => {
     const currentEpoch = ++epoch;
     const chatId = state.chatId;
     try {
-      const next = await fetchChatVariableState(chatId);
+      const next = await fetchChatVariableState(chatId, true);
       if (!destroyed && next.ready !== false && currentEpoch === epoch && chatId === state.chatId) accept(next);
     } catch (err) { console.warn('[vishrun:variables]', err); }
   };
@@ -99,9 +130,10 @@ export function bindChatVariableState(
     const id = ctx.getActiveChat().chatId ?? '';
     if (id !== state.chatId) {
       ++epoch;
-      state = { ...chatVariableState(id, {}), ready: false };
+      const cached = id ? chatStateCache.get(id) : undefined;
+      state = cached ?? { ...chatVariableState(id, {}), ready: false };
       deliver();
-      void refresh();
+      if (!cached) void refresh();
     }
   };
   const settings = ctx.events.on('SETTINGS_UPDATED', (data: unknown) => {
@@ -111,7 +143,10 @@ export function bindChatVariableState(
   // Re-deliver the latest state after srcdoc initializes, including events
   // received between createSandboxFrame and the iframe's load event.
   frame.element.addEventListener('load', deliver);
-  void refresh();
+  // buildWidgetIframe already supplied the shared DTO-derived state. Only retry
+  // here when that initial read failed; normal CHAT_CHANGED/chat-switch events
+  // still force a fresh read when they do not include metadata themselves.
+  if (initial.ready === false) void refresh();
   return () => {
     destroyed = true;
     ++epoch;
