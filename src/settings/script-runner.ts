@@ -1,6 +1,7 @@
+import { bindChatVariableState, fetchChatVariableState, chatVariableState, publishChatVariableState, type ChatVariableState } from '../render/chat-variable-state';
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import { thHelpersShim } from '../render/th-helpers-shim';
-import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
+import { fetchMessagesSnapshot, isThRequest, dispatchThRequest } from '../render/th-helpers-bridge';
 import type { Script } from './script-types';
 import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 
@@ -67,6 +68,7 @@ interface LiveFrame {
   reloadMemo: string;
   handle: SpindleSandboxFrameHandle;
   container: HTMLDivElement;
+  unbindVariables: () => void;
 }
 
 /** Frame map key = source + id, matching JSLR's :key="script.source + script.id + ...". */
@@ -167,23 +169,26 @@ export class ScriptRunner {
 
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
     let variablesSnapshot: Record<string, unknown> = {};
+    let chatState = chatVariableState(effectiveChatId, {});
     if (effectiveChatId) {
-      const [messages, variables] = await Promise.all([
+      const [messages, directState] = await Promise.all([
         fetchMessagesSnapshot(
           { chatId: effectiveChatId, currentMessageId: '', currentMessageIndex: -1 },
           this.ctx,
         ).catch(() => [] as Awaited<ReturnType<typeof fetchMessagesSnapshot>>),
-        this.fetchVariablesForChat(effectiveChatId),
+        fetchChatVariableState(effectiveChatId),
       ]);
       messagesSnapshot = messages;
-      variablesSnapshot = variables;
+      variablesSnapshot = directState.allVariables;
+      chatState = directState;
+      if ((this.ctx.getActiveChat().chatId ?? '') !== effectiveChatId) return;
       this.activeChatId = effectiveChatId;
     }
 
     console.log(`[vishrun:script-runner] launching ${scriptsToLaunch.length} script(s)`, scriptsToLaunch.map(s => s.name));
 
     for (const script of scriptsToLaunch) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot, variablesSnapshot);
+      this.launchFrame(script, effectiveChatId, messagesSnapshot, variablesSnapshot, chatState);
     }
   }
 
@@ -206,6 +211,7 @@ export class ScriptRunner {
   }
 
   private destroyFrame(frame: LiveFrame): void {
+    frame.unbindVariables();
     try { frame.handle.destroy?.(); } catch { /* no-op */ }
     try { frame.container.remove(); } catch { /* no-op */ }
   }
@@ -215,6 +221,7 @@ export class ScriptRunner {
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
     variablesSnapshot: Record<string, unknown>,
+    chatState: ChatVariableState,
   ): void {
     try {
       const shim = thHelpersShim({
@@ -224,6 +231,7 @@ export class ScriptRunner {
         messagesSnapshot,
         variablesChatId: chatId,
         variablesSnapshot,
+        chatVariablesSnapshot: chatState.ready === false ? undefined : chatState.variables,
       });
 
       const srcdoc = [
@@ -274,12 +282,18 @@ export class ScriptRunner {
         reloadMemo: this.reloadMemos.get(script.id) ?? '',
         handle,
         container,
+        unbindVariables: bindChatVariableState(handle, this.ctx, chatState, true),
       });
 
       handle.onMessage((payload: unknown) => {
         const p = payload as { kind?: string; payload?: unknown } | null;
         if (!p || typeof p.kind !== 'string') return;
-        if (p.kind === 'clipboard-write-text') {
+        if (isThRequest(payload)) {
+          dispatchThRequest(handle, payload, {
+            chatId: this.ctx.getActiveChat().chatId ?? '',
+            currentMessageId: '', currentMessageIndex: -1,
+          }, this.ctx);
+        } else if (p.kind === 'clipboard-write-text') {
           void handleClipboardWriteText(p.payload, this.ctx);
         } else if (p.kind === 'alert') {
           handleHostAlert(p.payload);
@@ -430,6 +444,7 @@ export class ScriptRunner {
     if (payload?.chat && payload.chat.metadata && payloadChatId) {
       ++this.variableEpoch;
       this.activeChatId = payloadChatId;
+      publishChatVariableState(this.ctx, chatVariableState(payloadChatId, payload.chat.metadata));
       this.pushVariableState(payloadChatId, variablesFromMetadata(payload.chat.metadata));
       this.broadcast('CHAT_CHANGED', data);
       return;
