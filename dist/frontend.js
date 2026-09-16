@@ -3359,7 +3359,8 @@ function installMessageHooks(ctx) {
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel);
     if (node) {
-      if (!node.querySelector('[data-component="MessageContent"]')) {
+      const messageContent = node.querySelector('[data-component="MessageContent"]');
+      if (!messageContent || messageContent.getAttribute("data-display-pending") === "true") {
         if (retriesLeft > 0) {
           requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
         }
@@ -3398,6 +3399,9 @@ function installMessageHooks(ctx) {
       const total = nodes.length;
       const tasks = [];
       nodes.forEach((n, i) => {
+        const messageContent = n.querySelector('[data-component="MessageContent"]');
+        if (messageContent?.getAttribute("data-display-pending") === "true")
+          return;
         const depthFromLatest = total - 1 - i;
         const nodeMessageId = n.getAttribute("data-message-id");
         const scriptsForMessage = compiled.filter((s) => {
