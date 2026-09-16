@@ -78,12 +78,27 @@ var VALID_MACRO_NAMES = [
   "roll",
   "pick"
 ];
-var VALID_MACRO_RE = new RegExp(`^\\{\\{(?:${VALID_MACRO_NAMES.join("|")})(?:::|\\}\\})`);
+var VALID_MACRO_RE = new RegExp(`^\\{\\{(?:${VALID_MACRO_NAMES.join("|")})(?:::|\\}\\})`, "i");
 var NUL = String.fromCharCode(0);
 var SENTINEL_RE = new RegExp(`${NUL}VSHMSK(\\d+)${NUL}`, "g");
-function maskInvalidMacros(template) {
+var DYNAMIC_VAR_MACRO_NAMES = new Set(["getvar", "getchatvar"]);
+var LOCAL_DYNAMIC_MACRO_NAMES = new Set([
+  "random",
+  "roll",
+  "pick",
+  "newline",
+  "input"
+]);
+function maskInvalidMacros(template, deferNames = new Set) {
   const masks = [];
   const masked = template.split(NUL).join("").replace(/\{\{[^{}]+\}\}/g, (match) => {
+    const nameMatch = match.match(/^\{\{\s*([A-Za-z_@$][\w@$]*)/);
+    const name = nameMatch ? nameMatch[1].toLowerCase() : "";
+    if (deferNames.has(name)) {
+      const idx2 = masks.length;
+      masks.push(match);
+      return `${NUL}VSHMSK${idx2}${NUL}`;
+    }
     if (VALID_MACRO_RE.test(match))
       return match;
     const idx = masks.length;
@@ -97,14 +112,14 @@ function unmaskInvalidMacros(text, masks) {
     return text;
   return text.replace(SENTINEL_RE, (_m, idx) => masks[Number(idx)] ?? "");
 }
-var SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/g;
+var SETVAR_RE = /\{\{(setvar|setchatvar|setgvar|setglobalvar)::([^:}]+)::([^}]*?)\}\}/gi;
 var NAME_RE = /^[A-Za-z_][A-Za-z0-9_]*$/;
 var chatSetvarMutex = new Map;
 async function applyAndStripSetvars(template, chatId, userId, vars = api.variables) {
   const matches = [];
   for (const m of template.matchAll(SETVAR_RE)) {
     const [match, kind, name, value] = m;
-    matches.push({ start: m.index, end: m.index + match.length, kind, name, value });
+    matches.push({ start: m.index, end: m.index + match.length, kind: kind.toLowerCase(), name, value });
   }
   if (matches.length === 0)
     return template;
@@ -164,6 +179,116 @@ async function runApplyAndStripSetvars(template, chatId, userId, vars, matches) 
   out += template.slice(cursor);
   return out;
 }
+async function resolveMacroText(original, chatId, characterId, userId, deferNames = new Set) {
+  try {
+    const stripped = await applyAndStripSetvars(original, chatId, userId);
+    const { masked, masks } = maskInvalidMacros(stripped, deferNames);
+    const { text, diagnostics } = await api.macros.resolve(masked, {
+      chatId,
+      characterId,
+      userId,
+      commit: false
+    });
+    if (diagnostics.length > 0) {
+      varsLog.debug(`resolve produced ${diagnostics.length} diagnostic(s):`, diagnostics[0]?.message);
+    }
+    return unmaskInvalidMacros(text, masks);
+  } catch (err) {
+    varsLog.warn("resolve failed:", err instanceof Error ? err.message : String(err));
+    return original;
+  }
+}
+var DYNAMIC_VAR_RE = /\{\{\s*(getvar|getchatvar)\s*::\s*([^:}]*?)\s*\}\}/gi;
+async function resolveDynamicVarMacros(text, chatId) {
+  if (!text.includes("{{"))
+    return text;
+  DYNAMIC_VAR_RE.lastIndex = 0;
+  if (!DYNAMIC_VAR_RE.test(text))
+    return text;
+  const cache = new Map;
+  DYNAMIC_VAR_RE.lastIndex = 0;
+  let m;
+  const lookups = [];
+  while ((m = DYNAMIC_VAR_RE.exec(text)) !== null) {
+    const kind = m[1].toLowerCase();
+    const key = m[2];
+    const cacheKey = `${kind}::${key}`;
+    if (cache.has(cacheKey))
+      continue;
+    cache.set(cacheKey, "");
+    lookups.push((kind === "getvar" ? api.variables.local.get(chatId, key) : api.variables.chat.get(chatId, key)).then((value) => {
+      cache.set(cacheKey, value ?? "");
+    }).catch((err) => {
+      varsLog.warn("dynamic var resolve failed:", { kind, key, err: err instanceof Error ? err.message : String(err) });
+      cache.set(cacheKey, `{{${kind}::${key}}}`);
+    }));
+  }
+  await Promise.all(lookups);
+  return text.replace(DYNAMIC_VAR_RE, (full, kind, key) => {
+    const v = cache.get(`${kind.toLowerCase()}::${key}`);
+    return v !== undefined ? v : full;
+  });
+}
+var LOCAL_DYNAMIC_RE = /\{\{\s*(random|roll|pick|newline|input)\s*(?:::([^}]*))?\}\}/gi;
+function rollDice(notation) {
+  const match = notation.match(/^(\d+)d(\d+)$/i);
+  if (!match)
+    return "0";
+  const count = Math.min(parseInt(match[1], 10), 100);
+  const sides = parseInt(match[2], 10);
+  if (sides < 1 || count < 1)
+    return "0";
+  let total = 0;
+  for (let i = 0;i < count; i++)
+    total += Math.floor(Math.random() * sides) + 1;
+  return String(total);
+}
+function splitArgs(argStr) {
+  if (argStr === undefined || argStr === "")
+    return [];
+  return argStr.split("::");
+}
+function randomMacro(argStr) {
+  const args = splitArgs(argStr);
+  if (args.length === 0)
+    return String(Math.round(Math.random()));
+  const allNumeric = args.length <= 2 && args.every((a) => a.trim() !== "" && !isNaN(Number(a)));
+  if (allNumeric) {
+    const min = parseInt(args[0], 10) || 0;
+    const max = parseInt(args[1], 10) || 1;
+    if (max < min)
+      return String(min);
+    return String(Math.floor(Math.random() * (max - min + 1)) + min);
+  }
+  return args[Math.floor(Math.random() * args.length)];
+}
+function pickMacro(argStr) {
+  const args = splitArgs(argStr);
+  if (args.length === 0)
+    return "";
+  return args[Math.floor(Math.random() * args.length)];
+}
+function resolveLocalDynamicMacros(text, lastUserMessage) {
+  if (!text.includes("{{"))
+    return text;
+  return text.replace(LOCAL_DYNAMIC_RE, (full, name, argStr) => {
+    switch (name.toLowerCase()) {
+      case "newline":
+        return `
+`;
+      case "input":
+        return lastUserMessage;
+      case "roll":
+        return rollDice((argStr ?? "1d6").trim());
+      case "random":
+        return randomMacro(argStr);
+      case "pick":
+        return pickMacro(argStr);
+      default:
+        return full;
+    }
+  });
+}
 function installMacroResolveHandler() {
   api.onFrontendMessage((payload, userId) => {
     if (!isResolveMacrosRequest(payload))
@@ -172,24 +297,7 @@ function installMacroResolveHandler() {
     (async () => {
       const results = new Array(templates.length);
       for (let i = 0;i < templates.length; i++) {
-        const original = templates[i];
-        try {
-          const stripped = await applyAndStripSetvars(original, chatId, userId);
-          const { masked, masks } = maskInvalidMacros(stripped);
-          const { text, diagnostics } = await api.macros.resolve(masked, {
-            chatId,
-            characterId,
-            userId,
-            commit: false
-          });
-          if (diagnostics.length > 0) {
-            varsLog.debug(`resolve produced ${diagnostics.length} diagnostic(s):`, diagnostics[0]?.message);
-          }
-          results[i] = unmaskInvalidMacros(text, masks);
-        } catch (err) {
-          varsLog.warn("resolve failed:", err instanceof Error ? err.message : String(err));
-          results[i] = original;
-        }
+        results[i] = await resolveMacroText(templates[i], chatId, characterId, userId);
       }
       api.sendToFrontend({ type: "resolve_macros_response", requestId, results }, userId);
     })();
@@ -264,9 +372,222 @@ function parseSetvarChain(content) {
   return { pairs, strippedContent: kept.join(" | ").trim() };
 }
 
+// src/backend/pre-generation-bridge.ts
+var LOG_PREFIX = "[vishrun:pre-generation]";
+var PRE_GENERATION_TIMEOUT_MS = 300000;
+var subscribedUsers = new Set;
+var pendingRequests = new Map;
+function isSubscriptionMessage(payload) {
+  return !!payload && typeof payload === "object" && payload.type === "vsh_pre_generation_subscription" && typeof payload.active === "boolean";
+}
+function isCompleteMessage(payload) {
+  return !!payload && typeof payload === "object" && payload.type === "vsh_pre_generation_complete" && typeof payload.requestId === "string";
+}
+function isWorldInfoRequestMessage(payload) {
+  return !!payload && typeof payload === "object" && payload.type === "vsh_pre_generation_world_info_request" && typeof payload.requestId === "string";
+}
+function normalizeActivatedWorldInfo(value) {
+  if (!Array.isArray(value))
+    return [];
+  const out = [];
+  const seen = new Set;
+  for (const item of value) {
+    if (!item || typeof item !== "object")
+      continue;
+    const raw = item;
+    const id = typeof raw.id === "string" ? raw.id : "";
+    if (!id || seen.has(id))
+      continue;
+    seen.add(id);
+    const entry = { id };
+    if (typeof raw.comment === "string")
+      entry.comment = raw.comment;
+    if (Array.isArray(raw.keys))
+      entry.keys = raw.keys.filter((key) => typeof key === "string");
+    if (typeof raw.source === "string")
+      entry.source = raw.source;
+    if (typeof raw.score === "number")
+      entry.score = raw.score;
+    if (typeof raw.bookId === "string")
+      entry.bookId = raw.bookId;
+    if (typeof raw.bookSource === "string")
+      entry.bookSource = raw.bookSource;
+    out.push(entry);
+  }
+  return out;
+}
+function clearPending(requestId) {
+  const pending = pendingRequests.get(requestId);
+  if (!pending)
+    return null;
+  pendingRequests.delete(requestId);
+  clearTimeout(pending.timer);
+  if (pending.signal && pending.abortHandler) {
+    pending.signal.removeEventListener("abort", pending.abortHandler);
+  }
+  return pending;
+}
+function releasePendingForUser(userId) {
+  for (const [requestId, pending] of pendingRequests) {
+    if (pending.userId !== userId)
+      continue;
+    clearPending(requestId)?.resolve();
+  }
+}
+async function sendWorldInfoBodies(requestId, userId, pending) {
+  try {
+    const results = await Promise.allSettled(pending.activatedWorldInfo.map(async (activation) => {
+      const entry = await api.world_books.entries.get(activation.id, userId);
+      if (!entry)
+        throw new Error(`Active World Info entry ${activation.id} is unavailable`);
+      if (typeof entry.content !== "string" || !entry.content.trim()) {
+        throw new Error(`Active World Info entry ${activation.id} has no readable content`);
+      }
+      return { ...entry, ...activation, content: entry.content };
+    }));
+    if (!pendingRequests.has(requestId))
+      return;
+    const failures = results.filter((result) => result.status === "rejected");
+    if (failures.length > 0) {
+      api.sendToFrontend({
+        type: "vsh_pre_generation_world_info_result",
+        requestId,
+        entries: [],
+        error: failures.map((result) => result.reason instanceof Error ? result.reason.message : String(result.reason)).join("; ")
+      }, userId);
+      return;
+    }
+    api.sendToFrontend({
+      type: "vsh_pre_generation_world_info_result",
+      requestId,
+      entries: results.filter((result) => result.status === "fulfilled").map((result) => result.value)
+    }, userId);
+  } catch (error) {
+    if (!pendingRequests.has(requestId))
+      return;
+    api.sendToFrontend({
+      type: "vsh_pre_generation_world_info_result",
+      requestId,
+      entries: [],
+      error: error instanceof Error ? error.message : String(error)
+    }, userId);
+  }
+}
+function installPreGenerationBridgeHandler() {
+  api.onFrontendMessage((payload, userId) => {
+    if (isSubscriptionMessage(payload)) {
+      if (payload.active) {
+        subscribedUsers.add(userId);
+      } else {
+        subscribedUsers.delete(userId);
+        releasePendingForUser(userId);
+      }
+      return;
+    }
+    if (isWorldInfoRequestMessage(payload)) {
+      const pending2 = pendingRequests.get(payload.requestId);
+      if (!pending2 || pending2.userId !== userId)
+        return;
+      sendWorldInfoBodies(payload.requestId, userId, pending2);
+      return;
+    }
+    if (!isCompleteMessage(payload))
+      return;
+    const pending = pendingRequests.get(payload.requestId);
+    if (!pending || pending.userId !== userId)
+      return;
+    clearPending(payload.requestId)?.resolve();
+    if (payload.error) {
+      console.warn(LOG_PREFIX, "frontend handler reported an error:", payload.error);
+    }
+  });
+}
+async function waitForPreGeneration(context) {
+  const { chatId, userId, generationType, signal } = context;
+  const activatedWorldInfo = normalizeActivatedWorldInfo(context.activatedWorldInfo);
+  if (!chatId || !userId || !subscribedUsers.has(userId))
+    return;
+  if (signal?.aborted) {
+    throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  }
+  const requestId = crypto.randomUUID();
+  await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const pending2 = clearPending(requestId);
+      if (!pending2)
+        return;
+      api.sendToFrontend({ type: "vsh_pre_generation_cancel", requestId }, userId);
+      console.warn(LOG_PREFIX, `frontend handler timed out after ${PRE_GENERATION_TIMEOUT_MS}ms`);
+      pending2.resolve();
+    }, PRE_GENERATION_TIMEOUT_MS);
+    const pending = {
+      userId,
+      resolve,
+      reject,
+      timer,
+      signal,
+      activatedWorldInfo
+    };
+    if (signal) {
+      pending.abortHandler = () => {
+        const active = clearPending(requestId);
+        if (!active)
+          return;
+        api.sendToFrontend({ type: "vsh_pre_generation_cancel", requestId }, userId);
+        active.reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      };
+      signal.addEventListener("abort", pending.abortHandler, { once: true });
+    }
+    pendingRequests.set(requestId, pending);
+    api.sendToFrontend({
+      type: "vsh_pre_generation_request",
+      requestId,
+      chatId,
+      ...generationType ? { generationType } : {},
+      activatedWorldInfo
+    }, userId);
+  });
+}
+
 // src/backend/message-content-processor.ts
 var EMPTY_REPLACEMENT = "_(variables updated)_";
+function injectPath(chatId) {
+  return `injects/${chatId}.json`;
+}
+async function readInjects(chatId) {
+  try {
+    return await api.storage.getJson(injectPath(chatId), { fallback: [] });
+  } catch (e) {
+    return [];
+  }
+}
+async function writeInjects(chatId, injects) {
+  try {
+    if (injects.length === 0) {
+      await api.storage.delete(injectPath(chatId));
+    } else {
+      await api.storage.setJson(injectPath(chatId), injects);
+    }
+  } catch (e) {}
+}
+function parseInjectArgs(raw) {
+  const args = {};
+  let remaining = raw.trim();
+  const ARG_RE = /^([a-zA-Z_]\w*)=(\S+)\s*/;
+  let m;
+  while ((m = ARG_RE.exec(remaining)) !== null) {
+    args[m[1].toLowerCase()] = m[2];
+    remaining = remaining.slice(m[0].length);
+  }
+  return { args, content: remaining };
+}
 var SETVAR_RE2 = /\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
+var INJECT_RE = /\/inject\b/i;
+var FLUSHINJECT_RE = /\/flushinject\b/i;
+var DEFERRED_MACRO_NAMES = new Set([
+  ...DYNAMIC_VAR_MACRO_NAMES,
+  ...LOCAL_DYNAMIC_MACRO_NAMES
+]);
 var SELF_CLOSING_CUSTOM_RE = /<([A-Z][a-zA-Z0-9_-]*)(\s[^>]*)?\s*\/>/g;
 function expandSelfClosingTags(content) {
   return content.replace(SELF_CLOSING_CUSTOM_RE, (_m, tag, attrs) => {
@@ -281,31 +602,144 @@ async function processMessageContent(ctx, deps = {}) {
   if (ctx.origin === "render") {
     return selfCloseChanged ? { content: workingContent } : undefined;
   }
-  if (!SETVAR_RE2.test(workingContent)) {
+  if (!SETVAR_RE2.test(workingContent) && !INJECT_RE.test(workingContent) && !FLUSHINJECT_RE.test(workingContent)) {
     return selfCloseChanged ? { content: workingContent } : undefined;
   }
   let content = workingContent;
   const parsed = parseSetvarChain(content);
   if (parsed) {
     for (const { kind, key, value } of parsed.pairs) {
-      try {
-        await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
-      } catch (err) {
-        varsLog.warn(`setvar failed for "${kind}::${key}":`, err instanceof Error ? err.message : String(err));
-      }
+      setTimeout(async () => {
+        try {
+          await applySetvar({ kind, name: key, value }, ctx.chatId, ctx.userId);
+        } catch (err) {
+          varsLog.warn(`setvar failed for "${kind}::${key}":`, err instanceof Error ? err.message : String(err));
+        }
+      }, 0);
     }
     content = parsed.strippedContent;
+  }
+  if (INJECT_RE.test(content)) {
+    const INJECT_CMD_RE = /^\/inject(?:\s+(.*?))?\s*$/gim;
+    const injects = await readInjects(ctx.chatId);
+    let im;
+    while ((im = INJECT_CMD_RE.exec(content)) !== null) {
+      const { args, content: body } = parseInjectArgs(im[1] ?? "");
+      if (!body.trim())
+        continue;
+      const resolvedBody = await resolveMacroText(body, ctx.chatId, undefined, ctx.userId, DEFERRED_MACRO_NAMES);
+      const id = args.id ?? Math.random().toString(36).slice(2, 10);
+      const spec = {
+        id,
+        content: resolvedBody,
+        role: args.role === "user" || args.role === "assistant" ? args.role : "system",
+        depth: Math.max(0, parseInt(args.depth ?? "0", 10) || 0),
+        position: args.position === "before" || args.position === "after" ? args.position : "chat",
+        turns: Math.max(0, parseInt(args.turns ?? "0", 10) || 0)
+      };
+      const existing = injects.findIndex((e) => e.id === id);
+      if (existing >= 0) {
+        injects[existing] = spec;
+      } else {
+        injects.push(spec);
+      }
+    }
+    await writeInjects(ctx.chatId, injects);
+    content = content.replace(/^\/inject(?:\s+.*?)?\s*$/gim, "").replace(/\n{3,}/g, `
+
+`);
+  }
+  if (FLUSHINJECT_RE.test(content)) {
+    const FLUSH_CMD_RE = /^\/flushinject(?:\s+id=(\S+))?\s*$/gim;
+    let injects = await readInjects(ctx.chatId);
+    let fm;
+    while ((fm = FLUSH_CMD_RE.exec(content)) !== null) {
+      const id = fm[1];
+      injects = id ? injects.filter((e) => e.id !== id) : [];
+    }
+    await writeInjects(ctx.chatId, injects);
+    content = content.replace(/^\/flushinject(?:\s+\S+)?\s*$/gim, "").replace(/\n{3,}/g, `
+
+`);
   }
   if (content === ctx.content)
     return;
   const stripped = content.trim();
   return { content: stripped.length > 0 ? stripped : EMPTY_REPLACEMENT };
 }
+function installInjectInterceptor() {
+  api.registerInterceptor(async (messages, context) => {
+    const ctx = context;
+    if (!ctx.chatId)
+      return { messages };
+    await waitForPreGeneration(ctx);
+    const injects = await readInjects(ctx.chatId);
+    if (injects.length === 0)
+      return { messages };
+    const result = [...messages];
+    const surviving = [];
+    const breakdown = [];
+    let lastUserMessage = "";
+    for (let i = messages.length - 1;i >= 0; i--) {
+      if (messages[i].role === "user") {
+        lastUserMessage = messages[i].content ?? "";
+        break;
+      }
+    }
+    for (const spec of injects) {
+      let resolvedContent = await resolveDynamicVarMacros(spec.content, ctx.chatId);
+      resolvedContent = resolveLocalDynamicMacros(resolvedContent, lastUserMessage);
+      if (ctx.userId) {
+        resolvedContent = await resolveMacroText(resolvedContent, ctx.chatId, ctx.characterId, ctx.userId);
+      }
+      const msg = { role: spec.role, content: resolvedContent };
+      let insertAt;
+      if (spec.position === "before") {
+        const first = result.findIndex((m) => m.__isChatHistory === true);
+        insertAt = first >= 0 ? first : 0;
+      } else if (spec.position === "after") {
+        insertAt = result.length;
+      } else {
+        if (spec.depth === 0) {
+          insertAt = result.length;
+        } else {
+          let count = 0;
+          insertAt = result.length;
+          for (let i = result.length - 1;i >= 0; i--) {
+            if (result[i].__isChatHistory === true) {
+              count++;
+              if (count === spec.depth) {
+                insertAt = i;
+                break;
+              }
+            }
+          }
+        }
+      }
+      result.splice(insertAt, 0, msg);
+      breakdown.push({ messageIndex: insertAt, name: "Inject: " + spec.id });
+      if (spec.turns === 0) {
+        surviving.push(spec);
+      } else if (spec.turns > 1) {
+        surviving.push({ ...spec, turns: spec.turns - 1 });
+      }
+    }
+    if (surviving.length !== injects.length) {
+      await writeInjects(ctx.chatId, surviving);
+    }
+    return { messages: result, breakdown };
+  });
+}
 function installMessageContentProcessor() {
   api.registerMessageContentProcessor((ctx) => processMessageContent(ctx), 50);
+  installInjectInterceptor();
 }
 
 // src/backend/dispatch-slash.ts
+var DEFERRED_MACRO_NAMES2 = new Set([
+  ...DYNAMIC_VAR_MACRO_NAMES,
+  ...LOCAL_DYNAMIC_MACRO_NAMES
+]);
 function isDispatchSlashRequest(p) {
   if (!p || typeof p !== "object")
     return false;
@@ -314,6 +748,40 @@ function isDispatchSlashRequest(p) {
 }
 var SETVAR_PREFIX_RE = /^\s*\/(setvar|setchatvar|setgvar|setglobalvar)\b/i;
 var SYS_PREFIX_RE = /^\s*\/sys\b/i;
+var INJECT_PREFIX_RE = /^\s*\/inject\b/i;
+var FLUSHINJECT_PREFIX_RE = /^\s*\/flushinject\b/i;
+var LISTINJECTS_PREFIX_RE = /^\s*\/listinjects\b/i;
+var VISHRUN_INJECTS_VAR = "_vishrun_injects";
+function injectPath2(chatId) {
+  return `injects/${chatId}.json`;
+}
+function parseInjectArgs2(raw) {
+  const args = {};
+  let remaining = raw.trim();
+  const ARG_RE = /^([a-zA-Z_]\w*)=(\S+)\s*/;
+  let m;
+  while ((m = ARG_RE.exec(remaining)) !== null) {
+    args[m[1].toLowerCase()] = m[2];
+    remaining = remaining.slice(m[0].length);
+  }
+  return { args, content: remaining };
+}
+async function readInjectsFromStorage(chatId) {
+  try {
+    return await api.storage.getJson(injectPath2(chatId), { fallback: [] });
+  } catch (e) {
+    return [];
+  }
+}
+async function writeInjectsToStorage(chatId, injects) {
+  try {
+    if (injects.length === 0) {
+      await api.storage.delete(injectPath2(chatId));
+    } else {
+      await api.storage.setJson(injectPath2(chatId), injects);
+    }
+  } catch (e) {}
+}
 async function dispatchSlashText(text, chatId, userId, deps = {}) {
   if (SETVAR_PREFIX_RE.test(text)) {
     const parsed = parseSetvarChain(text);
@@ -335,6 +803,47 @@ async function dispatchSlashText(text, chatId, userId, deps = {}) {
     const append = deps.appendMessage ?? api.chat.appendMessage.bind(api.chat);
     await append(chatId, { role: "system", content });
     return { handled: true, kind: "sys_message" };
+  }
+  if (INJECT_PREFIX_RE.test(text)) {
+    const body = text.replace(/^\s*\/inject\s*/i, "");
+    const { args, content } = parseInjectArgs2(body);
+    if (content.trim()) {
+      const resolvedContent = await resolveMacroText(content.trim(), chatId, undefined, userId, DEFERRED_MACRO_NAMES2);
+      const id = args.id ?? Math.random().toString(36).slice(2, 10);
+      const spec = {
+        id,
+        content: resolvedContent,
+        role: args.role === "user" || args.role === "assistant" ? args.role : "system",
+        depth: Math.max(0, parseInt(args.depth ?? "0", 10) || 0),
+        position: args.position === "before" || args.position === "after" ? args.position : "chat",
+        turns: Math.max(0, parseInt(args.turns ?? "0", 10) || 0)
+      };
+      const injects = await readInjectsFromStorage(chatId);
+      const existing = injects.findIndex((e) => e.id === id);
+      if (existing >= 0) {
+        injects[existing] = spec;
+      } else {
+        injects.push(spec);
+      }
+      await writeInjectsToStorage(chatId, injects);
+    }
+    return { handled: true, kind: "inject" };
+  }
+  if (FLUSHINJECT_PREFIX_RE.test(text)) {
+    const body = text.replace(/^\s*\/flushinject\s*/i, "").trim();
+    const idMatch = /^id=(\S+)/.exec(body);
+    const id = idMatch ? idMatch[1] : null;
+    let injects = await readInjectsFromStorage(chatId);
+    injects = id ? injects.filter((e) => e.id !== id) : [];
+    await writeInjectsToStorage(chatId, injects);
+    return { handled: true, kind: "flushinject" };
+  }
+  if (LISTINJECTS_PREFIX_RE.test(text)) {
+    const injects = await readInjectsFromStorage(chatId);
+    try {
+      await api.variables.chat.set(chatId, VISHRUN_INJECTS_VAR, JSON.stringify(injects));
+    } catch (e) {}
+    return { handled: true, kind: "listinjects" };
   }
   return { handled: false, kind: "none" };
 }
@@ -769,10 +1278,10 @@ async function computeVariablesSnapshot(messages, recoveryFetcher) {
 }
 
 // src/backend/th-helpers.ts
-var LOG_PREFIX = "[vishrun:th-helpers]";
+var LOG_PREFIX2 = "[vishrun:th-helpers]";
 var log = {
-  warn: (...args) => console.warn(LOG_PREFIX, ...args),
-  debug: (...args) => console.debug(LOG_PREFIX, ...args)
+  warn: (...args) => console.warn(LOG_PREFIX2, ...args),
+  debug: (...args) => console.debug(LOG_PREFIX2, ...args)
 };
 function isThHelpersRequest(p) {
   if (!p || typeof p !== "object")
@@ -888,6 +1397,27 @@ async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = ap
   }
   await chat.updateMessage(chatId, target.id, { content });
 }
+async function handleSetVariable(body, chatId, chat = api.chat) {
+  const key = body.key;
+  const value = body.value;
+  if (!key) {
+    log.warn("setVariable: no key provided, ignoring");
+    return;
+  }
+  const messages = await chat.getMessages(chatId);
+  if (messages.length === 0) {
+    log.warn("setVariable: empty chat, ignoring");
+    return;
+  }
+  const latest = messages[messages.length - 1];
+  const existing = latest.content ?? "";
+  const varBlock = `
+<UpdateVariable>
+${key}: ${JSON.stringify(value)}
+</UpdateVariable>`;
+  await chat.updateMessage(chatId, latest.id, { content: existing + varBlock });
+  log.debug("setVariable: set", key, "=", value);
+}
 function installThHelpersHandler() {
   api.onFrontendMessage((payload, userId) => {
     if (!isThHelpersRequest(payload))
@@ -904,6 +1434,9 @@ function installThHelpersHandler() {
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
+          response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
+        } else if (op === "th-set-variable") {
+          await handleSetVariable(body, chatId);
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
         } else {
           response = {
@@ -923,12 +1456,221 @@ function installThHelpersHandler() {
   });
 }
 
+// src/backend/generate-relay.ts
+var pendingGenerateRelays = new Map;
+function isGenerateRelayCancelRequest(p) {
+  return !!p && typeof p === "object" && p.type === "vsh_generate_cancel" && typeof p.requestId === "string";
+}
+function isGenerateRelayRequest(p) {
+  return !!p && typeof p === "object" && p.type === "vsh_generate" && typeof p.requestId === "string" && Array.isArray(p.messages);
+}
+function installGenerateRelayHandler() {
+  api.onFrontendMessage((payload, userId) => {
+    if (isGenerateRelayCancelRequest(payload)) {
+      const pending = pendingGenerateRelays.get(payload.requestId);
+      if (pending && pending.userId === userId)
+        pending.controller.abort();
+      return;
+    }
+    if (!isGenerateRelayRequest(payload))
+      return;
+    const { requestId, messages, provider, model, connection_id, parameters, tools, tool_choice } = payload;
+    const controller = new AbortController;
+    pendingGenerateRelays.set(requestId, { userId, controller });
+    const input = {
+      provider: provider || "",
+      model: model || "",
+      messages,
+      userId,
+      signal: controller.signal
+    };
+    if (connection_id)
+      input.connection_id = connection_id;
+    if (parameters)
+      input.parameters = parameters;
+    if (tools && Array.isArray(tools)) {
+      input.tools = tools.map((t) => {
+        if (t?.type === "function" && t?.function) {
+          return {
+            name: t.function.name,
+            description: t.function.description,
+            parameters: t.function.parameters,
+            ...t.function.strict !== undefined ? { strict: t.function.strict } : {}
+          };
+        }
+        return t;
+      });
+    }
+    if (tool_choice) {
+      if (!input.parameters)
+        input.parameters = {};
+      input.parameters.tool_choice = tool_choice;
+    }
+    api.generate.raw(input).then((result) => {
+      api.sendToFrontend({ type: "vsh_generate_result", requestId, result }, userId);
+    }, (err) => {
+      const name = err instanceof Error ? err.name : "";
+      const message = err instanceof Error ? err.message : String(err);
+      api.sendToFrontend({
+        type: "vsh_generate_error",
+        requestId,
+        error: name === "AbortError" ? `AbortError: ${message || "Generation aborted"}` : message
+      }, userId);
+    }).finally(() => {
+      const pending = pendingGenerateRelays.get(requestId);
+      if (pending?.controller === controller)
+        pendingGenerateRelays.delete(requestId);
+    });
+  });
+}
+
+// src/backend/user-message-bridge.ts
+var LOG_PREFIX3 = "[vishrun:user-message]";
+var FRONTEND_TIMEOUT_MS = 110000;
+var HOST_TIMEOUT_MS = 120000;
+var subscribedUsers2 = new Set;
+var pendingRequests2 = new Map;
+function isSubscriptionMessage2(payload) {
+  return !!payload && typeof payload === "object" && payload.type === "vsh_user_message_subscription" && typeof payload.active === "boolean";
+}
+function isCompleteMessage2(payload) {
+  if (!payload || typeof payload !== "object")
+    return false;
+  const value = payload;
+  return value.type === "vsh_user_message_complete" && typeof value.requestId === "string" && (value.content === undefined || typeof value.content === "string") && (value.cancelGeneration === undefined || typeof value.cancelGeneration === "boolean") && (value.removeMessage === undefined || typeof value.removeMessage === "boolean") && (value.error === undefined || typeof value.error === "string");
+}
+function clearPending2(requestId) {
+  const pending = pendingRequests2.get(requestId);
+  if (!pending)
+    return null;
+  pendingRequests2.delete(requestId);
+  clearTimeout(pending.timer);
+  if (pending.signal && pending.abortHandler) {
+    pending.signal.removeEventListener("abort", pending.abortHandler);
+  }
+  return pending;
+}
+function releasePendingForUser2(userId) {
+  for (const [requestId, pending] of pendingRequests2) {
+    if (pending.userId !== userId)
+      continue;
+    clearPending2(requestId)?.resolve(null);
+  }
+}
+async function findLatestUserMessage(chatId) {
+  const messages = await api.chat.getMessages(chatId);
+  for (let index = messages.length - 1;index >= 0; index--) {
+    const message = messages[index];
+    if (message.role !== "user" || typeof message.id !== "string" || typeof message.content !== "string")
+      continue;
+    return { id: message.id, content: message.content };
+  }
+  return null;
+}
+async function requestFrontendProcessing(context, message) {
+  const { chatId, userId, generationType, signal } = context;
+  if (!chatId || !userId)
+    return null;
+  if (signal?.aborted)
+    throw signal.reason ?? new DOMException("Aborted", "AbortError");
+  const requestId = crypto.randomUUID();
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      const pending2 = clearPending2(requestId);
+      if (!pending2)
+        return;
+      api.sendToFrontend({ type: "vsh_user_message_cancel", requestId }, userId);
+      console.warn(LOG_PREFIX3, `frontend handler timed out after ${FRONTEND_TIMEOUT_MS}ms; using original message`);
+      pending2.resolve(null);
+    }, FRONTEND_TIMEOUT_MS);
+    const pending = {
+      userId,
+      chatId,
+      messageId: message.id,
+      originalContent: message.content,
+      resolve,
+      timer,
+      signal
+    };
+    if (signal) {
+      pending.abortHandler = () => {
+        const active = clearPending2(requestId);
+        if (!active)
+          return;
+        api.sendToFrontend({ type: "vsh_user_message_cancel", requestId }, userId);
+        reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+      };
+      signal.addEventListener("abort", pending.abortHandler, { once: true });
+    }
+    pendingRequests2.set(requestId, pending);
+    api.sendToFrontend({
+      type: "vsh_user_message_request",
+      requestId,
+      chatId,
+      message: { id: message.id, content: message.content },
+      ...generationType ? { generationType } : {}
+    }, userId);
+  });
+}
+async function processGenerationContext(context) {
+  const { chatId, userId, generationType, dryRun } = context;
+  if (!chatId || !userId || dryRun || generationType !== "normal" || !subscribedUsers2.has(userId)) {
+    return context;
+  }
+  const message = await findLatestUserMessage(chatId);
+  if (!message)
+    return context;
+  const result = await requestFrontendProcessing(context, message);
+  if (!result)
+    return context;
+  if (result.error) {
+    console.warn(LOG_PREFIX3, "frontend handler reported an error:", result.error);
+  }
+  if (result.cancelGeneration) {
+    if (result.removeMessage) {
+      try {
+        await api.chat.deleteMessage(chatId, message.id);
+      } catch (error) {
+        console.warn(LOG_PREFIX3, "failed to remove cancelled user message:", error instanceof Error ? error.message : String(error));
+      }
+    }
+    return { ...context, cancelGeneration: true };
+  }
+  if (typeof result.content === "string" && result.content !== message.content) {
+    await api.chat.updateMessage(chatId, message.id, { content: result.content });
+  }
+  return context;
+}
+function installUserMessageBridgeHandler() {
+  api.onFrontendMessage((payload, userId) => {
+    if (isSubscriptionMessage2(payload)) {
+      if (payload.active) {
+        subscribedUsers2.add(userId);
+      } else {
+        subscribedUsers2.delete(userId);
+        releasePendingForUser2(userId);
+      }
+      return;
+    }
+    if (!isCompleteMessage2(payload))
+      return;
+    const pending = pendingRequests2.get(payload.requestId);
+    if (!pending || pending.userId !== userId)
+      return;
+    clearPending2(payload.requestId)?.resolve(payload);
+  });
+  api.registerContextHandler(async (rawContext) => processGenerationContext(rawContext), 40, { timeoutMs: HOST_TIMEOUT_MS });
+}
+
 // src/backend/index.ts
 installFetchExternalHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
 installDispatchSlashHandler();
 installThHelpersHandler();
+installGenerateRelayHandler();
+installPreGenerationBridgeHandler();
+installUserMessageBridgeHandler();
 function setup() {}
 export {
   setup
