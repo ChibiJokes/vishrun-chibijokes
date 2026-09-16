@@ -11,7 +11,7 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot' | 'th-set-variable';
+  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot' | 'th-set-variable' | 'th-replace-chat-variables';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -276,6 +276,38 @@ export async function handleSetVariable(
   log.debug('setVariable: set', key, '=', value);
 }
 
+// Serialize Vishrun's replacements per user/chat so unrelated metadata is read
+// immediately before each save, not captured when an iframe was constructed.
+const variableWrites = new Map<string, Promise<unknown>>();
+export function handleReplaceChatVariables(
+  body: Record<string, unknown>, chatId: string, userId: string,
+  chats: ChatsApi = api.chats,
+): Promise<{ chatId: string; variables: Record<string, unknown>; allVariables: Record<string, unknown> }> {
+  const key = JSON.stringify([userId, chatId]);
+  const work = (variableWrites.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    if (!chatId || body.chatId !== chatId) throw new Error('Chat variable target does not match the requesting frame');
+    const variables = body.variables;
+    if (!variables || typeof variables !== 'object' || Array.isArray(variables)) {
+      throw new TypeError('Variables must be an object');
+    }
+    const current = await chats.get(chatId, userId);
+    if (!current) throw new Error('Chat not found');
+    const updated = await chats.update(chatId, {
+      metadata: { ...current.metadata, chat_variables: variables },
+    }, userId);
+    if (!updated) throw new Error('Chat variable save failed');
+    const meta = updated.metadata ?? {};
+    const macro = (meta.macro_variables ?? {}) as Record<string, Record<string, unknown>>;
+    const saved = (meta.chat_variables ?? {}) as Record<string, unknown>;
+    return { chatId, variables: saved, allVariables: { ...macro.global, ...macro.local, ...saved } };
+  });
+  variableWrites.set(key, work);
+  void work.finally(() => {
+    if (variableWrites.get(key) === work) variableWrites.delete(key);
+  }).catch(() => {});
+  return work;
+}
+
 export function installThHelpersHandler(): void {
   api.onFrontendMessage((payload, userId) => {
     if (!isThHelpersRequest(payload)) return;
@@ -292,6 +324,9 @@ export function installThHelpersHandler(): void {
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
           response = { type: 'th_helpers_response', requestId, ok: true, result: undefined };
+        } else if (op === 'th-replace-chat-variables') {
+          const result = await handleReplaceChatVariables(body, chatId, userId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-set-variable') {
           await handleSetVariable(body, chatId);
           response = { type: 'th_helpers_response', requestId, ok: true, result: undefined };

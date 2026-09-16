@@ -1,3 +1,4 @@
+import { publishChatVariableState, type ChatVariableState } from './chat-variable-state';
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import type { SnapshotMessage } from '../backend/th-helpers';
 import { emptyMvuData, type MvuData } from '../backend/mvu-parser';
@@ -56,6 +57,7 @@ export function dispatchThRequest(
   ctx: SpindleFrontendContext,
 ): void {
   const { requestId, op, body } = request;
+  const backendRequestId = op === 'th-replace-chat-variables' ? nextBackendRequestId() : requestId;
   let settled = false;
   let unsub: (() => void) | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -78,8 +80,19 @@ export function dispatchThRequest(
     }
   };
 
+  if (op === 'th-replace-chat-variables' && (
+    body.chatId !== context.chatId ||
+    (typeof ctx.getActiveChat === 'function' && ctx.getActiveChat().chatId !== context.chatId)
+  )) {
+    respond({ ok: false, error: 'The chat changed before the variable update was dispatched' });
+    return;
+  }
+
   unsub = ctx.onBackendMessage((payload) => {
-    if (!isThHelpersResponse(payload, requestId)) return;
+    if (!isThHelpersResponse(payload, backendRequestId)) return;
+    if (payload.ok && op === 'th-replace-chat-variables') {
+      publishChatVariableState(ctx, payload.result as ChatVariableState);
+    }
     respond({ ok: payload.ok, result: payload.result, error: payload.error });
   });
 
@@ -90,7 +103,7 @@ export function dispatchThRequest(
   try {
     ctx.sendToBackend({
       type: 'th_helpers_request',
-      requestId,
+      requestId: backendRequestId,
       op,
       chatId: context.chatId,
       currentMessageId: context.currentMessageId,

@@ -1,3 +1,5 @@
+import { lodashShim } from './lodash-shim';
+import { chatVariablesShim } from './chat-variables-shim';
 import type { SnapshotMessage } from '../backend/th-helpers';
 
 // TS twin of the ES5 shim string in thHelpersShim() below. The twin is
@@ -16,6 +18,7 @@ export interface ThHelpersConstants {
   messagesSnapshot: SnapshotMessage[];
   variablesChatId?: string;
   variablesSnapshot?: Record<string, unknown>;
+  chatVariablesSnapshot?: Record<string, unknown>;
 }
 
 export interface ChatMessageNonSwiped {
@@ -167,8 +170,9 @@ export function thHelpersShim(consts: ThHelpersConstants): string {
     messagesSnapshot: consts.messagesSnapshot,
     variablesChatId: consts.variablesChatId ?? consts.chatId,
     variablesSnapshot: consts.variablesSnapshot ?? {},
-  });
-  return `<script>(function(){
+    chatVariablesSnapshot: consts.chatVariablesSnapshot,
+  }).replace(/</g, '\\u003c');
+  return lodashShim() + `<script>(function(){
 var THC = ${constsJson};
 var pending = {};
 var nextId = 0;
@@ -176,6 +180,7 @@ function makeRequestId(){ nextId = (nextId + 1) | 0; return 'th-' + Date.now().t
 function applyVariableState(nextChatId, nextVars, emitChanged){
   nextChatId = typeof nextChatId === 'string' ? nextChatId : '';
   nextVars = nextVars && typeof nextVars === 'object' && !Array.isArray(nextVars) ? nextVars : {};
+  if (THC.chatId !== nextChatId) invalidateChatVariables();
   THC.chatId = nextChatId;
   THC.variablesChatId = nextChatId;
   THC.variablesSnapshot = nextVars;
@@ -196,6 +201,10 @@ function setup(){
   if (!window.spindleSandbox || typeof window.spindleSandbox.onMessage !== 'function') return;
   window.spindleSandbox.onMessage(function(payload){
     if (!payload || typeof payload !== 'object') return;
+    if (payload.type === 'vsh_chat_variables') {
+      window.__vishrunSetChatVariables(payload.state);
+      return;
+    }
     if (payload.type === 'vsh_th_variables') {
       applyVariableState(payload.chatId, payload.variables, !!payload.emitChanged);
       return;
@@ -270,7 +279,7 @@ window.setChatMessage = function(fieldValues, messageId, opts){
 };
 window.getAllVariables = function(){
   if (THC.variablesChatId !== THC.chatId) return {};
-  var vars = THC.variablesSnapshot || {};
+  var vars = chatVariablesReady ? allChatVariables : THC.variablesSnapshot || {};
   var out = {};
   for (var key in vars) {
     if (Object.prototype.hasOwnProperty.call(vars, key)) out[key] = vars[key];
@@ -279,11 +288,12 @@ window.getAllVariables = function(){
 };
 window.getVariable = function(key){
   if (THC.variablesChatId !== THC.chatId) return null;
-  var vars = THC.variablesSnapshot || {};
+  var vars = chatVariablesReady ? allChatVariables : THC.variablesSnapshot || {};
   return Object.prototype.hasOwnProperty.call(vars, key) ? vars[key] : null;
 };
 window.setVariable = function(key, value){
   return postRequest('th-set-variable', { key: key, value: value });
 };
+${chatVariablesShim()}
 })();</script>`;
 }
