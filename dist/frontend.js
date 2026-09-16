@@ -3302,8 +3302,6 @@ var MULTILINE_BLOCK_TAGS = new Set([
   "H5",
   "H6"
 ]);
-var TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(["SPAN"]);
-var EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
 function cleanupEmptyAroundWidget(widget, stopAt) {
   let current = widget;
   for (;; ) {
@@ -3330,35 +3328,20 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     }
     if (parent === stopAt)
       break;
-    const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
-    const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
-    if ((transparentInline || knownBlock) && containsOnlyWidgetsAndResidue(parent)) {
-      const grandparent = parent.parentNode;
-      if (!grandparent)
+    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
+    if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
+      const gparent = parent.parentNode;
+      if (!gparent)
         break;
-      while (parent.firstChild) {
-        const child = parent.firstChild;
-        if (isEmptyResidue(child)) {
-          parent.removeChild(child);
-        } else {
-          grandparent.insertBefore(child, parent);
-        }
-      }
-      grandparent.removeChild(parent);
+      gparent.replaceChild(current, parent);
       continue;
     }
     break;
   }
 }
-function containsOnlyWidgetsAndResidue(container) {
-  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node));
-}
-function isWidgetNode(node) {
-  return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute("data-vishrun-widget");
-}
 function isEmptyResidue(node) {
   if (node.nodeType === Node.TEXT_NODE) {
-    return !(node.nodeValue ?? "").replace(EMPTY_RESIDUE_RE, "");
+    return (node.nodeValue ?? "").length === 0;
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node;
@@ -3366,7 +3349,7 @@ function isEmptyResidue(node) {
       return true;
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
       return false;
-    return !(el.textContent ?? "").replace(EMPTY_RESIDUE_RE, "");
+    return (el.textContent ?? "").length === 0;
   }
   return false;
 }
@@ -3651,42 +3634,7 @@ function installMessageHooks(ctx) {
   let pendingRecords = [];
   let bodyWatcher = null;
   let latestMessageId = null;
-  const newestPendingObservers = new Map;
   const OBSERVE_OPTS = { childList: true, subtree: true, characterData: true };
-  function processNewestWhenDisplayReady(messageId, retriesLeft = MAX_RAF_RETRIES) {
-    const sel = buildMessageSelector(messageId);
-    const node = document.querySelector(sel);
-    if (!node) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-    const content = node.querySelector('[data-component="MessageContent"]');
-    if (!content) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-    if (content.getAttribute("data-display-pending") !== "true") {
-      processMessageById(messageId, MAX_RAF_RETRIES);
-      return;
-    }
-    newestPendingObservers.get(messageId)?.disconnect();
-    const readyObserver = new MutationObserver(() => {
-      if (content.getAttribute("data-display-pending") === "true")
-        return;
-      readyObserver.disconnect();
-      newestPendingObservers.delete(messageId);
-      processMessageById(messageId, MAX_RAF_RETRIES);
-    });
-    newestPendingObservers.set(messageId, readyObserver);
-    readyObserver.observe(content, {
-      attributes: true,
-      attributeFilter: ["data-display-pending"]
-    });
-  }
   function compiledForActiveCard() {
     const card = getActiveCard();
     if (!card)
@@ -3896,7 +3844,7 @@ function installMessageHooks(ctx) {
     if (!p.messageId)
       return;
     latestMessageId = p.messageId;
-    processNewestWhenDisplayReady(p.messageId, MAX_RAF_RETRIES);
+    processMessageById(p.messageId, MAX_RAF_RETRIES);
   });
   const unsubChatChanged = ctx.events.on("CHAT_CHANGED", (payload) => {
     const p = payload || {};
@@ -3912,9 +3860,6 @@ function installMessageHooks(ctx) {
       detachObserver();
       teardownTagInterceptors();
       clearEditingMessageIds();
-      for (const pending of newestPendingObservers.values())
-        pending.disconnect();
-      newestPendingObservers.clear();
       unsubGenEnded();
       unsubChatChanged();
     }
