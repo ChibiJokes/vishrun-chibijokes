@@ -1418,6 +1418,36 @@ ${key}: ${JSON.stringify(value)}
   await chat.updateMessage(chatId, latest.id, { content: existing + varBlock });
   log.debug("setVariable: set", key, "=", value);
 }
+var variableWrites = new Map;
+function handleReplaceChatVariables(body, chatId, userId, chats = api.chats) {
+  const key = JSON.stringify([userId, chatId]);
+  const work = (variableWrites.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
+    if (!chatId || body.chatId !== chatId)
+      throw new Error("Chat variable target does not match the requesting frame");
+    const variables = body.variables;
+    if (!variables || typeof variables !== "object" || Array.isArray(variables)) {
+      throw new TypeError("Variables must be an object");
+    }
+    const current = await chats.get(chatId, userId);
+    if (!current)
+      throw new Error("Chat not found");
+    const updated = await chats.update(chatId, {
+      metadata: { ...current.metadata, chat_variables: variables }
+    }, userId);
+    if (!updated)
+      throw new Error("Chat variable save failed");
+    const meta = updated.metadata ?? {};
+    const macro = meta.macro_variables ?? {};
+    const saved = meta.chat_variables ?? {};
+    return { chatId, variables: saved, allVariables: { ...macro.global, ...macro.local, ...saved } };
+  });
+  variableWrites.set(key, work);
+  work.finally(() => {
+    if (variableWrites.get(key) === work)
+      variableWrites.delete(key);
+  }).catch(() => {});
+  return work;
+}
 function installThHelpersHandler() {
   api.onFrontendMessage((payload, userId) => {
     if (!isThHelpersRequest(payload))
@@ -1435,6 +1465,9 @@ function installThHelpersHandler() {
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
+        } else if (op === "th-replace-chat-variables") {
+          const result = await handleReplaceChatVariables(body, chatId, userId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-set-variable") {
           await handleSetVariable(body, chatId);
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
