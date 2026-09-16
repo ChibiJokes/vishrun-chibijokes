@@ -195,7 +195,23 @@ export async function processNode(
     // Catches React subtree rebuilds (swipe / edit / regen) that detached
     // an iframe but didn't unmount the host's sandboxFrames record.
     const target = findContentRoot(root);
+
+    // Lumiverse marks MessageContent with data-display-pending while its own
+    // async display regex / preprocessing pass is still resolving. Injecting
+    // into that intermediate tree can strand a widget inside markdown wrappers
+    // that disappear or change when React commits the final display content.
+    // Do nothing until Lumiverse removes the attribute. message-rendered.ts
+    // observes that exact attribute and will re-run this message immediately
+    // when the host declares the final DOM ready.
+    if (target.hasAttribute('data-display-pending')) return 0;
+
     cleanupOrphansForMessage(messageId, target);
+
+    // Existing widgets can survive a host-side subtree/layout reshuffle with an
+    // otherwise-empty markdown block still wrapped around them. Re-apply the
+    // same safe cleanup used after insertion so those wrappers cannot accumulate
+    // Lumiverse prose margins over a long chat.
+    normalizeExistingWidgetContainers(target);
 
     // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
     // widget HTML before any widget is built. Always returns a map; missing
@@ -446,6 +462,13 @@ const MULTILINE_BLOCK_TAGS = new Set([
   'P', 'DIV', 'BLOCKQUOTE', 'PRE', 'UL', 'OL', 'LI',
   'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
 ]);
+
+function normalizeExistingWidgetContainers(target: HTMLElement): void {
+  const widgets = Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-widget]'));
+  for (const widget of widgets) {
+    if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
+  }
+}
 
 function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
   let current: Element = widget;
