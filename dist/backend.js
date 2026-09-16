@@ -1430,14 +1430,17 @@ async function handleReplaceChatVariables(body, chatId, variables = api.variable
   const desired = normalizeChatVariables(body.variables);
   return queueChatVariableMutation(chatId, async () => {
     const current = await variables.list(chatId);
+    const mutations = [];
     for (const key of Object.keys(current)) {
       if (!Object.prototype.hasOwnProperty.call(desired, key))
-        await variables.delete(chatId, key);
+        mutations.push(variables.delete(chatId, key));
     }
     for (const [key, value] of Object.entries(desired)) {
       if (current[key] !== value)
-        await variables.set(chatId, key, value);
+        mutations.push(variables.set(chatId, key, value));
     }
+    if (mutations.length)
+      await Promise.all(mutations);
     return await variables.list(chatId);
   });
 }
@@ -1445,11 +1448,9 @@ async function handlePatchChatVariables(body, chatId, variables = api.variables.
   const patch = normalizeChatVariables(body.variables);
   return queueChatVariableMutation(chatId, async () => {
     const current = await variables.list(chatId);
-    for (const [key, value] of Object.entries(patch)) {
-      if (current[key] === value)
-        continue;
-      await variables.set(chatId, key, value);
-    }
+    const mutations = Object.entries(patch).filter(([key, value]) => current[key] !== value).map(([key, value]) => variables.set(chatId, key, value));
+    if (mutations.length)
+      await Promise.all(mutations);
     return await variables.list(chatId);
   });
 }
@@ -1457,11 +1458,9 @@ async function handleInsertChatVariables(body, chatId, variables = api.variables
   const additions = normalizeChatVariables(body.variables);
   return queueChatVariableMutation(chatId, async () => {
     const current = await variables.list(chatId);
-    for (const [key, value] of Object.entries(additions)) {
-      if (Object.prototype.hasOwnProperty.call(current, key))
-        continue;
-      await variables.set(chatId, key, value);
-    }
+    const mutations = Object.entries(additions).filter(([key]) => !Object.prototype.hasOwnProperty.call(current, key)).map(([key, value]) => variables.set(chatId, key, value));
+    if (mutations.length)
+      await Promise.all(mutations);
     return await variables.list(chatId);
   });
 }
