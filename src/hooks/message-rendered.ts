@@ -5,7 +5,7 @@ import { getActiveCard } from '../state/active-card';
 import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor';
 import { fetchMessageContentById } from '../lumiverse/fetch-message';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
-import { isSelfMutation } from '../render/self-mutation';
+import { allSelf } from '../render/self-mutation';
 
 const MAX_RAF_RETRIES = 3;
 const MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
@@ -55,9 +55,8 @@ export interface MessageHooks {
  *    (`[data-component="MessageList"]` — `MessageList.tsx:345`). React
  *    rebuilds the message subtree on content changes (greeting, edit,
  *    swipe nav), wiping our injected widget. Observer + rAF debounce →
- *    targeted reprocessing of only the affected message ids. Whole-chat
- *    scans are reserved for explicit initial/card/chat rescans. processNode
- *    idempotency (skip-text-inside-[data-vishrun-widget]) makes re-runs safe.
+ *    single coalesced rescan per frame. processNode idempotency
+ *    (skip-text-inside-[data-vishrun-widget]) makes re-runs safe.
  *  - Secondary mechanism: GENERATION_ENDED for the just-finished bot
  *    message id. Predictable, doesn't depend on observer state, no extra
  *    cost when both fire.
@@ -79,13 +78,11 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   // Lumiverse exposes data-display-pending while its async display-regex /
   // preprocessing pass is still settling. Observe that attribute so Vishrun
   // can wait for the host's own readiness signal instead of guessing with a
-  // timer. IMPORTANT: do not observe characterData here. During streaming,
-  // Lumiverse mutates text repeatedly; treating those token-level mutations as
-  // render signals caused whole-chat rescans and severe slowdown on large
-  // chats. MESSAGE_EDITED / MESSAGE_SWIPED already have targeted event paths.
+  // timer, then rescan immediately when Lumiverse clears it.
   const OBSERVE_OPTS: MutationObserverInit = {
     childList: true,
     subtree: true,
+    characterData: true,
     attributes: true,
     attributeFilter: ['data-display-pending'],
   };
@@ -162,25 +159,16 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
   async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving) observer!.disconnect();
-
-    const pendingMessageIds = new Set<string>();
-    let observerReattached = false;
-
     try {
       const nodes = Array.from(document.querySelectorAll('[data-message-id]'));
       const total = nodes.length;
       const tasks: Promise<unknown>[] = [];
-
       nodes.forEach((n, i) => {
         const messageContent = n.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-        const nodeMessageId = n.getAttribute('data-message-id');
-
-        if (messageContent?.getAttribute('data-display-pending') === 'true') {
-          if (nodeMessageId) pendingMessageIds.add(nodeMessageId);
-          return;
-        }
+        if (messageContent?.getAttribute('data-display-pending') === 'true') return;
 
         const depthFromLatest = total - 1 - i;
+        const nodeMessageId = n.getAttribute('data-message-id');
         const scriptsForMessage = compiled.filter((s) => {
           if (s.maxDepth === 0 && s.minDepth === 0) {
             return nodeMessageId !== null && nodeMessageId === latestMessageId;
@@ -192,166 +180,29 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
         if (scriptsForMessage.length === 0) return;
         tasks.push(processNode(n as HTMLElement, scriptsForMessage, ctx).catch(() => {}));
       });
-
-      // Reattach BEFORE the async widget builds settle. That way a pending
-      // MessageContent that becomes ready while other historical widgets are
-      // still building is not missed. The targeted mutation handler filters
-      // Vishrun's own insertions, so this no longer requires keeping the main
-      // observer blind for the full Promise.all duration.
-      if (wasObserving && observedTarget && document.contains(observedTarget)) {
-        observer!.observe(observedTarget, OBSERVE_OPTS);
-        observerReattached = true;
-      }
-
-      // Close the tiny disconnect/enumeration race: any message that cleared
-      // data-display-pending before the observer was reattached gets one
-      // targeted readiness check now. Messages still pending are skipped and
-      // will be handled by their later attribute transition.
-      if (pendingMessageIds.size > 0) {
-        void processMessageIdsNow(pendingMessageIds, compiled);
-      }
-
       await Promise.all(tasks);
     } finally {
-      if (
-        wasObserving &&
-        !observerReattached &&
-        observedTarget &&
-        document.contains(observedTarget)
-      ) {
+      if (wasObserving && observedTarget && document.contains(observedTarget)) {
         observer!.observe(observedTarget, OBSERVE_OPTS);
       }
     }
-  }
-
-  function messageElementForNode(node: Node | null): HTMLElement | null {
-    if (!node) return null;
-    const el = node.nodeType === 1 ? (node as Element) : node.parentElement;
-    if (!el) return null;
-    if (el.matches?.('[data-message-id]')) return el as HTMLElement;
-    return el.closest?.('[data-message-id]') as HTMLElement | null;
-  }
-
-  function addMessageIdsFromNode(node: Node | null, ids: Set<string>): void {
-    if (!node || node.nodeType !== 1) return;
-    const el = node as Element;
-
-    const own = el.matches?.('[data-message-id]') ? el.getAttribute('data-message-id') : null;
-    if (own) ids.add(own);
-
-    el.querySelectorAll?.('[data-message-id]').forEach((message) => {
-      const id = message.getAttribute('data-message-id');
-      if (id) ids.add(id);
-    });
-  }
-
-  function collectTargetMessageIds(records: MutationRecord[]): Set<string> {
-    const ids = new Set<string>();
-
-    for (const record of records) {
-      // Ignore Vishrun's own widget insertions/removals instead of letting a
-      // mixed observer batch make us revisit unrelated host messages.
-      if (isSelfMutation(record)) continue;
-
-      if (record.type === 'attributes') {
-        if (record.attributeName !== 'data-display-pending') continue;
-        const target = record.target as Element;
-
-        // Only the transition to READY matters. The pending=true transition
-        // is intentionally ignored; the later clear will target this message.
-        if (target.getAttribute('data-display-pending') === 'true') continue;
-
-        const message = messageElementForNode(target);
-        const id = message?.getAttribute('data-message-id');
-        if (id) ids.add(id);
-        continue;
-      }
-
-      if (record.type === 'childList') {
-        // If React rebuilt content inside one existing message, target that
-        // message only. This covers greeting switches and reconciliation that
-        // removes a Vishrun widget before replacing the host subtree.
-        const targetMessage = messageElementForNode(record.target);
-        const targetId = targetMessage?.getAttribute('data-message-id');
-        if (targetId) ids.add(targetId);
-
-        // New rows can arrive nested inside wrappers. Collect only message rows
-        // inside the newly-added subtree instead of rescanning MessageList.
-        record.addedNodes.forEach((node) => addMessageIdsFromNode(node, ids));
-      }
-    }
-
-    return ids;
-  }
-
-  async function processMessageIdsNow(
-    messageIds: Set<string>,
-    compiled: CompiledScript[],
-  ): Promise<void> {
-    if (messageIds.size === 0) return;
-
-    // Query the rendered list ONCE for the whole observer batch. The old path
-    // called scanAllNow() for every readiness mutation, which turned a large
-    // chat into repeated O(totalMessages) work.
-    const nodes = Array.from(document.querySelectorAll('[data-message-id]')) as HTMLElement[];
-    const total = nodes.length;
-    const indexById = new Map<string, number>();
-    nodes.forEach((node, index) => {
-      const id = node.getAttribute('data-message-id');
-      if (id) indexById.set(id, index);
-    });
-
-    const tasks: Promise<unknown>[] = [];
-
-    for (const messageId of messageIds) {
-      const index = indexById.get(messageId);
-      if (index === undefined) continue;
-
-      const node = nodes[index];
-      const messageContent = node.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-
-      // Preserve the Lumiverse wrapper/readiness fix: never build against the
-      // temporary pending DOM. The attribute observer will call us again for
-      // this exact message when Lumiverse clears the flag.
-      if (!messageContent || messageContent.getAttribute('data-display-pending') === 'true') continue;
-
-      const depthFromLatest = total - 1 - index;
-      const scriptsForMessage = compiled.filter((s) => {
-        if (s.maxDepth === 0 && s.minDepth === 0) {
-          return messageId === latestMessageId;
-        }
-        if (s.maxDepth !== null && depthFromLatest > s.maxDepth) return false;
-        if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
-        return true;
-      });
-
-      if (scriptsForMessage.length === 0) continue;
-      tasks.push(processNode(node, scriptsForMessage, ctx).catch(() => {}));
-    }
-
-    await Promise.all(tasks);
   }
 
   function handleMutations(records: MutationRecord[]): void {
     if (records.length > 0) pendingRecords.push(...records);
     if (pendingFrame) return;
-
     pendingFrame = requestAnimationFrame(() => {
       pendingFrame = 0;
       const batch = pendingRecords;
       pendingRecords = [];
-
       const compiled = compiledForActiveCard();
       if (!compiled) {
         // Card cleared between mutation and frame — observer should be off.
         detachObserver();
         return;
       }
-
-      const messageIds = collectTargetMessageIds(batch);
-      if (messageIds.size === 0) return;
-
-      void processMessageIdsNow(messageIds, compiled);
+      if (allSelf(batch)) return;
+      void scanAllNow(compiled);
     });
   }
 
@@ -376,10 +227,12 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     if (observer && observedTarget === target) return; // already attached
     if (observer) observer.disconnect();
     observer = new MutationObserver(handleMutations);
-    // childList + subtree catch greeting/swipe rebuilds and new-message
-    // inserts. data-display-pending catches Lumiverse's explicit transition
-    // from temporary display DOM to settled content. We intentionally do NOT
-    // observe characterData: token streaming must never trigger chat-wide work.
+    // childList + subtree catch greeting/swipe rebuilds (whole subtree
+    // replaced) and new-message inserts. characterData catches in-place
+    // text edits when React reuses a text node rather than replacing it.
+    // Watch-item: characterData also fires per token during streaming —
+    // if testing surfaces flicker or perf issues, drop characterData and
+    // rely on the childList/subtree mutations React fires at end-of-stream.
     observer.observe(target, OBSERVE_OPTS);
     observedTarget = target;
   }
