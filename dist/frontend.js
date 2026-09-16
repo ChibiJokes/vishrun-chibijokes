@@ -3276,7 +3276,13 @@ function installMessageHooks(ctx) {
   let pendingRecords = [];
   let bodyWatcher = null;
   let latestMessageId = null;
-  const OBSERVE_OPTS = { childList: true, subtree: true, characterData: true };
+  const OBSERVE_OPTS = {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["data-display-pending"]
+  };
   function compiledForActiveCard() {
     const card = getActiveCard();
     if (!card)
