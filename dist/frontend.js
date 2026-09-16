@@ -1925,7 +1925,8 @@ function resolveCurrentMessageIndex(messageId, snapshot, domIndex) {
   return { index: domIndex, source: "dom-fallback" };
 }
 async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
-  const env = classifyWidgetEnvironment(html);
+  const detectedEnv = classifyWidgetEnvironment(html);
+  const env = !shouldInjectThHelpersShim(detectedEnv) && (containsScriptTag(html) || containsInlineEventHandler(html)) ? "tavern-helpers-light" : detectedEnv;
   const active = ctx.getActiveChat();
   const chatId = active.chatId ?? "";
   const domIndex = computeMessageIndexInChat(messageId);
