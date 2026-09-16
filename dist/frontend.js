@@ -2752,8 +2752,6 @@ async function processNode(root, scripts, ctx) {
     if (transition === "still")
       return 0;
     const target = findContentRoot(root);
-    if (target.hasAttribute("data-display-pending"))
-      return 0;
     cleanupOrphansForMessage(messageId, target);
     normalizeExistingWidgetContainers(target);
     const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
@@ -2769,8 +2767,7 @@ async function processNode(root, scripts, ctx) {
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-      if (target.isConnected)
-        normalizeExistingWidgetContainers(target);
+      normalizeExistingWidgetContainers(findContentRoot(root));
     } catch (err) {
       console.debug("[vishrun] processNode render error:", err);
     }
@@ -2949,50 +2946,13 @@ var MULTILINE_BLOCK_TAGS = new Set([
   "H5",
   "H6"
 ]);
+var TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(["SPAN"]);
+var EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
 function normalizeExistingWidgetContainers(target) {
-  let changed = true;
-  let passes = 0;
-  while (changed && passes++ < 8) {
-    changed = false;
-    const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
-    for (const widget of widgets) {
-      if (widget.isConnected)
-        cleanupEmptyAroundWidget(widget, target);
-    }
-    const wrappers = Array.from(target.querySelectorAll("p,div,blockquote,pre,ul,ol,li,h1,h2,h3,h4,h5,h6"));
-    for (let i = wrappers.length - 1;i >= 0; i--) {
-      const wrapper = wrappers[i];
-      if (!wrapper.isConnected || wrapper === target)
-        continue;
-      if (wrapper.closest("[data-vishrun-widget]"))
-        continue;
-      const children = Array.from(wrapper.childNodes);
-      const widgetChildren = [];
-      let widgetOnly = children.length > 0;
-      for (const child of children) {
-        if (isEmptyResidue(child))
-          continue;
-        if (child.nodeType === Node.ELEMENT_NODE && child.hasAttribute("data-vishrun-widget")) {
-          widgetChildren.push(child);
-          continue;
-        }
-        widgetOnly = false;
-        break;
-      }
-      if (!widgetOnly || widgetChildren.length === 0)
-        continue;
-      const parent = wrapper.parentNode;
-      if (!parent)
-        continue;
-      const frag = document.createDocumentFragment();
-      for (const child of children) {
-        if (child.nodeType === Node.ELEMENT_NODE && child.hasAttribute("data-vishrun-widget")) {
-          frag.appendChild(child);
-        }
-      }
-      parent.replaceChild(frag, wrapper);
-      changed = true;
-    }
+  const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
+  for (const widget of widgets) {
+    if (widget.isConnected)
+      cleanupEmptyAroundWidget(widget, target);
   }
 }
 function cleanupEmptyAroundWidget(widget, stopAt) {
@@ -3021,23 +2981,35 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     }
     if (parent === stopAt)
       break;
-    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
-    if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
-      const gparent = parent.parentNode;
-      if (!gparent)
+    const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
+    const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
+    if ((transparentInline || knownBlock) && containsOnlyWidgetsAndResidue(parent)) {
+      const grandparent = parent.parentNode;
+      if (!grandparent)
         break;
-      gparent.replaceChild(current, parent);
+      while (parent.firstChild) {
+        const child = parent.firstChild;
+        if (isEmptyResidue(child)) {
+          parent.removeChild(child);
+        } else {
+          grandparent.insertBefore(child, parent);
+        }
+      }
+      grandparent.removeChild(parent);
       continue;
     }
     break;
   }
 }
-function isIgnorableText(value) {
-  return String(value ?? "").replace(/[\s\u00A0\u200B-\u200D\uFEFF]/g, "").length === 0;
+function containsOnlyWidgetsAndResidue(container) {
+  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node));
+}
+function isWidgetNode(node) {
+  return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute("data-vishrun-widget");
 }
 function isEmptyResidue(node) {
-  if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE) {
-    return isIgnorableText(node.nodeValue);
+  if (node.nodeType === Node.TEXT_NODE) {
+    return !(node.nodeValue ?? "").replace(EMPTY_RESIDUE_RE, "");
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node;
@@ -3045,7 +3017,7 @@ function isEmptyResidue(node) {
       return true;
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
       return false;
-    return Array.from(el.childNodes).every((child) => isEmptyResidue(child));
+    return !(el.textContent ?? "").replace(EMPTY_RESIDUE_RE, "");
   }
   return false;
 }
