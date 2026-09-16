@@ -11,7 +11,16 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot' | 'th-set-variable';
+  op:
+    | 'th-get-messages-snapshot'
+    | 'th-set-chat-message'
+    | 'th-get-variables-snapshot'
+    | 'th-set-variable'
+    | 'th-get-chat-variables-snapshot'
+    | 'th-replace-chat-variables'
+    | 'th-patch-chat-variables'
+    | 'th-insert-chat-variables'
+    | 'th-delete-chat-variable';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -112,6 +121,46 @@ function shapeSnapshotMessage(
 type ChatApi = SpindleAPI['chat'];
 type ChatsApi = SpindleAPI['chats'];
 type CharactersApi = SpindleAPI['characters'];
+type ChatVariablesApi = SpindleAPI['variables']['chat'];
+
+const chatVariableMutationTail = new Map<string, Promise<unknown>>();
+
+function queueChatVariableMutation<T>(chatId: string, work: () => Promise<T>): Promise<T> {
+  const previous = chatVariableMutationTail.get(chatId) ?? Promise.resolve();
+  const next = previous.then(work, work);
+  chatVariableMutationTail.set(chatId, next);
+  void next.then(
+    () => { if (chatVariableMutationTail.get(chatId) === next) chatVariableMutationTail.delete(chatId); },
+    () => { if (chatVariableMutationTail.get(chatId) === next) chatVariableMutationTail.delete(chatId); },
+  );
+  return next;
+}
+
+function plainRecord(value: unknown): Record<string, unknown> {
+  return value && typeof value === 'object' && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : {};
+}
+
+function normalizeChatVariableValue(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (value === undefined) return '';
+  if (value === null) return 'null';
+  if (typeof value === 'number' || typeof value === 'boolean' || typeof value === 'bigint') return String(value);
+  try {
+    const encoded = JSON.stringify(value);
+    return encoded === undefined ? String(value) : encoded;
+  } catch {
+    return String(value);
+  }
+}
+
+function normalizeChatVariables(value: unknown): Record<string, string> {
+  const input = plainRecord(value);
+  const out: Record<string, string> = {};
+  for (const [key, item] of Object.entries(input)) out[key] = normalizeChatVariableValue(item);
+  return out;
+}
 
 // Resolve a chat's greeting set (first_mes + alternate_greetings, in order)
 // from the character metadata. Group greetings carry character_id on
@@ -214,6 +263,85 @@ export async function handleGetVariablesSnapshot(
   }
 }
 
+
+export async function handleGetChatVariablesSnapshot(
+  chatId: string,
+  variables: ChatVariablesApi = api.variables.chat,
+): Promise<Record<string, string>> {
+  if (!chatId) return {};
+  try {
+    return await variables.list(chatId);
+  } catch (err) {
+    log.warn('getChatVariablesSnapshot failed:', err instanceof Error ? err.message : String(err));
+    return {};
+  }
+}
+
+export async function handleReplaceChatVariables(
+  body: Record<string, unknown>,
+  chatId: string,
+  variables: ChatVariablesApi = api.variables.chat,
+): Promise<Record<string, string>> {
+  const desired = normalizeChatVariables(body.variables);
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    for (const key of Object.keys(current)) {
+      if (!Object.prototype.hasOwnProperty.call(desired, key)) await variables.delete(chatId, key);
+    }
+    for (const [key, value] of Object.entries(desired)) {
+      if (current[key] !== value) await variables.set(chatId, key, value);
+    }
+    return await variables.list(chatId);
+  });
+}
+
+export async function handlePatchChatVariables(
+  body: Record<string, unknown>,
+  chatId: string,
+  variables: ChatVariablesApi = api.variables.chat,
+): Promise<Record<string, string>> {
+  const patch = normalizeChatVariables(body.variables);
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    for (const [key, value] of Object.entries(patch)) {
+      if (current[key] === value) continue;
+      await variables.set(chatId, key, value);
+    }
+    return await variables.list(chatId);
+  });
+}
+
+export async function handleInsertChatVariables(
+  body: Record<string, unknown>,
+  chatId: string,
+  variables: ChatVariablesApi = api.variables.chat,
+): Promise<Record<string, string>> {
+  const additions = normalizeChatVariables(body.variables);
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    for (const [key, value] of Object.entries(additions)) {
+      if (Object.prototype.hasOwnProperty.call(current, key)) continue;
+      await variables.set(chatId, key, value);
+    }
+    return await variables.list(chatId);
+  });
+}
+
+export async function handleDeleteChatVariable(
+  body: Record<string, unknown>,
+  chatId: string,
+  variables: ChatVariablesApi = api.variables.chat,
+): Promise<{ variables: Record<string, string>; delete_occurred: boolean }> {
+  const path = typeof body.path === 'string' ? body.path : '';
+  return queueChatVariableMutation(chatId, async () => {
+    const current = await variables.list(chatId);
+    const deleteOccurred = !!path && Object.prototype.hasOwnProperty.call(current, path);
+    if (deleteOccurred) await variables.delete(chatId, path);
+    const next = await variables.list(chatId);
+    return { variables: next, delete_occurred: deleteOccurred };
+  });
+}
+
 export async function handleSetChatMessage(
   body: Record<string, unknown>,
   chatId: string,
@@ -288,6 +416,21 @@ export function installThHelpersHandler(): void {
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-get-variables-snapshot') {
           const result = await handleGetVariablesSnapshot(chatId, userId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-get-chat-variables-snapshot') {
+          const result = await handleGetChatVariablesSnapshot(chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-replace-chat-variables') {
+          const result = await handleReplaceChatVariables(body, chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-patch-chat-variables') {
+          const result = await handlePatchChatVariables(body, chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-insert-chat-variables') {
+          const result = await handleInsertChatVariables(body, chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
+        } else if (op === 'th-delete-chat-variable') {
+          const result = await handleDeleteChatVariable(body, chatId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);

@@ -27,11 +27,21 @@ const LODASH_TOKEN = /(?:^|[^a-zA-Z_$.\w])_\s*\.[a-zA-Z]/;
 const JQUERY_TOKEN = /(?:^|[^a-zA-Z_$.\w])\$\s*\(/;
 const JQUERY_NAMED_TOKEN = /\bjQuery\s*[(.]/;
 
+const CHAT_VARIABLE_HELPER_TOKENS: readonly RegExp[] = [
+  /\bgetVariables\s*\(/,
+  /\breplaceVariables\s*\(/,
+  /\bupdateVariablesWith\s*\(/,
+  /\binsertOrAssignVariables\s*\(/,
+  /\binsertVariables\s*\(/,
+  /\bdeleteVariable\s*\(/,
+];
+
 const HELPERS_LIGHT_TOKENS: readonly RegExp[] = [
   /\bgetChatMessages\s*\(/,
   /\bsetChatMessage\s*\(/,
   /\bgetCurrentMessageId\s*\(/,
   /\bgetChatId\s*\(/,
+  ...CHAT_VARIABLE_HELPER_TOKENS,
 ];
 
 const SLASH_TOKEN = /\btriggerSlash\s*\(/;
@@ -93,6 +103,12 @@ function classifyImpl(html: string): WidgetEnvironment {
   if (hasSlash) return 'tavern-slash';
 
   return 'static';
+}
+
+export function usesChatVariableHelpers(html: string): boolean {
+  const body = extractScriptBodies(html);
+  if (!body) return false;
+  return CHAT_VARIABLE_HELPER_TOKENS.some((re) => re.test(body));
 }
 
 export function shouldInjectThHelpersShim(env: WidgetEnvironment): boolean {

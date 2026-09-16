@@ -1,6 +1,6 @@
 import type { SpindleFrontendContext, SpindleSandboxFrameHandle } from 'lumiverse-spindle-types';
 import { thHelpersShim } from '../render/th-helpers-shim';
-import { fetchMessagesSnapshot } from '../render/th-helpers-bridge';
+import { dispatchThRequest, fetchMessagesSnapshot, isThRequest } from '../render/th-helpers-bridge';
 import type { Script } from './script-types';
 import { handleClipboardWriteText, handleHostAlert } from '../render/clipboard-shim';
 
@@ -96,13 +96,43 @@ function plainRecord(value: unknown): Record<string, unknown> {
  * invalidated before any switch event reaches scripts, so a persistent iframe
  * can never return variables belonging to a previous chat.
  */
-function variablesFromMetadata(metadata: unknown): Record<string, unknown> {
+interface VariableState {
+  base: Record<string, unknown>;
+  chat: Record<string, unknown>;
+  all: Record<string, unknown>;
+}
+
+function emptyVariableState(): VariableState {
+  return { base: {}, chat: {}, all: {} };
+}
+
+function variableStateFromMetadata(metadata: unknown): VariableState {
   const meta = plainRecord(metadata);
   const macro = plainRecord(meta.macro_variables);
   const globalVars = plainRecord(macro.global);
   const localVars = plainRecord(macro.local);
   const chatVars = plainRecord(meta.chat_variables);
-  return { ...globalVars, ...localVars, ...chatVars };
+  const base = { ...globalVars, ...localVars };
+  const chat = { ...chatVars };
+  return { base, chat, all: { ...base, ...chat } };
+}
+
+function chatVariablesFromMutationResult(op: string, result: unknown): Record<string, unknown> | null {
+  if (!result || typeof result !== 'object' || Array.isArray(result)) return null;
+  const record = result as Record<string, unknown>;
+  if (op === 'th-delete-chat-variable') {
+    return record.variables && typeof record.variables === 'object' && !Array.isArray(record.variables)
+      ? record.variables as Record<string, unknown>
+      : null;
+  }
+  return record;
+}
+
+function isChatVariableMutationOp(op: string): boolean {
+  return op === 'th-replace-chat-variables' ||
+    op === 'th-patch-chat-variables' ||
+    op === 'th-insert-chat-variables' ||
+    op === 'th-delete-chat-variable';
 }
 
 export class ScriptRunner {
@@ -111,6 +141,8 @@ export class ScriptRunner {
   private eventUnsubs: Array<() => void> = [];
   private activeChatId: string | null;
   private variableEpoch = 0;
+  private variableStateChatId: string | null = null;
+  private variableState: VariableState = emptyVariableState();
 
   constructor(private readonly ctx: SpindleFrontendContext) {
     this.activeChatId = ctx.getActiveChat().chatId ?? null;
@@ -166,24 +198,26 @@ export class ScriptRunner {
     const effectiveChatId = chatId ?? '';
 
     let messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>> = [];
-    let variablesSnapshot: Record<string, unknown> = {};
+    let variableState = emptyVariableState();
     if (effectiveChatId) {
       const [messages, variables] = await Promise.all([
         fetchMessagesSnapshot(
           { chatId: effectiveChatId, currentMessageId: '', currentMessageIndex: -1 },
           this.ctx,
         ).catch(() => [] as Awaited<ReturnType<typeof fetchMessagesSnapshot>>),
-        this.fetchVariablesForChat(effectiveChatId),
+        this.fetchVariableStateForChat(effectiveChatId),
       ]);
       messagesSnapshot = messages;
-      variablesSnapshot = variables;
+      variableState = variables;
       this.activeChatId = effectiveChatId;
+      this.variableStateChatId = effectiveChatId;
+      this.variableState = variableState;
     }
 
     console.log(`[vishrun:script-runner] launching ${scriptsToLaunch.length} script(s)`, scriptsToLaunch.map(s => s.name));
 
     for (const script of scriptsToLaunch) {
-      this.launchFrame(script, effectiveChatId, messagesSnapshot, variablesSnapshot);
+      this.launchFrame(script, effectiveChatId, messagesSnapshot, variableState);
     }
   }
 
@@ -214,7 +248,7 @@ export class ScriptRunner {
     script: Script,
     chatId: string,
     messagesSnapshot: Awaited<ReturnType<typeof fetchMessagesSnapshot>>,
-    variablesSnapshot: Record<string, unknown>,
+    variableState: VariableState,
   ): void {
     try {
       const shim = thHelpersShim({
@@ -223,7 +257,10 @@ export class ScriptRunner {
         chatId,
         messagesSnapshot,
         variablesChatId: chatId,
-        variablesSnapshot,
+        variablesSnapshot: variableState.all,
+        variablesBaseSnapshot: variableState.base,
+        chatVariablesChatId: chatId,
+        chatVariablesSnapshot: variableState.chat,
       });
 
       const srcdoc = [
@@ -264,8 +301,11 @@ export class ScriptRunner {
         'overflow:hidden',
       ].join(';');
       container.appendChild(handle.element);
-      document.body.appendChild(container);
 
+      // Register the frame and its request listener before connecting the iframe
+      // to the document. A script may call a helper at top level as soon as its
+      // srcdoc executes; connecting first would leave a tiny window where that
+      // first request has no host listener and can never receive a response.
       this.frames.set(frameKey(script.scope, script.id), {
         scriptId: script.id,
         scriptName: script.name,
@@ -283,9 +323,24 @@ export class ScriptRunner {
           void handleClipboardWriteText(p.payload, this.ctx);
         } else if (p.kind === 'alert') {
           handleHostAlert(p.payload);
+        } else if (isThRequest(payload)) {
+          const requestedChatId = typeof payload.body.chatId === 'string' ? payload.body.chatId : '';
+          const requestChatId = requestedChatId || this.ctx.getActiveChat().chatId || this.activeChatId || '';
+          dispatchThRequest(
+            handle,
+            payload,
+            { chatId: requestChatId, currentMessageId: '', currentMessageIndex: -1 },
+            this.ctx,
+            (response) => {
+              if (!response.ok || !isChatVariableMutationOp(payload.op)) return;
+              const nextChatVariables = chatVariablesFromMutationResult(payload.op, response.result);
+              if (nextChatVariables) this.applyDirectChatVariableState(requestChatId, nextChatVariables);
+            },
+          );
         }
       });
 
+      document.body.appendChild(container);
       console.log(`[vishrun:script-runner] launched: ${script.name} (${script.id})`);
     } catch (err) {
       console.error('[vishrun:script-runner] failed to launch:', script.name, err);
@@ -302,8 +357,8 @@ export class ScriptRunner {
     this.frames.clear();
   }
 
-  private async fetchVariablesForChat(chatId: string): Promise<Record<string, unknown>> {
-    if (!chatId) return {};
+  private async fetchVariableStateForChat(chatId: string): Promise<VariableState> {
+    if (!chatId) return emptyVariableState();
     try {
       const response = await fetch(
         `/api/v1/chats/${encodeURIComponent(chatId)}?_t=${Date.now()}`,
@@ -311,25 +366,45 @@ export class ScriptRunner {
       );
       if (!response.ok) {
         console.warn('[vishrun:script-runner] variable mirror fetch failed:', response.status);
-        return {};
+        return emptyVariableState();
       }
       const chat = await response.json() as { metadata?: unknown };
-      return variablesFromMetadata(chat?.metadata);
+      return variableStateFromMetadata(chat?.metadata);
     } catch (err) {
       console.warn(
         '[vishrun:script-runner] variable mirror fetch failed:',
         err instanceof Error ? err.message : String(err),
       );
-      return {};
+      return emptyVariableState();
     }
+  }
+
+  private applyDirectChatVariableState(chatId: string, chatVariables: Record<string, unknown>): void {
+    if (!chatId || this.activeChatId !== chatId || this.variableStateChatId !== chatId) return;
+    const base = { ...this.variableState.base };
+    const chat = { ...chatVariables };
+    this.pushVariableState(chatId, { base, chat, all: { ...base, ...chat } });
   }
 
   private pushVariableState(
     chatId: string,
-    variables: Record<string, unknown>,
+    state: VariableState,
     emitChanged = false,
   ): void {
-    const msg = { type: 'vsh_th_variables', chatId, variables, emitChanged };
+    this.variableStateChatId = chatId || null;
+    this.variableState = {
+      base: { ...state.base },
+      chat: { ...state.chat },
+      all: { ...state.all },
+    };
+    const msg = {
+      type: 'vsh_th_variables',
+      chatId,
+      variables: this.variableState.all,
+      variablesBase: this.variableState.base,
+      chatVariables: this.variableState.chat,
+      emitChanged,
+    };
     for (const frame of this.frames.values()) {
       // Same-origin script frames can accept the state synchronously. This is
       // the closest equivalent to JSLR's direct parent-window bindings and,
@@ -340,13 +415,21 @@ export class ScriptRunner {
           | (Window & {
               __vishrunSetVariableState?: (
                 nextChatId: string,
+                nextBaseVariables: Record<string, unknown>,
+                nextChatVariables: Record<string, unknown>,
                 nextVariables: Record<string, unknown>,
                 shouldEmitChanged?: boolean,
               ) => void;
             })
           | null;
         if (typeof frameWindow?.__vishrunSetVariableState === 'function') {
-          frameWindow.__vishrunSetVariableState(chatId, variables, emitChanged);
+          frameWindow.__vishrunSetVariableState(
+            chatId,
+            this.variableState.base,
+            this.variableState.chat,
+            this.variableState.all,
+            emitChanged,
+          );
           continue;
         }
       } catch {
@@ -373,7 +456,7 @@ export class ScriptRunner {
     // can observe either the new chat's variables or an empty bag, never the
     // previous chat's variables. The shim emits CHAT_CHANGED only after the
     // empty state is installed, which clears legacy script-side caches too.
-    this.pushVariableState(nextChatId ?? '', {}, true);
+    this.pushVariableState(nextChatId ?? '', emptyVariableState(), true);
   }
 
   private async handleChatSwitched(data: unknown): Promise<void> {
@@ -392,13 +475,13 @@ export class ScriptRunner {
     // a second time. Otherwise preserve the original safety net for hosts that
     // emit CHAT_SWITCHED without the settings notification.
     if (!alreadyInvalidated) {
-      this.pushVariableState(targetChatId ?? '', {}, true);
+      this.pushVariableState(targetChatId ?? '', emptyVariableState(), true);
     }
     this.broadcast('CHAT_SWITCHED', data);
 
     if (!targetChatId) return;
 
-    const variables = await this.fetchVariablesForChat(targetChatId);
+    const variables = await this.fetchVariableStateForChat(targetChatId);
     if (epoch !== this.variableEpoch || this.activeChatId !== targetChatId) return;
 
     // Install only if this is still the active chat. The shim emits one local
@@ -430,7 +513,7 @@ export class ScriptRunner {
     if (payload?.chat && payload.chat.metadata && payloadChatId) {
       ++this.variableEpoch;
       this.activeChatId = payloadChatId;
-      this.pushVariableState(payloadChatId, variablesFromMetadata(payload.chat.metadata));
+      this.pushVariableState(payloadChatId, variableStateFromMetadata(payload.chat.metadata));
       this.broadcast('CHAT_CHANGED', data);
       return;
     }
@@ -451,7 +534,7 @@ export class ScriptRunner {
     }
 
     const epoch = ++this.variableEpoch;
-    const variables = await this.fetchVariablesForChat(payloadChatId);
+    const variables = await this.fetchVariableStateForChat(payloadChatId);
     if (epoch !== this.variableEpoch || this.activeChatId !== payloadChatId) return;
     this.pushVariableState(payloadChatId, variables);
     this.broadcast('CHAT_CHANGED', data);
