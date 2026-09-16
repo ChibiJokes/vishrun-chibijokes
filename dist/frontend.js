@@ -1840,7 +1840,7 @@ function buildHeadInjection(iframeCtx) {
   return jsRunnerLayoutReset() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
 }
 function jsRunnerLayoutReset() {
-  return `<style data-vishrun-jsr-layout>` + `*,*::before,*::after{box-sizing:border-box;}` + `html,body{margin:0!important;padding:0;overflow:hidden!important;max-width:100%!important;}` + `</style>`;
+  return `<style data-vishrun-jsr-layout>` + `*,*::before,*::after{box-sizing:border-box;-webkit-tap-highlight-color:transparent!important;}` + `html,body{margin:0!important;padding:0;overflow:hidden!important;max-width:100%!important;-webkit-tap-highlight-color:transparent!important;}` + `</style>`;
 }
 function setChatMessagesShim() {
   const diagJson = JSON.stringify(VSH_VISHRUN_DIAG);
@@ -2753,6 +2753,7 @@ async function processNode(root, scripts, ctx) {
       return 0;
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
+    normalizeExistingWidgetContainers(target);
     const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     let total = 0;
     try {
@@ -2766,6 +2767,7 @@ async function processNode(root, scripts, ctx) {
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
+      normalizeExistingWidgetContainers(findContentRoot(root));
     } catch (err) {
       console.debug("[vishrun] processNode render error:", err);
     }
@@ -2944,6 +2946,15 @@ var MULTILINE_BLOCK_TAGS = new Set([
   "H5",
   "H6"
 ]);
+var TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(["SPAN"]);
+var EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
+function normalizeExistingWidgetContainers(target) {
+  const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
+  for (const widget of widgets) {
+    if (widget.isConnected)
+      cleanupEmptyAroundWidget(widget, target);
+  }
+}
 function cleanupEmptyAroundWidget(widget, stopAt) {
   let current = widget;
   for (;; ) {
@@ -2970,20 +2981,35 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     }
     if (parent === stopAt)
       break;
-    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
-    if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
-      const gparent = parent.parentNode;
-      if (!gparent)
+    const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
+    const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
+    if ((transparentInline || knownBlock) && containsOnlyWidgetsAndResidue(parent)) {
+      const grandparent = parent.parentNode;
+      if (!grandparent)
         break;
-      gparent.replaceChild(current, parent);
+      while (parent.firstChild) {
+        const child = parent.firstChild;
+        if (isEmptyResidue(child)) {
+          parent.removeChild(child);
+        } else {
+          grandparent.insertBefore(child, parent);
+        }
+      }
+      grandparent.removeChild(parent);
       continue;
     }
     break;
   }
 }
+function containsOnlyWidgetsAndResidue(container) {
+  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node));
+}
+function isWidgetNode(node) {
+  return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute("data-vishrun-widget");
+}
 function isEmptyResidue(node) {
   if (node.nodeType === Node.TEXT_NODE) {
-    return (node.nodeValue ?? "").length === 0;
+    return !(node.nodeValue ?? "").replace(EMPTY_RESIDUE_RE, "");
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node;
@@ -2991,7 +3017,7 @@ function isEmptyResidue(node) {
       return true;
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
       return false;
-    return (el.textContent ?? "").length === 0;
+    return !(el.textContent ?? "").replace(EMPTY_RESIDUE_RE, "");
   }
   return false;
 }
@@ -3276,7 +3302,13 @@ function installMessageHooks(ctx) {
   let pendingRecords = [];
   let bodyWatcher = null;
   let latestMessageId = null;
-  const OBSERVE_OPTS = { childList: true, subtree: true, characterData: true };
+  const OBSERVE_OPTS = {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    attributes: true,
+    attributeFilter: ["data-display-pending"]
+  };
   function compiledForActiveCard() {
     const card = getActiveCard();
     if (!card)
@@ -3299,7 +3331,8 @@ function installMessageHooks(ctx) {
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel);
     if (node) {
-      if (!node.querySelector('[data-component="MessageContent"]')) {
+      const messageContent = node.querySelector('[data-component="MessageContent"]');
+      if (!messageContent || messageContent.getAttribute("data-display-pending") === "true") {
         if (retriesLeft > 0) {
           requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
         }
@@ -3338,6 +3371,9 @@ function installMessageHooks(ctx) {
       const total = nodes.length;
       const tasks = [];
       nodes.forEach((n, i) => {
+        const messageContent = n.querySelector('[data-component="MessageContent"]');
+        if (messageContent?.getAttribute("data-display-pending") === "true")
+          return;
         const depthFromLatest = total - 1 - i;
         const nodeMessageId = n.getAttribute("data-message-id");
         const scriptsForMessage = compiled.filter((s) => {

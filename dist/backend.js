@@ -374,7 +374,7 @@ function parseSetvarChain(content) {
 
 // src/backend/pre-generation-bridge.ts
 var LOG_PREFIX = "[vishrun:pre-generation]";
-var PRE_GENERATION_TIMEOUT_MS = 90000;
+var PRE_GENERATION_TIMEOUT_MS = 300000;
 var subscribedUsers = new Set;
 var pendingRequests = new Map;
 function isSubscriptionMessage(payload) {
