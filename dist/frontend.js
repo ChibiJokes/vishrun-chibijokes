@@ -1422,6 +1422,13 @@ function rollbackCreatedMessages(chatId, created){
     return hostJsonFetch(path, { method: 'DELETE', credentials: 'include' }).catch(function(){ return undefined; });
   }));
 }
+window.triggerSlash = function(command){
+  if (typeof command !== 'string') return Promise.reject(new TypeError('triggerSlash command must be a string'));
+  return postRequest('th-trigger-slash', { command: command }).then(function(result){
+    return result == null ? '' : String(result);
+  });
+};
+window.triggerSlashWithResult = window.triggerSlash;
 window.createChatMessages = function(chatMessages, options){
   if (!Array.isArray(chatMessages)) return Promise.reject(new TypeError('chat_messages must be an array'));
   var normalized;
