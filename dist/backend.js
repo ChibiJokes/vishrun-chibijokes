@@ -1445,16 +1445,6 @@ async function handleCreateChatMessages(body, chatId, chat = api.chat) {
     }))
   };
 }
-async function handleTriggerSlash(body, chatId, userId) {
-  const command = body.command;
-  if (typeof command !== "string")
-    throw new TypeError("triggerSlash command must be a string");
-  const result = await dispatchSlashText(command, chatId, userId);
-  if (!result.handled) {
-    throw new Error(`Unsupported slash command in Vishrun triggerSlash: ${command}`);
-  }
-  return "";
-}
 async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = api.chat) {
   const fieldValues = body.fieldValues ?? {};
   const messageRange = body.messageId;
@@ -1546,9 +1536,6 @@ function installThHelpersHandler() {
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
         } else if (op === "th-create-chat-messages") {
           const result = await handleCreateChatMessages(body, chatId);
-          response = { type: "th_helpers_response", requestId, ok: true, result };
-        } else if (op === "th-trigger-slash") {
-          const result = await handleTriggerSlash(body, chatId, userId);
           response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-replace-chat-variables") {
           const result = await handleReplaceChatVariables(body, chatId, userId);
