@@ -3,7 +3,7 @@ name: Build Vishrun
 on:
   push:
     branches:
-      - staging
+      - testing
     paths-ignore:
       - "dist/**"
 
