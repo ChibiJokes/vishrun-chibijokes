@@ -2752,7 +2752,10 @@ async function processNode(root, scripts, ctx) {
     if (transition === "still")
       return 0;
     const target = findContentRoot(root);
+    if (target.hasAttribute("data-display-pending"))
+      return 0;
     cleanupOrphansForMessage(messageId, target);
+    normalizeExistingWidgetContainers(target);
     const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     let total = 0;
     try {
@@ -2944,6 +2947,13 @@ var MULTILINE_BLOCK_TAGS = new Set([
   "H5",
   "H6"
 ]);
+function normalizeExistingWidgetContainers(target) {
+  const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
+  for (const widget of widgets) {
+    if (widget.isConnected)
+      cleanupEmptyAroundWidget(widget, target);
+  }
+}
 function cleanupEmptyAroundWidget(widget, stopAt) {
   let current = widget;
   for (;; ) {
