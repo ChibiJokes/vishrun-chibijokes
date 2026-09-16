@@ -75,7 +75,16 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   // Used to anchor depth-0 scripts to a stable identity rather than
   // a DOM position that shifts as Lumi loads/unloads messages on scroll.
   let latestMessageId: string | null = null;
-  const OBSERVE_OPTS: MutationObserverInit = { childList: true, subtree: true, characterData: true };
+  const OBSERVE_OPTS: MutationObserverInit = {
+    childList: true,
+    subtree: true,
+    characterData: true,
+    // Lumiverse exposes async display-preprocessing readiness on MessageContent.
+    // Watching this exact attribute lets Vishrun retry when the host's final DOM
+    // becomes ready instead of guessing with timers / extra animation frames.
+    attributes: true,
+    attributeFilter: ['data-display-pending'],
+  };
 
   function compiledForActiveCard(): CompiledScript[] | null {
     const card = getActiveCard();
@@ -212,9 +221,10 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     // childList + subtree catch greeting/swipe rebuilds (whole subtree
     // replaced) and new-message inserts. characterData catches in-place
     // text edits when React reuses a text node rather than replacing it.
-    // Watch-item: characterData also fires per token during streaming —
-    // if testing surfaces flicker or perf issues, drop characterData and
-    // rely on the childList/subtree mutations React fires at end-of-stream.
+    // data-display-pending is Lumiverse's own readiness signal for async
+    // display preprocessing: while present Vishrun must not inject; when
+    // Lumiverse removes it this observer schedules the settled render pass.
+    // characterData also covers hosts/configurations that do stream text.
     observer.observe(target, OBSERVE_OPTS);
     observedTarget = target;
   }
