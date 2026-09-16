@@ -1,0 +1,875 @@
+import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
+import type { CompiledScript } from '../core/parse-regex-script';
+import { isPlaceholderLikeKind } from '../core/classify-trigger';
+import { substitute } from '../core/substitute';
+import { applyNestedPipeline } from '../core/nested-pipeline';
+import {
+  buildWidgetIframe,
+  cleanupOrphansForMessage,
+  destroyAllRegisteredWidgetsForMessage,
+  destroyRegisteredWidgetsFor,
+  destroyWidgetIframe,
+  hasRegisteredWidgetsFor,
+  widgetNeedsIsolation,
+} from './widget-iframe';
+import { getCapturesForMessage } from '../hooks/tag-interceptor';
+import { hasMacros } from '../core/macro-detection';
+import { resolveMacrosBatch } from '../core/macro-resolver';
+import { getLinearizedBubble, invalidateLinearizedBubble, type OffsetMapEntry } from './linearize-bubble';
+import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
+
+// Expanded widget HTML → macro-resolved HTML, for one processNode pass.
+type ResolvedMap = Map<string, string>;
+
+// Global cache of macro resolutions. Key: expanded raw template (what was sent
+// to the backend). Value: resolved HTML (what the backend returned). Lives
+// across processNode passes so replacePlaceholderMatches can recover the
+// resolution even when the current run's map is empty — which happens when
+// processNode re-fires after the first render: collectExpandedTemplates returns
+// 0 (the matched text now lives inside a [data-vishrun-widget], so it's excluded
+// from the text-node scan) → no resolve → empty map → otherwise a MISS → raw
+// `{{getvar::}}` re-rendered into the DOM.
+//
+// Limitation: not invalidated when variables change. If a /setvar mutates
+// player_grade mid-session, widgets with a cached entry keep showing the old
+// value. A browser refresh clears the cache. Acceptable for the current use
+// case (variables are set up front, rarely mutate).
+const resolutionCache = new Map<string, string>();
+
+// Per-message in-flight guard + pending rescan queue.
+//
+// Problem: GENERATION_ENDED fires processMessageById while Lumiverse's
+// useDisplayPreprocessed is still resolving async. processNode starts and
+// awaits resolveMacrosForMessage (~100-200ms). During that await,
+// useDisplayPreprocessed resolves → React re-renders the message → DOM
+// mutation → MutationObserver fires → scanAllNow tries processNode again →
+// blocked by the in-flight guard → DROPPED.
+//
+// processNode then finishes but its widgets land in stale DOM nodes
+// (React already replaced them), so tn.parentNode !== parent → widgets
+// destroyed. The blocked scanAllNow was the call that had the settled DOM —
+// dropping it means widgets never render.
+//
+// Fix: instead of dropping concurrent calls, stash the latest one. When the
+// current call finishes, fire the pending rescan on the now-settled DOM.
+// This means at most one extra processNode run per message per generation,
+// and it runs after all React async re-renders have committed.
+const inFlightMessages = new Set<string>();
+interface PendingRescan {
+  root: HTMLElement;
+  scripts: CompiledScript[];
+  ctx: SpindleFrontendContext;
+}
+const pendingRescans = new Map<string, PendingRescan>();
+
+// Module-scoped tracker for which messageIds are currently observed in edit
+// mode. Lumiverse emits no event for the edit enter/exit transition (pure
+// React state, see BubbleMessageDefault.tsx:270-293), so we infer transitions
+// by diffing the DOM signal against this Set on each processNode pass. The
+// Set is load-bearing: enter → tear down widgets and short-circuit; still
+// → short-circuit; exit → fall through to the rebuild pipeline.
+const editingMessageIds = new Set<string>();
+
+export type EditTransition = 'enter' | 'still' | 'exit' | 'idle';
+
+/**
+ * Diff the message's current DOM state against the editing Set to detect an
+ * edit-mode transition edge. Mutates `editingSet` on 'enter' and 'exit' so
+ * the next call sees the new steady state. DOM signal established by prior
+ * investigation: textarea present AND no [data-component="MessageContent"].
+ */
+export function computeEditModeTransition(
+  root: HTMLElement,
+  messageId: string,
+  editingSet: Set<string>,
+): EditTransition {
+  const hasTextarea = !!root.querySelector('textarea');
+  const hasMessageContent = !!root.querySelector('[data-component="MessageContent"]');
+  const inEditMode = hasTextarea && !hasMessageContent;
+  const wasEditing = editingSet.has(messageId);
+  if (inEditMode && !wasEditing) {
+    editingSet.add(messageId);
+    return 'enter';
+  }
+  if (inEditMode && wasEditing) return 'still';
+  if (!inEditMode && wasEditing) {
+    editingSet.delete(messageId);
+    return 'exit';
+  }
+  return 'idle';
+}
+
+/** Reset the module's edit-mode tracker. Called from installMessageHooks
+ *  dispose() so the Set doesn't outlive a spindle reload / chat teardown. */
+export function clearEditingMessageIds(): void {
+  editingMessageIds.clear();
+}
+
+/** Test-only inspection of the module's edit-mode Set. */
+export function getEditingMessageIdsForTest(): ReadonlySet<string> {
+  return editingMessageIds;
+}
+
+/**
+ * Process a single message DOM. Two pipelines, kept separate per the
+ * Step 3 design constraint:
+ *
+ *   1. Placeholder pipeline (Step 2 + iframe extension)
+ *      For each compiled placeholder-like script (`placeholder` and
+ *      `delimitedCapture` — Fix B), find every match in the message's text
+ *      nodes and replace with a widget. The widget is a <div> with innerHTML
+ *      if the replaceString has no <script>, or a sandboxed iframe if it does.
+ *      `delimitedCapture` scripts (`【…(…)…】`, `↦…↤`, `[START OF X]…[END OF X]`,
+ *      etc.) survive DOMPurify just like plain placeholders, so they share
+ *      this path; `$N` substitution handles their capture groups.
+ *
+ *   2. Paired-tag pipeline (Step 3)
+ *      Read the captures map populated by tag-interceptor.ts. For each
+ *      capture not already rendered as a widget in this message, append
+ *      one to the message's [data-component="MessageContent"] node.
+ *      Widgets are always iframes here for safety — paired-tag widgets
+ *      tend to carry behavior (Vavesta Court Ledger has <script>) and
+ *      keeping them isolated from the host CSS is conservative.
+ *
+ * Idempotency: both pipelines skip work where a [data-vishrun-widget] is
+ * already in place. Re-running on the same DOM is a no-op.
+ */
+export async function processNode(
+  root: HTMLElement,
+  scripts: CompiledScript[],
+  ctx: SpindleFrontendContext,
+): Promise<number> {
+  const messageId = root.getAttribute('data-message-id') || undefined;
+  if (!messageId) {
+    // Without a stable messageId, the global widget registry can't track
+    // ownership and the pre-pipeline orphan cleanup would have nothing
+    // to scope against. Silently skip — scanAllNow only ever calls
+    // processNode for `[data-message-id]` nodes anyway.
+    return 0;
+  }
+
+  // In-flight guard: if a processNode call is already running for this
+  // message, stash this call as a pending rescan rather than dropping it.
+  // The current in-flight call may be working on stale DOM nodes (React
+  // re-rendered while it was awaiting macro resolution). The stashed call
+  // will fire after the in-flight call finishes, by which time the DOM has
+  // settled and widgets will land correctly.
+  if (inFlightMessages.has(messageId)) {
+    pendingRescans.set(messageId, { root, scripts, ctx });
+    return 0;
+  }
+  inFlightMessages.add(messageId);
+
+  // Edit-mode gate. Lumiverse replaces MessageContent with MessageEditArea
+  // (textarea) when editingMessageId === message.id; no event fires for the
+  // transition, so we diff the DOM signal against the editing Set every pass.
+  //   enter → destroy registered widgets (so the iframe doesn't sit next to
+  //           the textarea via findContentRoot's fallback) and short-circuit.
+  //   still → short-circuit every observer tick while the textarea is open.
+  //   exit  → fall through; MessageContent is back, findContentRoot resolves,
+  //           and the pipeline rebuilds from the (possibly edited) content.
+  //   idle  → normal path, unchanged.
+  const transition = computeEditModeTransition(root, messageId, editingMessageIds);
+  if (VSH_VISHRUN_DIAG) {
+    if (transition === 'enter') {
+      console.log('[vishrun:edit-mode] transition', {
+        messageId,
+        phase: 'enter',
+        signal: 'textarea-without-MessageContent',
+      });
+    } else if (transition === 'exit') {
+      console.log('[vishrun:edit-mode] transition', { messageId, phase: 'exit' });
+    }
+  }
+  try {
+    if (transition === 'enter') {
+      // Reuse the teardown path the MESSAGE_EDITED rebuild uses. Idempotent
+      // when nothing's registered for this id.
+      destroyAllRegisteredWidgetsForMessage(messageId, 'edit-mode-enter');
+      return 0;
+    }
+    if (transition === 'still') return 0;
+
+    // Global pre-pipeline cleanup: destroy any registered iframes for this
+    // messageId that aren't currently inside the expected MessageContent.
+    // Catches React subtree rebuilds (swipe / edit / regen) that detached
+    // an iframe but didn't unmount the host's sandboxFrames record.
+    const target = findContentRoot(root);
+    cleanupOrphansForMessage(messageId, target);
+
+    // Repair any already-mounted widgets that were left inside Lumiverse's
+    // temporary render wrappers by an earlier pass. This is the same DOM
+    // normalization that an edit/cancel remount happened to provide.
+    normalizeExistingWidgetContainers(target);
+
+    // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
+    // widget HTML before any widget is built. Always returns a map; missing
+    // entries → widget renders the raw template (no worse than pre-MVU-lite).
+    const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
+
+    let total = 0;
+    // Widget building is async now (buildWidgetIframe → injectShimsAndSizeReporter
+    // → transformHtmlForTailwind may fetch the Tailwind bundle on first use).
+    // Swallow errors so a single bad render doesn't reject for fire-and-forget
+    // callers (scanAllNow / processMessageById) and so a later scan can retry.
+    try {
+      for (const script of scripts) {
+        // placeholder + delimitedCapture run through the post-DOMPurify text scan.
+        // delimitedCaptureMultiLine routes through the linearize-bubble path
+        // (single regex across all text nodes in the bubble). pairedTag scripts
+        // go through registerTagInterceptor (pre-sanitizer) and surface here as
+        // captures via getCapturesForMessage. unknown is skipped.
+        if (!isPlaceholderLikeKind(script.kind)) continue;
+        if (script.kind === 'delimitedCaptureMultiLine') {
+          total += await replaceMultiLineMatches(root, script, scripts, messageId, ctx, resolvedMap);
+        } else {
+          total += await replacePlaceholderMatches(root, script, scripts, messageId, ctx, resolvedMap);
+        }
+      }
+      total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
+
+      // Finalize against the DOM shape Lumiverse actually produced for this
+      // generation. Newly inserted widgets can still be inside chunk-fade
+      // spans / prose paragraphs even if the pre-pass was clean.
+      normalizeExistingWidgetContainers(findContentRoot(root));
+    } catch (err) {
+      console.debug('[vishrun] processNode render error:', err);
+    }
+    return total;
+  } finally {
+    inFlightMessages.delete(messageId);
+    // Fire any queued rescan now that the DOM has had time to settle.
+    // Use Promise.resolve() to yield one microtask tick so React can flush
+    // any remaining synchronous state updates before we re-enter.
+    const pending = pendingRescans.get(messageId);
+    if (pending) {
+      pendingRescans.delete(messageId);
+      void Promise.resolve().then(() => processNode(pending.root, pending.scripts, pending.ctx));
+    }
+  }
+}
+
+// ─── Macro resolution ──────────────────────────────────────────────────
+
+// Resolve this message's widget macros in one backend round-trip. Returns a map
+// keyed by the exact expanded HTML the render functions recompute, so their
+// `get(expanded) ?? expanded` lookup picks up the resolved version. Best-effort:
+// any failure (no macros, no chatId, timeout, error) → partial/empty map →
+// widgets render raw (pre-MVU-lite behaviour). Never throws.
+async function resolveMacrosForMessage(
+  root: HTMLElement,
+  scripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<ResolvedMap> {
+  const map: ResolvedMap = new Map();
+  // Fast out: if no script's replaceString has `{{` at all, no expanded HTML
+  // (even after nested expansion) can carry a macro — skip the whole pass.
+  if (!scripts.some((s) => s.replaceString.includes('{{'))) return map;
+  const templates = collectExpandedTemplates(root, scripts, messageId).filter(hasMacros);
+  if (templates.length === 0) return map;
+
+  const { chatId, characterId } = ctx.getActiveChat();
+  if (!chatId) {
+    console.warn('[vishrun:variables] no active chatId; widget macros left unresolved');
+    return map;
+  }
+
+  try {
+    const resolved = await resolveMacrosBatch(ctx, chatId, characterId, templates);
+    templates.forEach((t, i) => {
+      map.set(t, resolved[i]);
+      resolutionCache.set(t, resolved[i]); // global cache, survives across processNode passes
+    });
+  } catch (err) {
+    console.warn(
+      '[vishrun:variables] macro resolve failed; widgets render unresolved:',
+      err instanceof Error ? err.message : String(err),
+    );
+  }
+  return map;
+}
+
+// Read-only pass mirroring what the render functions would compute as the
+// per-widget expanded HTML, without touching the DOM. Recomputing the same
+// (deterministic) substitute()+applyNestedPipeline() there makes the map lookup
+// hit — unless the DOM changed under us, in which case that widget renders
+// unresolved (acceptable). Skips already-rendered paired captures so re-scans
+// don't re-resolve.
+function collectExpandedTemplates(
+  root: HTMLElement,
+  scripts: CompiledScript[],
+  messageId: string,
+): string[] {
+  const out = new Set<string>();
+
+  // Placeholder-like scripts (placeholder + delimitedCapture): scan text nodes
+  // outside existing widgets. After a render the matched text lives inside a
+  // [data-vishrun-widget], so re-scans collect nothing here and skip the round-trip.
+  const textNodes = collectTextNodes(root);
+  for (const script of scripts) {
+    if (!isPlaceholderLikeKind(script.kind)) continue;
+    if (script.kind === 'delimitedCaptureMultiLine') {
+      const bubble = findContentRoot(root);
+      const linear = getLinearizedBubble(bubble);
+      script.findRe.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = script.findRe.exec(linear.text)) !== null) {
+        const groups = m.slice(1).map((g) => g ?? '');
+        const html = substitute(script.replaceString, m[0], groups);
+        out.add(applyNestedPipeline(html, scripts, new Set([script.id]), 0));
+        if (m[0].length === 0) script.findRe.lastIndex++;
+      }
+      continue;
+    }
+    for (const tn of textNodes) {
+      const text = tn.nodeValue ?? '';
+      if (!text) continue;
+      script.findRe.lastIndex = 0;
+      let m: RegExpExecArray | null;
+      while ((m = script.findRe.exec(text)) !== null) {
+        const groups = m.slice(1).map((g) => g ?? '');
+        const html = substitute(script.replaceString, m[0], groups);
+        out.add(applyNestedPipeline(html, scripts, new Set([script.id]), 0));
+        if (m[0].length === 0) script.findRe.lastIndex++;
+      }
+    }
+  }
+
+  // Paired-tag captures: skip ones already on screen (matches the idempotency
+  // check in renderPairedTagCaptures) so re-scans don't re-resolve them.
+  const target = findContentRoot(root);
+  for (const cap of getCapturesForMessage(messageId)) {
+    const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
+    if (target.querySelector(sel)) continue;
+    cap.findRe.lastIndex = 0;
+    const m = cap.findRe.exec(cap.fullMatch);
+    if (!m) continue; // failed re-match renders raw text — no macros
+    const groups = m.slice(1).map((g) => g ?? '');
+    const html = substitute(cap.replaceString, m[0], groups);
+    out.add(applyNestedPipeline(html, scripts, new Set([cap.scriptId]), 0));
+  }
+
+  return [...out];
+}
+
+// ─── Multi-line placeholder pipeline ───────────────────────────────────
+//
+// `delimitedCaptureMultiLine` scripts use a single regex executed against the
+// linearized bubble (text + <br>→\n + <p>-gap→\n\n). When a match is found,
+// the corresponding DOM range is removed via the Range API and the widget is
+// inserted in its place. Matches are processed in reverse document order so
+// earlier offsets in the precomputed offsetMap remain valid after each splice.
+// Empty block ancestors that were drained by the deletion are pruned so we
+// don't leave stray empty <p> elements polluting the bubble.
+
+async function replaceMultiLineMatches(
+  root: HTMLElement,
+  script: CompiledScript,
+  allScripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+  resolvedMap: ResolvedMap,
+): Promise<number> {
+  const bubble = findContentRoot(root);
+  if (!bubble.isConnected) return 0;
+
+  const linear = getLinearizedBubble(bubble);
+  if (linear.text.length === 0) return 0;
+
+  script.findRe.lastIndex = 0;
+  const matches: Array<{ start: number; end: number; match: RegExpExecArray }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = script.findRe.exec(linear.text)) !== null) {
+    matches.push({ start: m.index, end: m.index + m[0].length, match: m });
+    if (m[0].length === 0) script.findRe.lastIndex++;
+  }
+  if (matches.length === 0) return 0;
+
+  if (hasRegisteredWidgetsFor(messageId, script.id)) {
+    destroyRegisteredWidgetsFor(messageId, script.id);
+  }
+
+  let count = 0;
+  for (let i = matches.length - 1; i >= 0; i--) {
+    const { start, end, match } = matches[i];
+    const groups = match.slice(1).map((g) => g ?? '');
+    const html = substitute(script.replaceString, match[0], groups);
+    const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
+    const fromMap = resolvedMap.get(expanded);
+    const fromCache = fromMap ?? resolutionCache.get(expanded);
+    const finalHtml = fromCache ?? expanded;
+
+    const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+    const placed = replaceLinearRange(bubble, linear.offsetMap, start, end, widget);
+    if (placed) {
+      count++;
+    } else {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: script.id, reason: 'replaceLinearRange-failed',
+        }));
+      }
+      if (widget.tagName === 'IFRAME') {
+        destroyWidgetIframe(widget as HTMLIFrameElement);
+      }
+    }
+  }
+
+  invalidateLinearizedBubble(bubble);
+  return count;
+}
+
+export function replaceLinearRange(
+  bubble: HTMLElement,
+  offsetMap: OffsetMapEntry[],
+  start: number,
+  end: number,
+  widget: HTMLElement,
+): boolean {
+  let startEntry: OffsetMapEntry | null = null;
+  let endEntry: OffsetMapEntry | null = null;
+  for (const e of offsetMap) {
+    if (!startEntry && e.sourceStart <= start && start < e.sourceEnd) startEntry = e;
+    if (e.sourceStart < end && end <= e.sourceEnd) endEntry = e;
+  }
+  if (!startEntry || !endEntry) return false;
+  if (!bubble.contains(startEntry.node) || !bubble.contains(endEntry.node)) return false;
+
+  const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
+  const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
+  let range: Range;
+  try {
+    range = document.createRange();
+    range.setStart(startEntry.node, startNodeOffset);
+    range.setEnd(endEntry.node, endNodeOffset);
+  } catch {
+    return false;
+  }
+  range.deleteContents();
+  range.insertNode(widget);
+  cleanupEmptyAroundWidget(widget, bubble);
+  return true;
+}
+
+const MULTILINE_BLOCK_TAGS = new Set([
+  'P', 'DIV', 'BLOCKQUOTE', 'PRE', 'UL', 'OL', 'LI',
+  'H1', 'H2', 'H3', 'H4', 'H5', 'H6',
+]);
+
+// Lumiverse temporarily wraps newly-rendered text in animation <span>s while
+// a generation is active. If Vishrun replaces that text with a block widget,
+// the widget can remain trapped inside the inline span (and often a parent <p>)
+// until React later remounts the message. That produces extra line-box / prose
+// spacing. Treat wrapper-only spans as transparent, then apply the existing
+// block-wrapper cleanup. Do not depend on Lumiverse's CSS-module class name: it
+// is hashed and may change between builds.
+const TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(['SPAN']);
+const EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
+
+function normalizeExistingWidgetContainers(target: HTMLElement): void {
+  // Static snapshot is intentional: unwrapping a later widget may also hoist
+  // an earlier sibling, but every still-connected widget gets one cleanup pass.
+  const widgets = Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-widget]'));
+  for (const widget of widgets) {
+    if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
+  }
+}
+
+function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
+  let current: Element = widget;
+  for (;;) {
+    const parent = current.parentElement;
+    if (!parent) break;
+
+    // Strip whitespace / BR residue immediately adjacent to the widget first.
+    // This lets a paragraph containing multiple adjacent Vishrun widgets become
+    // wrapper-only after each widget's temporary span has been removed.
+    let prev = current.previousSibling;
+    while (prev) {
+      const next = prev.previousSibling;
+      if (isEmptyResidue(prev)) prev.parentNode?.removeChild(prev);
+      else break;
+      prev = next;
+    }
+    let nxt = current.nextSibling;
+    while (nxt) {
+      const next = nxt.nextSibling;
+      if (isEmptyResidue(nxt)) nxt.parentNode?.removeChild(nxt);
+      else break;
+      nxt = next;
+    }
+
+    if (parent === stopAt) break;
+
+    const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
+    const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
+    if ((transparentInline || knownBlock) && containsOnlyWidgetsAndResidue(parent)) {
+      const grandparent = parent.parentNode;
+      if (!grandparent) break;
+
+      // Hoist every Vishrun widget in document order and discard only residue.
+      // Using nodeType/tagName rather than instanceof keeps this safe even when
+      // the host DOM and an extension sandbox come from different JS realms.
+      while (parent.firstChild) {
+        const child = parent.firstChild;
+        if (isEmptyResidue(child)) {
+          parent.removeChild(child);
+        } else {
+          grandparent.insertBefore(child, parent);
+        }
+      }
+      grandparent.removeChild(parent);
+      continue;
+    }
+
+    break;
+  }
+}
+
+function containsOnlyWidgetsAndResidue(container: Element): boolean {
+  return Array.from(container.childNodes).every((node) =>
+    isWidgetNode(node) || isEmptyResidue(node),
+  );
+}
+
+function isWidgetNode(node: Node): boolean {
+  return node.nodeType === Node.ELEMENT_NODE
+    && (node as Element).hasAttribute('data-vishrun-widget');
+}
+
+function isEmptyResidue(node: Node): boolean {
+  if (node.nodeType === Node.TEXT_NODE) {
+    return !(node.nodeValue ?? '').replace(EMPTY_RESIDUE_RE, '');
+  }
+  if (node.nodeType === Node.ELEMENT_NODE) {
+    const el = node as HTMLElement;
+    if (el.tagName === 'BR') return true;
+    if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
+    return !(el.textContent ?? '').replace(EMPTY_RESIDUE_RE, '');
+  }
+  return false;
+}
+
+// ─── Placeholder pipeline ──────────────────────────────────────────────
+
+async function replacePlaceholderMatches(
+  root: HTMLElement,
+  script: CompiledScript,
+  allScripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+  resolvedMap: ResolvedMap,
+): Promise<number> {
+  const textNodes = collectTextNodes(root);
+  let count = 0;
+
+  // Phase 1 (placeholder): if there's at least one fresh placeholder
+  // match in the current text AND we have iframes already registered
+  // for (messageId, scriptId), the pair is a duplication smell. The
+  // existing registered widgets came from a prior render, and the
+  // fresh-text scan that follows would create new widgets next to them
+  // — that's exactly the swipe-duplication bug.
+  //
+  // Two-stage check (not unconditional destroy) keeps streaming cheap:
+  // every observer fire during streaming runs collectTextNodes excluding
+  // text inside [data-vishrun-widget], so an already-mounted widget's
+  // placeholder text isn't re-detected — no fresh match, no destroy,
+  // no churn. The destroy path only triggers when React actually re-
+  // emits the placeholder text, which is the swipe / edit case.
+  let hasFreshMatch = false;
+  for (const tn of textNodes) {
+    const text = tn.nodeValue ?? '';
+    if (!text) continue;
+    script.findRe.lastIndex = 0;
+    if (script.findRe.test(text)) {
+      hasFreshMatch = true;
+      break;
+    }
+  }
+  if (hasFreshMatch && hasRegisteredWidgetsFor(messageId, script.id)) {
+    destroyRegisteredWidgetsFor(messageId, script.id);
+  }
+
+  for (const tn of textNodes) {
+    const text = tn.nodeValue ?? '';
+    if (!text) continue;
+
+    script.findRe.lastIndex = 0;
+    const ranges: { start: number; end: number; match: RegExpExecArray }[] = [];
+    let m: RegExpExecArray | null;
+    while ((m = script.findRe.exec(text)) !== null) {
+      ranges.push({ start: m.index, end: m.index + m[0].length, match: m });
+      if (m[0].length === 0) script.findRe.lastIndex++;
+    }
+    if (ranges.length === 0) continue;
+
+    const parent = tn.parentNode;
+    // Stale text node: a React subtree rebuild during an earlier iteration's
+    // await detached `tn` (or its parent). Skip — a later scan re-collects.
+    if (!parent || !parent.isConnected) {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: script.id, reason: 'parent-disconnected-pre-build',
+        }));
+      }
+      continue;
+    }
+
+    const frag = document.createDocumentFragment();
+    const insertedWidgets: HTMLElement[] = [];
+    let cursor = 0;
+    for (const { start, end, match } of ranges) {
+      if (start > cursor) {
+        frag.appendChild(document.createTextNode(text.slice(cursor, start)));
+      }
+      // Placeholders typically have no captures, but a future card could
+      // introduce them via (?:...) or (...). Pass match[1..] regardless;
+      // substitute() handles the no-groups case fine.
+      const groups = match.slice(1).map((g) => g ?? '');
+      const html = substitute(script.replaceString, match[0], groups);
+      // Recursively substitute any nested tags this card's other scripts
+      // match before the HTML goes into a widget (one iframe, whole tree).
+      const expanded = applyNestedPipeline(html, allScripts, new Set([script.id]), 0);
+      // Macro-resolved HTML: the current run's map first, then the global
+      // resolutionCache (survives across processNode passes — see its comment),
+      // then the raw template as last resort.
+      const fromMap = resolvedMap.get(expanded);
+      const fromCache = fromMap ?? resolutionCache.get(expanded);
+      const finalHtml = fromCache ?? expanded;
+      // await: buildWidget → buildWidgetIframe → injectShimsAndSizeReporter
+      // may fetch the Tailwind bundle (cached after the first use).
+      const widget = await buildWidget(finalHtml, script.scriptName, script.id, messageId, ctx);
+      frag.appendChild(widget);
+      insertedWidgets.push(widget);
+      cursor = end;
+      count++;
+    }
+    if (cursor < text.length) {
+      frag.appendChild(document.createTextNode(text.slice(cursor)));
+    }
+    // Re-validate: `replaceChild` requires `tn` to still be a child of
+    // `parent`. If a React rebuild displaced it while we awaited a fetch,
+    // drop the fragment and release any host sandbox-frame records its
+    // iframes hold (else they leak until extension teardown). Next scan
+    // re-renders into the fresh DOM.
+    if (tn.parentNode === parent && parent.isConnected) {
+      parent.replaceChild(frag, tn);
+
+      // Lumiverse markdown commonly wraps a standalone regex marker in <p>.
+      // If we leave the replacement iframe/div inside that paragraph, the
+      // host `.prose p` margins stack on top of the widget's own spacing.
+      // JS Slash Runner replaces the rendered code block itself, so it does
+      // not inherit those paragraph margins. Hoist widget-only paragraphs to
+      // the MessageContent level to make both hosts lay out the same.
+      const stopAt = findContentRoot(root);
+      for (const widget of insertedWidgets) {
+        if (widget.isConnected) cleanupEmptyAroundWidget(widget, stopAt);
+      }
+    } else {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: script.id, reason: 'parent-displaced-post-await',
+        }));
+      }
+      frag.querySelectorAll('iframe[data-vishrun-widget]').forEach((el) =>
+        destroyWidgetIframe(el as HTMLIFrameElement),
+      );
+      count -= ranges.length;
+    }
+  }
+
+  return count;
+}
+
+// ─── Paired-tag pipeline ───────────────────────────────────────────────
+
+async function renderPairedTagCaptures(
+  root: HTMLElement,
+  allScripts: CompiledScript[],
+  messageId: string,
+  ctx: SpindleFrontendContext,
+  resolvedMap: ResolvedMap,
+): Promise<number> {
+  const captures = getCapturesForMessage(messageId);
+  const target = findContentRoot(root);
+  let added = 0;
+  let removed = 0;
+
+  // Phase 1 (cleanup): drop paired-tag widgets in this message that no
+  // longer match any current capture. Greeting switch / edit / regen
+  // depend on this — `onCapture` evicts the prior capture for a
+  // (messageId, scriptId) when a new fullMatch arrives, and this loop
+  // removes the matching stale widget. Filter on data-vishrun-paired-
+  // fullmatch presence so we don't touch placeholder widgets — those
+  // live inside the React-owned markdown subtree and React handles
+  // unmount on content change.
+  const existingPaired = target.querySelectorAll<HTMLElement>(
+    '[data-vishrun-widget][data-vishrun-paired-fullmatch]',
+  );
+  existingPaired.forEach((el) => {
+    const sid = el.getAttribute('data-vishrun-script-id');
+    const fmHash = el.getAttribute('data-vishrun-paired-fullmatch');
+    const stillValid = captures.some(
+      (c) => c.scriptId === sid && hashKey(c.fullMatch) === fmHash,
+    );
+    if (!stillValid) {
+      // destroyWidgetIframe releases the host's sandboxFrames record AND
+      // removes the element. Plain el.remove() would leak the record
+      // until extension teardown.
+      if (el.tagName === 'IFRAME') {
+        destroyWidgetIframe(el as HTMLIFrameElement);
+      } else {
+        el.remove();
+      }
+      removed++;
+    }
+  });
+
+  // Phase 2 (inject): for each capture without a matching widget in the
+  // DOM, build and insert. The querySelector at the top of the loop is
+  // the within-scan idempotency check (a capture iterated twice in one
+  // scan doesn't double-insert).
+  for (const cap of captures) {
+    const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
+    if (target.querySelector(sel)) continue;
+
+    // Re-run findRe on fullMatch to recover the real capture groups.
+    // payload.content (which the interceptor delivers) is a single inner
+    // string and would only populate $1 — leaving $2..$N literal for cards
+    // whose findRegex defines multiple groups.
+    cap.findRe.lastIndex = 0;
+    const m = cap.findRe.exec(cap.fullMatch);
+    if (!m) {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: cap.scriptId, reason: 'paired-findRe-failed-rematch',
+        }));
+      }
+      // Card's regex doesn't match its own fullMatch. Should be rare —
+      // the tag interceptor already confirmed the tag is present — but a
+      // mis-authored findRegex (extra anchors, lookarounds that miss) can
+      // land here. Render the raw text inside a marked wrapper so:
+      //  - ctx.dom.cleanup() removes it on teardown (vs orphan text node).
+      //  - The idempotency selector at the top of this loop matches it
+      //    next scan, so we don't re-append on every observer fire.
+      //  - data-vishrun-widget-failed lets us spot mis-authored cards.
+      console.debug(`[vishrun] paired-tag findRegex failed to re-match fullMatch for "${cap.scriptName}" — rendering raw text`);
+      const failed = ctx.dom.createElement('span', {
+        'data-vishrun-widget': cap.scriptName,
+        'data-vishrun-widget-failed': cap.scriptName,
+        'data-vishrun-script-id': cap.scriptId,
+      }) as HTMLElement;
+      failed.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
+      failed.textContent = cap.fullMatch;
+      if (target.isConnected) {
+        target.appendChild(failed);
+        added++;
+      }
+      continue;
+    }
+    const groups = m.slice(1).map((g) => g ?? '');
+    const html = substitute(cap.replaceString, m[0], groups);
+    // Recursively substitute nested tags (Satoru Bottom2's <role_npc> blocks)
+    // before the HTML goes into the iframe — one frame, whole nested tree.
+    const expanded = applyNestedPipeline(html, allScripts, new Set([cap.scriptId]), 0);
+    // Macro-resolved HTML: current run's map → global resolutionCache → raw.
+    const fromMap = resolvedMap.get(expanded);
+    const fromCache = fromMap ?? resolutionCache.get(expanded);
+    const finalHtml = fromCache ?? expanded;
+    // Paired-tag widgets always go through the iframe path (some cards
+    // ship <script>). await: buildWidgetIframe may fetch the Tailwind
+    // bundle on first use (cached thereafter).
+    const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
+    iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
+    // Re-validate after the await: another scan may have inserted this
+    // capture's widget, or a React rebuild may have detached `target`. In
+    // either case drop the just-built iframe (releasing its host record) and
+    // skip — a later scan re-renders into the current DOM.
+    if (!target.isConnected || target.querySelector(sel)) {
+      if (VSH_VISHRUN_DIAG) {
+        console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
+          messageId, scriptId: cap.scriptId,
+          reason: !target.isConnected ? 'target-disconnected-post-await' : 'sibling-mounted-during-await',
+        }));
+      }
+      destroyWidgetIframe(iframe);
+      continue;
+    }
+    target.appendChild(iframe);
+    added++;
+  }
+
+  return added;
+}
+
+function findContentRoot(messageNode: HTMLElement): HTMLElement {
+  // Prefer MessageContent's own div — keeps widgets visually inside the
+  // bubble, alongside the rendered markdown.
+  const inner = messageNode.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
+  return inner ?? messageNode;
+}
+
+// ─── Shared helpers ────────────────────────────────────────────────────
+
+async function buildWidget(
+  html: string,
+  scriptName: string,
+  scriptId: string,
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<HTMLElement> {
+  if (widgetNeedsIsolation(html)) {
+    return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
+  }
+  const wrapper = ctx.dom.createElement('div', {
+    'data-vishrun-widget': scriptName,
+    'data-vishrun-script-id': scriptId,
+  }) as HTMLElement;
+  // Match JS Slash Runner: the widget owns its own internal spacing.
+  wrapper.style.margin = '0';
+  wrapper.style.display = 'block';
+  wrapper.style.width = '100%';
+  wrapper.innerHTML = html;
+  return wrapper;
+}
+
+function collectTextNodes(root: HTMLElement): Text[] {
+  const out: Text[] = [];
+  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      let p = node.parentElement;
+      while (p && p !== root) {
+        if (p.hasAttribute('data-vishrun-widget')) return NodeFilter.FILTER_REJECT;
+        p = p.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+  let n: Node | null;
+  while ((n = walker.nextNode()) !== null) {
+    out.push(n as Text);
+  }
+  return out;
+}
+
+function cssEscape(s: string): string {
+  return typeof CSS !== 'undefined' && typeof CSS.escape === 'function'
+    ? CSS.escape(s)
+    : s.replace(/["\\]/g, '\\$&');
+}
+
+/**
+ * Compress an arbitrary fullMatch string into a short stable token usable
+ * inside an attribute selector. djb2 hash → base36; collisions don't
+ * matter for the (scriptId, fullMatch) idempotency check because the
+ * scriptId already disambiguates per-script, and within a single script
+ * collisions on inner content of paired tags are vanishingly unlikely.
+ */
+function hashKey(s: string): string {
+  let h = 5381;
+  for (let i = 0; i < s.length; i++) {
+    h = ((h << 5) + h + s.charCodeAt(i)) | 0;
+  }
+  return (h >>> 0).toString(36);
+          }
