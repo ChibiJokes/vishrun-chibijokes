@@ -95,9 +95,9 @@ function maskInvalidMacros(template, deferNames = new Set) {
     const nameMatch = match.match(/^\{\{\s*([A-Za-z_@$][\w@$]*)/);
     const name = nameMatch ? nameMatch[1].toLowerCase() : "";
     if (deferNames.has(name)) {
-      const idx2 = masks.length;
+      const idx = masks.length;
       masks.push(match);
-      return `${NUL}VSHMSK${idx2}${NUL}`;
+      return `${NUL}VSHMSK${idx}${NUL}`;
     }
     if (VALID_MACRO_RE.test(match))
       return match;
@@ -485,10 +485,10 @@ function installPreGenerationBridgeHandler() {
       return;
     }
     if (isWorldInfoRequestMessage(payload)) {
-      const pending2 = pendingRequests.get(payload.requestId);
-      if (!pending2 || pending2.userId !== userId)
+      const pending = pendingRequests.get(payload.requestId);
+      if (!pending || pending.userId !== userId)
         return;
-      sendWorldInfoBodies(payload.requestId, userId, pending2);
+      sendWorldInfoBodies(payload.requestId, userId, pending);
       return;
     }
     if (!isCompleteMessage(payload))
@@ -513,12 +513,12 @@ async function waitForPreGeneration(context) {
   const requestId = crypto.randomUUID();
   await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      const pending2 = clearPending(requestId);
-      if (!pending2)
+      const pending = clearPending(requestId);
+      if (!pending)
         return;
       api.sendToFrontend({ type: "vsh_pre_generation_cancel", requestId }, userId);
       console.warn(LOG_PREFIX, `frontend handler timed out after ${PRE_GENERATION_TIMEOUT_MS}ms`);
-      pending2.resolve();
+      pending.resolve();
     }, PRE_GENERATION_TIMEOUT_MS);
     const pending = {
       userId,
@@ -1152,8 +1152,8 @@ var InitvarYamlRecognizer = {
 var LodashSetRecognizer = {
   name: "lodash-set",
   extract(block, ctx) {
-    const calls = parseLodashSetCalls(block, (snippet2, reason) => {
-      ctx?.onDiagnostic?.("unknown-command", { snippet: snippet2, reason });
+    const calls = parseLodashSetCalls(block, (snippet, reason) => {
+      ctx?.onDiagnostic?.("unknown-command", { snippet, reason });
     });
     return calls.map((c) => ({
       kind: "set_path",
@@ -1576,12 +1576,12 @@ async function requestFrontendProcessing(context, message) {
   const requestId = crypto.randomUUID();
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
-      const pending2 = clearPending2(requestId);
-      if (!pending2)
+      const pending = clearPending2(requestId);
+      if (!pending)
         return;
       api.sendToFrontend({ type: "vsh_user_message_cancel", requestId }, userId);
       console.warn(LOG_PREFIX3, `frontend handler timed out after ${FRONTEND_TIMEOUT_MS}ms; using original message`);
-      pending2.resolve(null);
+      pending.resolve(null);
     }, FRONTEND_TIMEOUT_MS);
     const pending = {
       userId,

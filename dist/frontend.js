@@ -2945,12 +2945,12 @@ var MULTILINE_BLOCK_TAGS = new Set([
   "H6"
 ]);
 function cleanupEmptyAroundWidget(widget, stopAt) {
-  let current2 = widget;
+  let current = widget;
   for (;; ) {
-    const parent = current2.parentElement;
+    const parent = current.parentElement;
     if (!parent)
       break;
-    let prev = current2.previousSibling;
+    let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
       if (isEmptyResidue(prev))
@@ -2959,7 +2959,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
         break;
       prev = next;
     }
-    let nxt = current2.nextSibling;
+    let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
       if (isEmptyResidue(nxt))
@@ -2970,12 +2970,12 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     }
     if (parent === stopAt)
       break;
-    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current2;
+    const onlyChild = parent.childNodes.length === 1 && parent.childNodes[0] === current;
     if (onlyChild && MULTILINE_BLOCK_TAGS.has(parent.tagName)) {
       const gparent = parent.parentNode;
       if (!gparent)
         break;
-      gparent.replaceChild(current2, parent);
+      gparent.replaceChild(current, parent);
       continue;
     }
     break;
@@ -3700,12 +3700,12 @@ class ScriptStorageClient {
   }
   async saveCharacter(characterId, scripts) {
     const url = `${BASE}/characters/${encodeURIComponent(characterId)}`;
-    const current2 = await getJson(url);
-    if (!current2) {
+    const current = await getJson(url);
+    if (!current) {
       console.error("[vishrun] saveCharacter: GET returned null for", characterId, "— aborting write to prevent data loss");
       throw new Error("saveCharacter: failed to read character before write, aborting to prevent data loss");
     }
-    const existing = current2.extensions ?? {};
+    const existing = current.extensions ?? {};
     const existingTh = existing.tavern_helper ?? {};
     const merged = {
       ...existing,
@@ -4401,13 +4401,13 @@ function createScriptsPanel(root, ctx, onScriptsSaved, onReloadScript) {
     const panelSettings = document.createElement("div");
     panelSettings.className = "vsh-editor-tabpanel";
     panelSettings.hidden = true;
-    const switchTab = (active, panel2) => {
+    const switchTab = (active, panel) => {
       [tabCode, tabData, tabSettings].forEach((t) => t.classList.remove("vsh-tab-active"));
       [panelCode, panelData, panelSettings].forEach((p) => {
         p.hidden = true;
       });
       active.classList.add("vsh-tab-active");
-      panel2.hidden = false;
+      panel.hidden = false;
     };
     tabCode.addEventListener("click", () => switchTab(tabCode, panelCode));
     tabData.addEventListener("click", () => switchTab(tabData, panelData));
@@ -5300,26 +5300,26 @@ function setup(ctx) {
         return;
       }
       const timer = setTimeout(() => {
-        const pending2 = pendingGenerates.get(requestId);
-        if (!pending2)
+        const pending = pendingGenerates.get(requestId);
+        if (!pending)
           return;
         pendingGenerates.delete(requestId);
-        if (pending2.signal && pending2.abortHandler)
-          pending2.signal.removeEventListener("abort", pending2.abortHandler);
+        if (pending.signal && pending.abortHandler)
+          pending.signal.removeEventListener("abort", pending.abortHandler);
         ctx.sendToBackend({ type: "vsh_generate_cancel", requestId });
-        pending2.reject(new Error("Generation timed out"));
+        pending.reject(new Error("Generation timed out"));
       }, 120000);
       const pending = { resolve, reject, timer, signal };
       if (signal) {
         pending.abortHandler = () => {
-          const active2 = pendingGenerates.get(requestId);
-          if (!active2)
+          const active = pendingGenerates.get(requestId);
+          if (!active)
             return;
           pendingGenerates.delete(requestId);
-          clearTimeout(active2.timer);
+          clearTimeout(active.timer);
           signal.removeEventListener("abort", pending.abortHandler);
           ctx.sendToBackend({ type: "vsh_generate_cancel", requestId });
-          active2.reject(new DOMException("Generation aborted", "AbortError"));
+          active.reject(new DOMException("Generation aborted", "AbortError"));
         };
         signal.addEventListener("abort", pending.abortHandler, { once: true });
       }
@@ -5329,10 +5329,10 @@ function setup(ctx) {
   };
   const runner = new ScriptRunner(ctx);
   async function reloadRunner() {
-    const active2 = ctx.getActiveChat();
+    const active = ctx.getActiveChat();
     const presetId = await getActiveLoomPresetId();
-    const enabledScripts = await loadEnabledScripts(active2.characterId ?? null, presetId);
-    await runner.run(enabledScripts, active2.chatId ?? null);
+    const enabledScripts = await loadEnabledScripts(active.characterId ?? null, presetId);
+    await runner.run(enabledScripts, active.chatId ?? null);
   }
   const settingsMount = ctx.ui.mount("settings_extensions");
   const onReloadScript = (scriptId) => {
@@ -5417,8 +5417,8 @@ function setup(ctx) {
     const msg = p.message;
     if (!msg || typeof msg.id !== "string" || typeof msg.content !== "string")
       return;
-    const active2 = ctx.getActiveChat();
-    if (active2.chatId && p.chatId && active2.chatId !== p.chatId)
+    const active = ctx.getActiveChat();
+    if (active.chatId && p.chatId && active.chatId !== p.chatId)
       return;
     const destroyReason = eventName === "MESSAGE_EDITED" ? "message-edited" : "message-swiped";
     destroyAllRegisteredWidgetsForMessage(msg.id, destroyReason);
@@ -5450,13 +5450,13 @@ function setup(ctx) {
         await new Promise((resolve) => setTimeout(resolve, POLL_MS));
         if (cancelled)
           return;
-        const active2 = ctx.getActiveChat();
-        if (active2.chatId !== expectedChatId)
+        const active = ctx.getActiveChat();
+        if (active.chatId !== expectedChatId)
           return;
-        if (active2.characterId) {
+        if (active.characterId) {
           cancelPendingNavLoad = null;
-          console.log("[vishrun:diag] deferred loadFor resolved, characterId:", active2.characterId);
-          loadFor(active2.characterId);
+          console.log("[vishrun:diag] deferred loadFor resolved, characterId:", active.characterId);
+          loadFor(active.characterId);
           return;
         }
       }
@@ -5490,9 +5490,9 @@ function setup(ctx) {
         if (newPresetId !== lastPresetId) {
           lastPresetId = newPresetId;
           scriptsPanel?.onPresetChanged(newPresetId);
-          const active2 = ctx.getActiveChat();
-          const enabledScripts = await loadEnabledScripts(active2.characterId ?? null, newPresetId);
-          await runner.run(enabledScripts, active2.chatId ?? null);
+          const active = ctx.getActiveChat();
+          const enabledScripts = await loadEnabledScripts(active.characterId ?? null, newPresetId);
+          await runner.run(enabledScripts, active.chatId ?? null);
         }
       })();
     }
