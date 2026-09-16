@@ -3642,13 +3642,6 @@ function isSelfMutation(record) {
   }
   return false;
 }
-function allSelf(records) {
-  for (let i = 0;i < records.length; i++) {
-    if (!isSelfMutation(records[i]))
-      return false;
-  }
-  return true;
-}
 
 // src/hooks/message-rendered.ts
 var MAX_RAF_RETRIES = 3;
@@ -3660,10 +3653,10 @@ function installMessageHooks(ctx) {
   let pendingRecords = [];
   let bodyWatcher = null;
   let latestMessageId = null;
+  const waitingForReadyIds = new Set;
   const OBSERVE_OPTS = {
     childList: true,
     subtree: true,
-    characterData: true,
     attributes: true,
     attributeFilter: ["data-display-pending"]
   };
@@ -3691,11 +3684,13 @@ function installMessageHooks(ctx) {
     if (node) {
       const messageContent = node.querySelector('[data-component="MessageContent"]');
       if (!messageContent || messageContent.getAttribute("data-display-pending") === "true") {
+        waitingForReadyIds.add(messageId);
         if (retriesLeft > 0) {
           requestAnimationFrame(() => processMessageById(messageId, retriesLeft - 1));
         }
         return;
       }
+      waitingForReadyIds.delete(messageId);
       const allNodes = Array.from(document.querySelectorAll("[data-message-id]"));
       const nodeIndex = allNodes.indexOf(node);
       if (nodeIndex === -1)
@@ -3724,19 +3719,28 @@ function installMessageHooks(ctx) {
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving)
       observer.disconnect();
+    let observerReattached = false;
+    let latestPendingId = null;
     try {
       const nodes = Array.from(document.querySelectorAll("[data-message-id]"));
       const total = nodes.length;
       const tasks = [];
       nodes.forEach((n, i) => {
-        const messageContent = n.querySelector('[data-component="MessageContent"]');
-        if (messageContent?.getAttribute("data-display-pending") === "true")
-          return;
-        const depthFromLatest = total - 1 - i;
         const nodeMessageId = n.getAttribute("data-message-id");
+        if (!nodeMessageId)
+          return;
+        const messageContent = n.querySelector('[data-component="MessageContent"]');
+        const isDomLatest = i === total - 1;
+        const isPending = !messageContent || messageContent.getAttribute("data-display-pending") === "true";
+        if (isDomLatest && isPending) {
+          waitingForReadyIds.add(nodeMessageId);
+          latestPendingId = nodeMessageId;
+          return;
+        }
+        const depthFromLatest = total - 1 - i;
         const scriptsForMessage = compiled.filter((s) => {
           if (s.maxDepth === 0 && s.minDepth === 0) {
-            return nodeMessageId !== null && nodeMessageId === latestMessageId;
+            return nodeMessageId === latestMessageId;
           }
           if (s.maxDepth !== null && depthFromLatest > s.maxDepth)
             return false;
@@ -3748,12 +3752,116 @@ function installMessageHooks(ctx) {
           return;
         tasks.push(processNode(n, scriptsForMessage, ctx).catch(() => {}));
       });
+      if (wasObserving && observedTarget && document.contains(observedTarget)) {
+        observer.observe(observedTarget, OBSERVE_OPTS);
+        observerReattached = true;
+      }
+      if (latestPendingId) {
+        const latest = document.querySelector(buildMessageSelector(latestPendingId));
+        const content = latest?.querySelector('[data-component="MessageContent"]');
+        if (content && content.getAttribute("data-display-pending") !== "true") {
+          waitingForReadyIds.delete(latestPendingId);
+          processMessageIdsNow(new Set([latestPendingId]), compiled);
+        }
+      }
       await Promise.all(tasks);
     } finally {
-      if (wasObserving && observedTarget && document.contains(observedTarget)) {
+      if (wasObserving && !observerReattached && observedTarget && document.contains(observedTarget)) {
         observer.observe(observedTarget, OBSERVE_OPTS);
       }
     }
+  }
+  function messageElementForNode(node) {
+    if (!node)
+      return null;
+    const el = node.nodeType === 1 ? node : node.parentElement;
+    if (!el)
+      return null;
+    if (el.matches?.("[data-message-id]"))
+      return el;
+    return el.closest?.("[data-message-id]");
+  }
+  function addMessageIdsFromNode(node, ids) {
+    if (!node || node.nodeType !== 1)
+      return;
+    const el = node;
+    const own = el.matches?.("[data-message-id]") ? el.getAttribute("data-message-id") : null;
+    if (own)
+      ids.add(own);
+    el.querySelectorAll?.("[data-message-id]").forEach((message) => {
+      const id = message.getAttribute("data-message-id");
+      if (id)
+        ids.add(id);
+    });
+  }
+  function collectTargetMessageIds(records) {
+    const ids = new Set;
+    for (const record of records) {
+      if (isSelfMutation(record))
+        continue;
+      if (record.type === "attributes") {
+        if (record.attributeName !== "data-display-pending")
+          continue;
+        const target = record.target;
+        if (target.getAttribute("data-display-pending") === "true")
+          continue;
+        const message = messageElementForNode(target);
+        const id = message?.getAttribute("data-message-id");
+        if (id && waitingForReadyIds.has(id)) {
+          waitingForReadyIds.delete(id);
+          ids.add(id);
+        }
+        continue;
+      }
+      if (record.type === "childList") {
+        const targetMessage = messageElementForNode(record.target);
+        const targetId = targetMessage?.getAttribute("data-message-id");
+        if (targetId)
+          ids.add(targetId);
+        record.addedNodes.forEach((node) => addMessageIdsFromNode(node, ids));
+      }
+    }
+    return ids;
+  }
+  async function processMessageIdsNow(messageIds, compiled) {
+    if (messageIds.size === 0)
+      return;
+    const nodes = Array.from(document.querySelectorAll("[data-message-id]"));
+    const total = nodes.length;
+    const indexById = new Map;
+    nodes.forEach((node, index) => {
+      const id = node.getAttribute("data-message-id");
+      if (id)
+        indexById.set(id, index);
+    });
+    const tasks = [];
+    for (const messageId of messageIds) {
+      const index = indexById.get(messageId);
+      if (index === undefined)
+        continue;
+      const node = nodes[index];
+      const messageContent = node.querySelector('[data-component="MessageContent"]');
+      if (!messageContent || messageContent.getAttribute("data-display-pending") === "true") {
+        waitingForReadyIds.add(messageId);
+        continue;
+      }
+      waitingForReadyIds.delete(messageId);
+      const depthFromLatest = total - 1 - index;
+      const scriptsForMessage = compiled.filter((s) => {
+        if (s.maxDepth === 0 && s.minDepth === 0) {
+          return messageId === latestMessageId;
+        }
+        if (s.maxDepth !== null && depthFromLatest > s.maxDepth)
+          return false;
+        if (s.minDepth !== null && depthFromLatest < s.minDepth)
+          return false;
+        return true;
+      });
+      if (scriptsForMessage.length === 0)
+        continue;
+      tasks.push(processNode(node, scriptsForMessage, ctx).catch(() => {}));
+    }
+    await Promise.all(tasks);
   }
   function handleMutations(records) {
     if (records.length > 0)
@@ -3769,9 +3877,10 @@ function installMessageHooks(ctx) {
         detachObserver();
         return;
       }
-      if (allSelf(batch))
+      const messageIds = collectTargetMessageIds(batch);
+      if (messageIds.size === 0)
         return;
-      scanAllNow(compiled);
+      processMessageIdsNow(messageIds, compiled);
     });
   }
   function attachObserver() {
@@ -3831,6 +3940,7 @@ function installMessageHooks(ctx) {
     bodyWatcher.observe(document.body, { childList: true, subtree: true });
   }
   function detachObserver() {
+    waitingForReadyIds.clear();
     if (pendingFrame) {
       cancelAnimationFrame(pendingFrame);
       pendingFrame = 0;
