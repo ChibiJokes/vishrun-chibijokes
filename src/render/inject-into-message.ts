@@ -238,6 +238,13 @@ export async function processNode(
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
+
+      // The pre-pass above cannot clean wrappers around widgets that did not
+      // exist yet. Normalize again AFTER every placeholder/paired-tag widget
+      // for this pass has been inserted. This is the critical generated-message
+      // path; edit/cancel previously fixed the layout only because it forced a
+      // later pass over already-mounted widgets.
+      if (target.isConnected) normalizeExistingWidgetContainers(target);
     } catch (err) {
       console.debug('[vishrun] processNode render error:', err);
     }
@@ -464,9 +471,66 @@ const MULTILINE_BLOCK_TAGS = new Set([
 ]);
 
 function normalizeExistingWidgetContainers(target: HTMLElement): void {
-  const widgets = Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-widget]'));
-  for (const widget of widgets) {
-    if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
+  // First let the existing per-widget cleanup peel single-widget wrappers.
+  // Then handle the case it cannot: one markdown block containing MULTIPLE
+  // Vishrun widgets separated only by whitespace / <br> residue. That shape is
+  // common when several regex markers are emitted on adjacent lines. A normal
+  // <p> wrapper contributes Lumiverse's prose margins even though it contains
+  // no real prose, which is the intermittent "huge gaps" layout bug.
+  let changed = true;
+  let passes = 0;
+  while (changed && passes++ < 8) {
+    changed = false;
+
+    const widgets = Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-widget]'));
+    for (const widget of widgets) {
+      if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
+    }
+
+    const wrappers = Array.from(
+      target.querySelectorAll<HTMLElement>('p,div,blockquote,pre,ul,ol,li,h1,h2,h3,h4,h5,h6'),
+    );
+
+    // Inner wrappers first so nested markdown shells collapse cleanly.
+    for (let i = wrappers.length - 1; i >= 0; i--) {
+      const wrapper = wrappers[i];
+      if (!wrapper.isConnected || wrapper === target) continue;
+      // Never rewrite HTML owned by a widget itself.
+      if (wrapper.closest('[data-vishrun-widget]')) continue;
+
+      const children = Array.from(wrapper.childNodes);
+      const widgetChildren: HTMLElement[] = [];
+      let widgetOnly = children.length > 0;
+
+      for (const child of children) {
+        if (isEmptyResidue(child)) continue;
+        if (
+          child.nodeType === Node.ELEMENT_NODE &&
+          (child as HTMLElement).hasAttribute('data-vishrun-widget')
+        ) {
+          widgetChildren.push(child as HTMLElement);
+          continue;
+        }
+        widgetOnly = false;
+        break;
+      }
+
+      if (!widgetOnly || widgetChildren.length === 0) continue;
+      const parent = wrapper.parentNode;
+      if (!parent) continue;
+
+      const frag = document.createDocumentFragment();
+      for (const child of children) {
+        if (
+          child.nodeType === Node.ELEMENT_NODE &&
+          (child as HTMLElement).hasAttribute('data-vishrun-widget')
+        ) {
+          frag.appendChild(child);
+        }
+      }
+      parent.replaceChild(frag, wrapper);
+      changed = true;
+    }
   }
 }
 
@@ -501,15 +565,24 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
   }
 }
 
+function isIgnorableText(value: string | null | undefined): boolean {
+  // Markdown/React commonly leaves newline, spaces, NBSP or zero-width text
+  // around a replaced marker. Treat those as layout residue, not real prose.
+  return String(value ?? '').replace(/[\s\u00A0\u200B-\u200D\uFEFF]/g, '').length === 0;
+}
+
 function isEmptyResidue(node: Node): boolean {
-  if (node.nodeType === Node.TEXT_NODE) {
-    return (node.nodeValue ?? '').length === 0;
+  if (node.nodeType === Node.TEXT_NODE || node.nodeType === Node.COMMENT_NODE) {
+    return isIgnorableText(node.nodeValue);
   }
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as HTMLElement;
     if (el.tagName === 'BR') return true;
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
-    return (el.textContent ?? '').length === 0;
+    // Be conservative: only discard a block when every descendant is itself
+    // ignorable residue. Never treat an image/real element as "empty" merely
+    // because textContent happens to be blank.
+    return Array.from(el.childNodes).every((child) => isEmptyResidue(child));
   }
   return false;
 }
