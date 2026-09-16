@@ -339,7 +339,15 @@ function chatVariableState(chatId, metadata) {
   return { chatId, variables, allVariables: { ...record(macro.global), ...record(macro.local), ...variables } };
 }
 var listeners = new WeakMap;
+var chatStateCache = new Map;
+var chatStateInflight = new Map;
+function cacheChatVariableState(state) {
+  if (state.chatId && state.ready !== false)
+    chatStateCache.set(state.chatId, state);
+  return state;
+}
 function publishChatVariableState(ctx, state) {
+  cacheChatVariableState(state);
   for (const listener of listeners.get(ctx) ?? []) {
     try {
       listener(state);
@@ -348,22 +356,38 @@ function publishChatVariableState(ctx, state) {
     }
   }
 }
-async function fetchChatVariableState(chatId) {
+function fetchChatVariableState(chatId, force = false) {
   if (!chatId)
-    return chatVariableState("", {});
-  try {
-    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
-      cache: "no-store",
-      credentials: "same-origin"
-    });
-    if (!response.ok)
-      throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
-    const chat = await response.json();
-    return chatVariableState(chatId, chat?.metadata);
-  } catch (err) {
-    console.warn("[vishrun:variables]", err);
-    return { ...chatVariableState(chatId, {}), ready: false };
+    return Promise.resolve(chatVariableState("", {}));
+  if (!force) {
+    const cached = chatStateCache.get(chatId);
+    if (cached)
+      return Promise.resolve(cached);
   }
+  const existing = chatStateInflight.get(chatId);
+  if (existing)
+    return existing;
+  const request = (async () => {
+    try {
+      const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
+        cache: "no-store",
+        credentials: "same-origin"
+      });
+      if (!response.ok)
+        throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
+      const chat = await response.json();
+      return cacheChatVariableState(chatVariableState(chatId, chat?.metadata));
+    } catch (err) {
+      console.warn("[vishrun:variables]", err);
+      return { ...chatVariableState(chatId, {}), ready: false };
+    }
+  })();
+  chatStateInflight.set(chatId, request);
+  request.finally(() => {
+    if (chatStateInflight.get(chatId) === request)
+      chatStateInflight.delete(chatId);
+  });
+  return request;
 }
 function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
   let state = initial;
@@ -385,14 +409,14 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
     if (next.chatId !== state.chatId)
       return;
     ++epoch;
-    state = next;
+    state = cacheChatVariableState(next);
     deliver();
   };
   const refresh = async () => {
     const currentEpoch = ++epoch;
     const chatId = state.chatId;
     try {
-      const next = await fetchChatVariableState(chatId);
+      const next = await fetchChatVariableState(chatId, true);
       if (!destroyed && next.ready !== false && currentEpoch === epoch && chatId === state.chatId)
         accept(next);
     } catch (err) {
@@ -420,9 +444,11 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
     const id = ctx.getActiveChat().chatId ?? "";
     if (id !== state.chatId) {
       ++epoch;
-      state = { ...chatVariableState(id, {}), ready: false };
+      const cached = id ? chatStateCache.get(id) : undefined;
+      state = cached ?? { ...chatVariableState(id, {}), ready: false };
       deliver();
-      refresh();
+      if (!cached)
+        refresh();
     }
   };
   const settings = ctx.events.on("SETTINGS_UPDATED", (data) => {
@@ -431,7 +457,8 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
   });
   const switched = ctx.events.on("CHAT_SWITCHED", switchChat);
   frame.element.addEventListener("load", deliver);
-  refresh();
+  if (initial.ready === false)
+    refresh();
   return () => {
     destroyed = true;
     ++epoch;
@@ -2045,7 +2072,8 @@ function resolveCurrentMessageIndex(messageId, snapshot, domIndex) {
 }
 async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   const detectedEnv = classifyWidgetEnvironment(html);
-  const env = !shouldInjectThHelpersShim(detectedEnv) && (containsScriptTag(html) || containsInlineEventHandler(html)) ? "tavern-helpers-light" : detectedEnv;
+  const promotedForDynamicApi = !shouldInjectThHelpersShim(detectedEnv) && (containsScriptTag(html) || containsInlineEventHandler(html));
+  const env = promotedForDynamicApi ? "tavern-helpers-light" : detectedEnv;
   const active = ctx.getActiveChat();
   const chatId = active.chatId ?? "";
   const domIndex = computeMessageIndexInChat(messageId);
@@ -2059,13 +2087,13 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     }));
   }
   const [messagesSnapshot, variablesSnapshot, chatState] = await Promise.all([
-    shouldInjectThHelpersShim(env) ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
+    shouldInjectThHelpersShim(env) && !promotedForDynamicApi ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
     shouldInjectMvuShim(env) ? fetchVariablesSnapshot(snapshotContext, ctx) : Promise.resolve({ stat_data: {} }),
     shouldInjectThHelpersShim(env) ? fetchChatVariableState(chatId) : Promise.resolve(undefined)
   ]);
   const resolved = resolveCurrentMessageIndex(messageId, messagesSnapshot, domIndex);
   const currentMessageIndex = resolved.index;
-  if (resolved.source === "dom-fallback" && VSH_VISHRUN_DIAG && shouldInjectThHelpersShim(env)) {
+  if (resolved.source === "dom-fallback" && VSH_VISHRUN_DIAG && shouldInjectThHelpersShim(env) && !promotedForDynamicApi) {
     console.log("[vishrun:bridge] currentMessageDbIndex-fallback", JSON.stringify({
       messageId,
       reason: "not-in-snapshot",
