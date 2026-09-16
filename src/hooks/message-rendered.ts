@@ -47,7 +47,7 @@ export interface MessageHooks {
  * Hook strategy (Step 1.5 / greeting-switch findings):
  *  - Lumiverse does NOT emit a "message rendered" event we can use:
  *    CHARACTER_MESSAGE_RENDERED is vestigial, and the greeting-switch path
- *    (PUT /api/v1/chats/:id/messages/:id) was observed to emit no WS frame
+ *    (PUT /api/v1/chats/:id/messages/:id) was observed to emit no WS frame.
  *    despite chats.service.ts:updateMessage being wired to fire
  *    MESSAGE_EDITED. Some upstream condition is bypassing the emit. So we
  *    can't depend on event-only signals for re-render coverage.
