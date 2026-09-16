@@ -75,10 +75,53 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   // Used to anchor depth-0 scripts to a stable identity rather than
   // a DOM position that shifts as Lumi loads/unloads messages on scroll.
   let latestMessageId: string | null = null;
-  // Only newly generated messages use Lumiverse's display-readiness signal.
-  // Historical messages keep the original fast path and never wait on it.
-  const generatedReadyWatchers = new Map<string, MutationObserver>();
+  const newestPendingObservers = new Map<string, MutationObserver>();
   const OBSERVE_OPTS: MutationObserverInit = { childList: true, subtree: true, characterData: true };
+
+  function processNewestWhenDisplayReady(
+    messageId: string,
+    retriesLeft: number = MAX_RAF_RETRIES,
+  ): void {
+    const sel = buildMessageSelector(messageId);
+    const node = document.querySelector(sel) as HTMLElement | null;
+
+    if (!node) {
+      if (retriesLeft > 0) {
+        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
+      }
+      return;
+    }
+
+    const content = node.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
+    if (!content) {
+      if (retriesLeft > 0) {
+        requestAnimationFrame(() => processNewestWhenDisplayReady(messageId, retriesLeft - 1));
+      }
+      return;
+    }
+
+    // Historical/chat-load scans never come through here. This gate is ONLY
+    // for the just-finished newest generation.
+    if (content.getAttribute('data-display-pending') !== 'true') {
+      processMessageById(messageId, MAX_RAF_RETRIES);
+      return;
+    }
+
+    newestPendingObservers.get(messageId)?.disconnect();
+
+    const readyObserver = new MutationObserver(() => {
+      if (content.getAttribute('data-display-pending') === 'true') return;
+      readyObserver.disconnect();
+      newestPendingObservers.delete(messageId);
+      processMessageById(messageId, MAX_RAF_RETRIES);
+    });
+
+    newestPendingObservers.set(messageId, readyObserver);
+    readyObserver.observe(content, {
+      attributes: true,
+      attributeFilter: ['data-display-pending'],
+    });
+  }
 
   function compiledForActiveCard(): CompiledScript[] | null {
     const card = getActiveCard();
@@ -92,58 +135,6 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
     const active = ctx.getActiveChat().chatId;
     if (!active) return true;
     return active === chatId;
-  }
-
-  function clearGeneratedReadyWatcher(messageId: string): void {
-    const watcher = generatedReadyWatchers.get(messageId);
-    if (!watcher) return;
-    watcher.disconnect();
-    generatedReadyWatchers.delete(messageId);
-  }
-
-  function processGeneratedMessageWhenReady(
-    messageId: string,
-    retriesLeft: number = MAX_RAF_RETRIES,
-  ): void {
-    const node = document.querySelector(buildMessageSelector(messageId)) as HTMLElement | null;
-    if (!node) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processGeneratedMessageWhenReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-
-    const messageContent = node.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-    if (!messageContent) {
-      if (retriesLeft > 0) {
-        requestAnimationFrame(() => processGeneratedMessageWhenReady(messageId, retriesLeft - 1));
-      }
-      return;
-    }
-
-    if (messageContent.getAttribute('data-display-pending') !== 'true') {
-      clearGeneratedReadyWatcher(messageId);
-      processMessageById(messageId, 0);
-      return;
-    }
-
-    if (generatedReadyWatchers.has(messageId)) return;
-
-    const watcher = new MutationObserver(() => {
-      const currentNode = document.querySelector(buildMessageSelector(messageId)) as HTMLElement | null;
-      const currentContent = currentNode?.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
-      if (!currentContent || currentContent.getAttribute('data-display-pending') === 'true') return;
-      clearGeneratedReadyWatcher(messageId);
-      processMessageById(messageId, 0);
-    });
-
-    watcher.observe(node, {
-      childList: true,
-      subtree: true,
-      attributes: true,
-      attributeFilter: ['data-display-pending'],
-    });
-    generatedReadyWatchers.set(messageId, watcher);
   }
 
 function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
@@ -325,8 +316,6 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       observer = null;
       observedTarget = null;
     }
-    generatedReadyWatchers.forEach((watcher) => watcher.disconnect());
-    generatedReadyWatchers.clear();
   }
 
   function rescanAll(): void {
@@ -368,10 +357,7 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     if (!isActiveChat(p.chatId)) return;
     if (!p.messageId) return;
     latestMessageId = p.messageId;
-
-    // Only the newly generated row waits for Lumiverse to finish its own
-    // display preprocessing. Existing/history messages never enter this path.
-    processGeneratedMessageWhenReady(p.messageId, MAX_RAF_RETRIES);
+    processNewestWhenDisplayReady(p.messageId, MAX_RAF_RETRIES);
   });
 
   const unsubChatChanged = ctx.events.on('CHAT_CHANGED', (payload: unknown) => {
@@ -392,6 +378,8 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       detachObserver();
       teardownTagInterceptors();
       clearEditingMessageIds();
+      for (const pending of newestPendingObservers.values()) pending.disconnect();
+      newestPendingObservers.clear();
       unsubGenEnded();
       unsubChatChanged();
     },

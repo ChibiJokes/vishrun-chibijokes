@@ -197,11 +197,6 @@ export async function processNode(
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
 
-    // Repair any already-mounted widgets that were left inside Lumiverse's
-    // temporary render wrappers by an earlier pass. This is the same DOM
-    // normalization that an edit/cancel remount happened to provide.
-    normalizeExistingWidgetContainers(target);
-
     // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
     // widget HTML before any widget is built. Always returns a map; missing
     // entries → widget renders the raw template (no worse than pre-MVU-lite).
@@ -227,11 +222,6 @@ export async function processNode(
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-
-      // Finalize against the DOM shape Lumiverse actually produced for this
-      // generation. Newly inserted widgets can still be inside chunk-fade
-      // spans / prose paragraphs even if the pre-pass was clean.
-      normalizeExistingWidgetContainers(findContentRoot(root));
     } catch (err) {
       console.debug('[vishrun] processNode render error:', err);
     }
@@ -466,15 +456,6 @@ const MULTILINE_BLOCK_TAGS = new Set([
 // is hashed and may change between builds.
 const TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(['SPAN']);
 const EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
-
-function normalizeExistingWidgetContainers(target: HTMLElement): void {
-  // Static snapshot is intentional: unwrapping a later widget may also hoist
-  // an earlier sibling, but every still-connected widget gets one cleanup pass.
-  const widgets = Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-widget]'));
-  for (const widget of widgets) {
-    if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
-  }
-}
 
 function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
   let current: Element = widget;
