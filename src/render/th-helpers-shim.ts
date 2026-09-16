@@ -47,6 +47,22 @@ export interface ChatMessageSwiped {
   swipes_info: Record<string, unknown>[];
 }
 
+export interface ChatMessageCreating {
+  name?: string;
+  role: 'system' | 'assistant' | 'user';
+  is_hidden?: boolean;
+  message: string;
+  data?: Record<string, unknown>;
+  extra?: Record<string, unknown>;
+}
+
+export interface CreateChatMessagesOption {
+  /** @deprecated JSLR keeps this as an alias of insert_before. */
+  insert_at?: number | 'end';
+  insert_before?: number | 'end';
+  refresh?: 'none' | 'affected' | 'all';
+}
+
 export interface ThHelpersHandle {
   getCurrentMessageId(): number;
   getChatId(): string;
@@ -58,6 +74,10 @@ export interface ThHelpersHandle {
     fieldValues: string | Record<string, unknown>,
     messageId: number | string,
     opts?: Record<string, unknown>,
+  ): Promise<void>;
+  createChatMessages(
+    chatMessages: ChatMessageCreating[],
+    options?: CreateChatMessagesOption,
   ): Promise<void>;
   getAllVariables(): Record<string, unknown>;
   getVariable(key: string): unknown;
@@ -141,6 +161,12 @@ export function createThHelpers(
         fieldValues: normalized,
         messageId,
         opts: opts ?? {},
+      });
+    },
+    async createChatMessages(chatMessages, options) {
+      await bridge.postRequest('th-create-chat-messages', {
+        chatMessages,
+        options: options ?? {},
       });
     },
     getAllVariables() {
@@ -276,6 +302,118 @@ window.getChatMessages = function(range, opts){
 window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
+};
+var JSLR_DATA_EXTRA_KEY = '__vishrun_jslr_message_data_v1';
+function isPlainRecord(value){ return !!value && typeof value === 'object' && !Array.isArray(value); }
+function cloneRecord(value){
+  var out = {};
+  if (!isPlainRecord(value)) return out;
+  for (var key in value) if (Object.prototype.hasOwnProperty.call(value, key)) out[key] = value[key];
+  return out;
+}
+function defaultMessageName(role){
+  if (role === 'system') return 'system';
+  var snap = THC.messagesSnapshot || [];
+  for (var i = snap.length - 1; i >= 0; i--) {
+    var item = snap[i];
+    if (item && item.role === role && typeof item.name === 'string' && item.name.trim()) return item.name;
+  }
+  return role === 'user' ? 'User' : 'Assistant';
+}
+function hostJsonFetch(path, init){
+  var hostWindow = window;
+  try { if (window.parent && window.parent !== window && window.parent.fetch) hostWindow = window.parent; } catch (_) {}
+  var fetcher = hostWindow.fetch ? hostWindow.fetch.bind(hostWindow) : window.fetch.bind(window);
+  var origin = '';
+  try { origin = hostWindow.location && hostWindow.location.origin ? hostWindow.location.origin : window.location.origin; } catch (_) { origin = window.location.origin; }
+  return fetcher(origin + path, init).then(function(response){
+    if (response.ok) return response.json().catch(function(){ return {}; });
+    return response.text().catch(function(){ return ''; }).then(function(text){
+      throw new Error('Lumiverse message update failed (HTTP ' + response.status + ')' + (text ? ': ' + text.slice(0, 300) : ''));
+    });
+  });
+}
+function normalizeCreatingMessage(raw, index){
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new TypeError('chat_messages[' + index + '] must be an object');
+  if (raw.role !== 'system' && raw.role !== 'assistant' && raw.role !== 'user') throw new TypeError('chat_messages[' + index + '].role must be system, assistant, or user');
+  if (typeof raw.message !== 'string') throw new TypeError('chat_messages[' + index + '].message must be a string');
+  if (raw.name !== undefined && typeof raw.name !== 'string') throw new TypeError('chat_messages[' + index + '].name must be a string');
+  if (raw.is_hidden !== undefined && typeof raw.is_hidden !== 'boolean') throw new TypeError('chat_messages[' + index + '].is_hidden must be a boolean');
+  if (raw.data !== undefined && !isPlainRecord(raw.data)) throw new TypeError('chat_messages[' + index + '].data must be an object');
+  if (raw.extra !== undefined && !isPlainRecord(raw.extra)) throw new TypeError('chat_messages[' + index + '].extra must be an object');
+  return raw;
+}
+function patchCreatedMessage(chatId, created, message){
+  var extra = cloneRecord(message.extra);
+  // Lumiverse represents the three-way JSLR role on persisted chat rows with
+  // is_user + extra.spindle_role. Keep this host-native marker authoritative.
+  extra.spindle_role = message.role;
+  if (message.data !== undefined) extra[JSLR_DATA_EXTRA_KEY] = cloneRecord(message.data);
+  if (message.is_hidden !== undefined) {
+    if (message.is_hidden) extra.hidden = true;
+    else delete extra.hidden;
+  }
+  var name = message.name !== undefined ? message.name : defaultMessageName(message.role);
+  var path = '/api/v1/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(created.id);
+  return hostJsonFetch(path, {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name, extra: extra })
+  }).then(function(){
+    var exposedExtra = cloneRecord(extra);
+    delete exposedExtra[JSLR_DATA_EXTRA_KEY];
+    return {
+      id: created.id,
+      message_id: created.message_id,
+      name: name,
+      role: message.role,
+      is_hidden: extra.hidden === true,
+      message: message.message,
+      swipe_id: 0,
+      swipes: [message.message],
+      data: message.data !== undefined ? cloneRecord(message.data) : {},
+      extra: exposedExtra
+    };
+  });
+}
+function rollbackCreatedMessages(chatId, created){
+  return Promise.all((created || []).map(function(row){
+    var path = '/api/v1/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(row.id);
+    return hostJsonFetch(path, { method: 'DELETE', credentials: 'include' }).catch(function(){ return undefined; });
+  }));
+}
+window.createChatMessages = function(chatMessages, options){
+  if (!Array.isArray(chatMessages)) return Promise.reject(new TypeError('chat_messages must be an array'));
+  var normalized;
+  try {
+    normalized = chatMessages.map(function(message, index){ return normalizeCreatingMessage(message, index); });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  options = options || {};
+  if (!isPlainRecord(options)) return Promise.reject(new TypeError('createChatMessages options must be an object'));
+  if (options.refresh !== undefined && options.refresh !== 'none' && options.refresh !== 'affected' && options.refresh !== 'all') {
+    return Promise.reject(new TypeError('refresh must be none, affected, or all'));
+  }
+  return postRequest('th-create-chat-messages', { chatMessages: normalized, options: options }).then(function(result){
+    if (!result || !Array.isArray(result.created) || result.created.length !== normalized.length) {
+      throw new Error('createChatMessages backend returned an invalid creation result');
+    }
+    return Promise.all(normalized.map(function(message, index){
+      return patchCreatedMessage(THC.chatId, result.created[index], message);
+    })).then(function(rows){
+      // JSLR mutates the live chat array immediately. Vishrun's synchronous
+      // getChatMessages() reads a baked snapshot, so mirror the appended rows
+      // locally after persistence to keep same-frame reads coherent.
+      for (var i = 0; i < rows.length; i++) THC.messagesSnapshot.push(rows[i]);
+      THC.messagesSnapshot.sort(function(a, b){ return a.message_id - b.message_id; });
+      return undefined;
+    }, function(error){
+      // Avoid leaving half-customized rows behind if Lumiverse rejects a name/extra patch.
+      return rollbackCreatedMessages(THC.chatId, result.created).then(function(){ throw error; });
+    });
+  });
 };
 window.getAllVariables = function(){
   if (THC.variablesChatId !== THC.chatId) return {};

@@ -11,7 +11,7 @@ const log = {
 interface ThHelpersRequest {
   type: 'th_helpers_request';
   requestId: string;
-  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-get-variables-snapshot' | 'th-set-variable' | 'th-replace-chat-variables';
+  op: 'th-get-messages-snapshot' | 'th-set-chat-message' | 'th-create-chat-messages' | 'th-get-variables-snapshot' | 'th-set-variable' | 'th-replace-chat-variables';
   chatId: string;
   currentMessageId: string;
   currentMessageIndex: number;
@@ -84,6 +84,8 @@ export interface SnapshotMessage {
   extra: Record<string, unknown>;
 }
 
+const JSLR_DATA_EXTRA_KEY = '__vishrun_jslr_message_data_v1';
+
 function shapeSnapshotMessage(
   msg: ChatMessageDTO & { role?: 'system' | 'user' | 'assistant'; extra?: Record<string, unknown> },
 ): SnapshotMessage {
@@ -95,17 +97,25 @@ function shapeSnapshotMessage(
         : 'assistant';
   const swipes =
     Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
+  const rawExtra = msg.extra ?? {};
+  const storedData = rawExtra[JSLR_DATA_EXTRA_KEY];
+  const data =
+    storedData && typeof storedData === 'object' && !Array.isArray(storedData)
+      ? { ...(storedData as Record<string, unknown>) }
+      : {};
+  const extra = { ...rawExtra };
+  delete extra[JSLR_DATA_EXTRA_KEY];
   return {
     id: msg.id,
     message_id: msg.index_in_chat,
     name: msg.name,
     role,
-    is_hidden: false,
+    is_hidden: rawExtra.hidden === true,
     message: msg.content,
     swipe_id: msg.swipe_id ?? 0,
     swipes,
-    data: {},
-    extra: msg.extra ?? {},
+    data,
+    extra,
   };
 }
 
@@ -212,6 +222,99 @@ export async function handleGetVariablesSnapshot(
     log.warn('getVariablesSnapshot failed:', err instanceof Error ? err.message : String(err));
     return emptyMvuData();
   }
+}
+
+interface ChatMessageCreatingCompat {
+  name?: string;
+  role: 'system' | 'assistant' | 'user';
+  is_hidden?: boolean;
+  message: string;
+  data?: Record<string, unknown>;
+  extra?: Record<string, unknown>;
+}
+
+interface CreateChatMessagesCompatOptions {
+  insert_at?: number | 'end';
+  insert_before?: number | 'end';
+  refresh?: 'none' | 'affected' | 'all';
+}
+
+export async function handleCreateChatMessages(
+  body: Record<string, unknown>,
+  chatId: string,
+  chat: ChatApi = api.chat,
+): Promise<{ created: Array<{ id: string; message_id: number }> }> {
+  const rawMessages = body.chatMessages;
+  if (!Array.isArray(rawMessages)) throw new TypeError('chat_messages must be an array');
+
+  const messages: ChatMessageCreatingCompat[] = rawMessages.map((raw, index) => {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new TypeError(`chat_messages[${index}] must be an object`);
+    }
+    const item = raw as Record<string, unknown>;
+    if (item.role !== 'system' && item.role !== 'assistant' && item.role !== 'user') {
+      throw new TypeError(`chat_messages[${index}].role must be system, assistant, or user`);
+    }
+    if (typeof item.message !== 'string') {
+      throw new TypeError(`chat_messages[${index}].message must be a string`);
+    }
+    if (item.name !== undefined && typeof item.name !== 'string') {
+      throw new TypeError(`chat_messages[${index}].name must be a string`);
+    }
+    if (item.is_hidden !== undefined && typeof item.is_hidden !== 'boolean') {
+      throw new TypeError(`chat_messages[${index}].is_hidden must be a boolean`);
+    }
+    if (item.data !== undefined && (!item.data || typeof item.data !== 'object' || Array.isArray(item.data))) {
+      throw new TypeError(`chat_messages[${index}].data must be an object`);
+    }
+    if (item.extra !== undefined && (!item.extra || typeof item.extra !== 'object' || Array.isArray(item.extra))) {
+      throw new TypeError(`chat_messages[${index}].extra must be an object`);
+    }
+    return item as unknown as ChatMessageCreatingCompat;
+  });
+
+  const rawOptions = body.options;
+  const options: CreateChatMessagesCompatOptions =
+    rawOptions && typeof rawOptions === 'object' && !Array.isArray(rawOptions)
+      ? (rawOptions as CreateChatMessagesCompatOptions)
+      : {};
+  if (options.refresh !== undefined && options.refresh !== 'none' && options.refresh !== 'affected' && options.refresh !== 'all') {
+    throw new TypeError('refresh must be none, affected, or all');
+  }
+
+  // JSLR can splice into SillyTavern's in-memory chat array. Lumiverse's
+  // public Spindle mutation API deliberately exposes append-only creation;
+  // there is no safe indexed-insert primitive to mirror without rewriting
+  // existing persisted rows. Accept every request that resolves to the end
+  // and reject true mid-history insertion rather than silently doing the wrong thing.
+  const before = options.insert_at ?? options.insert_before ?? 'end';
+  if (before !== 'end') {
+    if (typeof before !== 'number' || !Number.isFinite(before)) {
+      throw new TypeError('insert_before must be a number or end');
+    }
+    const existing = await chat.getMessages(chatId);
+    const clamped = Math.max(-existing.length, Math.min(existing.length, Math.trunc(before)));
+    if (clamped !== existing.length) {
+      throw new Error('Lumiverse does not expose safe indexed message insertion; createChatMessages currently supports insert_before/insert_at only when it resolves to the end');
+    }
+  }
+
+  const ids: string[] = [];
+  for (const message of messages) {
+    const created = await chat.appendMessage(chatId, { role: message.role, content: message.message });
+    ids.push(created.id);
+  }
+
+  if (ids.length === 0) return { created: [] };
+  const current = await chat.getMessages(chatId);
+  const indexById = new Map<string, number>();
+  for (const message of current) indexById.set(message.id, message.index_in_chat);
+  return {
+    created: ids.map((id, index) => ({
+      id,
+      message_id: indexById.get(id) ?? (current.length - ids.length + index),
+    })),
+  };
 }
 
 export async function handleSetChatMessage(
@@ -324,6 +427,9 @@ export function installThHelpersHandler(): void {
         } else if (op === 'th-set-chat-message') {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
           response = { type: 'th_helpers_response', requestId, ok: true, result: undefined };
+        } else if (op === 'th-create-chat-messages') {
+          const result = await handleCreateChatMessages(body, chatId);
+          response = { type: 'th_helpers_response', requestId, ok: true, result };
         } else if (op === 'th-replace-chat-variables') {
           const result = await handleReplaceChatVariables(body, chatId, userId);
           response = { type: 'th_helpers_response', requestId, ok: true, result };
