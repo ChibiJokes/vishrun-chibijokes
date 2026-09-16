@@ -1,0 +1,49 @@
+name: Build Vishrun
+
+on:
+  push:
+    branches:
+      - staging
+    paths-ignore:
+      - "dist/**"
+
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Bun
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: latest
+
+      - name: Install dependencies
+        run: bun install
+
+      - name: Build frontend
+        run: bun build src/frontend.ts --target browser --outfile dist/frontend.js
+
+      - name: Build backend
+        run: bun build src/backend/index.ts --target bun --outfile dist/backend.js
+
+      - name: Commit built files
+        run: |
+          if git diff --quiet -- dist/frontend.js dist/backend.js; then
+            echo "Build files are already up to date."
+            exit 0
+          fi
+
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add dist/frontend.js dist/backend.js
+          git commit -m "build: update Vishrun dist"
+          git push origin HEAD:${{ github.ref_name }}
