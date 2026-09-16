@@ -374,7 +374,7 @@ function parseSetvarChain(content) {
 
 // src/backend/pre-generation-bridge.ts
 var LOG_PREFIX = "[vishrun:pre-generation]";
-var PRE_GENERATION_TIMEOUT_MS = 300000;
+var PRE_GENERATION_TIMEOUT_MS = 90000;
 var subscribedUsers = new Set;
 var pendingRequests = new Map;
 function isSubscriptionMessage(payload) {
@@ -1308,26 +1308,20 @@ function resolveRangeToIndex(range, total, currentMessageIndex) {
   }
   return null;
 }
-var JSLR_DATA_EXTRA_KEY = "__vishrun_jslr_message_data_v1";
 function shapeSnapshotMessage(msg) {
   const role = msg.role === "system" || msg.role === "user" || msg.role === "assistant" ? msg.role : msg.is_user ? "user" : "assistant";
   const swipes = Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
-  const rawExtra = msg.extra ?? {};
-  const storedData = rawExtra[JSLR_DATA_EXTRA_KEY];
-  const data = storedData && typeof storedData === "object" && !Array.isArray(storedData) ? { ...storedData } : {};
-  const extra = { ...rawExtra };
-  delete extra[JSLR_DATA_EXTRA_KEY];
   return {
     id: msg.id,
     message_id: msg.index_in_chat,
     name: msg.name,
     role,
-    is_hidden: rawExtra.hidden === true,
+    is_hidden: false,
     message: msg.content,
     swipe_id: msg.swipe_id ?? 0,
     swipes,
-    data,
-    extra
+    data: {},
+    extra: msg.extra ?? {}
   };
 }
 async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
@@ -1382,79 +1376,6 @@ async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats
     return emptyMvuData();
   }
 }
-async function handleCreateChatMessages(body, chatId, chat = api.chat) {
-  const rawMessages = body.chatMessages;
-  if (!Array.isArray(rawMessages))
-    throw new TypeError("chat_messages must be an array");
-  const messages = rawMessages.map((raw, index) => {
-    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
-      throw new TypeError(`chat_messages[${index}] must be an object`);
-    }
-    const item = raw;
-    if (item.role !== "system" && item.role !== "assistant" && item.role !== "user") {
-      throw new TypeError(`chat_messages[${index}].role must be system, assistant, or user`);
-    }
-    if (typeof item.message !== "string") {
-      throw new TypeError(`chat_messages[${index}].message must be a string`);
-    }
-    if (item.name !== undefined && typeof item.name !== "string") {
-      throw new TypeError(`chat_messages[${index}].name must be a string`);
-    }
-    if (item.is_hidden !== undefined && typeof item.is_hidden !== "boolean") {
-      throw new TypeError(`chat_messages[${index}].is_hidden must be a boolean`);
-    }
-    if (item.data !== undefined && (!item.data || typeof item.data !== "object" || Array.isArray(item.data))) {
-      throw new TypeError(`chat_messages[${index}].data must be an object`);
-    }
-    if (item.extra !== undefined && (!item.extra || typeof item.extra !== "object" || Array.isArray(item.extra))) {
-      throw new TypeError(`chat_messages[${index}].extra must be an object`);
-    }
-    return item;
-  });
-  const rawOptions = body.options;
-  const options = rawOptions && typeof rawOptions === "object" && !Array.isArray(rawOptions) ? rawOptions : {};
-  if (options.refresh !== undefined && options.refresh !== "none" && options.refresh !== "affected" && options.refresh !== "all") {
-    throw new TypeError("refresh must be none, affected, or all");
-  }
-  const before = options.insert_at ?? options.insert_before ?? "end";
-  if (before !== "end") {
-    if (typeof before !== "number" || !Number.isFinite(before)) {
-      throw new TypeError("insert_before must be a number or end");
-    }
-    const existing = await chat.getMessages(chatId);
-    const clamped = Math.max(-existing.length, Math.min(existing.length, Math.trunc(before)));
-    if (clamped !== existing.length) {
-      throw new Error("Lumiverse does not expose safe indexed message insertion; createChatMessages currently supports insert_before/insert_at only when it resolves to the end");
-    }
-  }
-  const ids = [];
-  for (const message of messages) {
-    const created = await chat.appendMessage(chatId, { role: message.role, content: message.message });
-    ids.push(created.id);
-  }
-  if (ids.length === 0)
-    return { created: [] };
-  const current = await chat.getMessages(chatId);
-  const indexById = new Map;
-  for (const message of current)
-    indexById.set(message.id, message.index_in_chat);
-  return {
-    created: ids.map((id, index) => ({
-      id,
-      message_id: indexById.get(id) ?? current.length - ids.length + index
-    }))
-  };
-}
-async function handleTriggerSlash(body, chatId, userId) {
-  const command = body.command;
-  if (typeof command !== "string")
-    throw new TypeError("triggerSlash command must be a string");
-  const result = await dispatchSlashText(command, chatId, userId);
-  if (!result.handled) {
-    throw new Error(`Unsupported slash command in Vishrun triggerSlash: ${command}`);
-  }
-  return "";
-}
 async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = api.chat) {
   const fieldValues = body.fieldValues ?? {};
   const messageRange = body.messageId;
@@ -1497,36 +1418,6 @@ ${key}: ${JSON.stringify(value)}
   await chat.updateMessage(chatId, latest.id, { content: existing + varBlock });
   log.debug("setVariable: set", key, "=", value);
 }
-var variableWrites = new Map;
-function handleReplaceChatVariables(body, chatId, userId, chats = api.chats) {
-  const key = JSON.stringify([userId, chatId]);
-  const work = (variableWrites.get(key) ?? Promise.resolve()).catch(() => {}).then(async () => {
-    if (!chatId || body.chatId !== chatId)
-      throw new Error("Chat variable target does not match the requesting frame");
-    const variables = body.variables;
-    if (!variables || typeof variables !== "object" || Array.isArray(variables)) {
-      throw new TypeError("Variables must be an object");
-    }
-    const current = await chats.get(chatId, userId);
-    if (!current)
-      throw new Error("Chat not found");
-    const updated = await chats.update(chatId, {
-      metadata: { ...current.metadata, chat_variables: variables }
-    }, userId);
-    if (!updated)
-      throw new Error("Chat variable save failed");
-    const meta = updated.metadata ?? {};
-    const macro = meta.macro_variables ?? {};
-    const saved = meta.chat_variables ?? {};
-    return { chatId, variables: saved, allVariables: { ...macro.global, ...macro.local, ...saved } };
-  });
-  variableWrites.set(key, work);
-  work.finally(() => {
-    if (variableWrites.get(key) === work)
-      variableWrites.delete(key);
-  }).catch(() => {});
-  return work;
-}
 function installThHelpersHandler() {
   api.onFrontendMessage((payload, userId) => {
     if (!isThHelpersRequest(payload))
@@ -1544,15 +1435,6 @@ function installThHelpersHandler() {
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
-        } else if (op === "th-create-chat-messages") {
-          const result = await handleCreateChatMessages(body, chatId);
-          response = { type: "th_helpers_response", requestId, ok: true, result };
-        } else if (op === "th-trigger-slash") {
-          const result = await handleTriggerSlash(body, chatId, userId);
-          response = { type: "th_helpers_response", requestId, ok: true, result };
-        } else if (op === "th-replace-chat-variables") {
-          const result = await handleReplaceChatVariables(body, chatId, userId);
-          response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-set-variable") {
           await handleSetVariable(body, chatId);
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
