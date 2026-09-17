@@ -3153,7 +3153,9 @@ async function processNode(root, scripts, ctx) {
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-      normalizeExistingWidgetContainers(findContentRoot(root));
+      const finalTarget = findContentRoot(root);
+      normalizeExistingWidgetContainers(finalTarget);
+      stripEscapedPseudoTags(finalTarget);
     } catch (err) {
       console.debug("[vishrun] processNode render error:", err);
     }
@@ -3334,6 +3336,37 @@ var MULTILINE_BLOCK_TAGS = new Set([
 ]);
 var TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(["SPAN"]);
 var EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
+var ESCAPED_PSEUDO_TAG_RE = /<[A-Za-z][^>\r\n]*>/g;
+var PSEUDO_TAG_LITERAL_CONTEXTS = new Set(["CODE", "PRE", "TEXTAREA"]);
+function stripEscapedPseudoTags(target) {
+  const candidates = [];
+  const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = node.nodeValue ?? "";
+      if (!text.includes("<") || !text.includes(">"))
+        return NodeFilter.FILTER_REJECT;
+      let parent = node.parentElement;
+      while (parent && parent !== target) {
+        if (parent.hasAttribute("data-vishrun-widget"))
+          return NodeFilter.FILTER_REJECT;
+        if (PSEUDO_TAG_LITERAL_CONTEXTS.has(parent.tagName))
+          return NodeFilter.FILTER_REJECT;
+        parent = parent.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  let node;
+  while ((node = walker.nextNode()) !== null)
+    candidates.push(node);
+  for (const textNode of candidates) {
+    const before = textNode.nodeValue ?? "";
+    ESCAPED_PSEUDO_TAG_RE.lastIndex = 0;
+    const after = before.replace(ESCAPED_PSEUDO_TAG_RE, "");
+    if (after !== before)
+      textNode.nodeValue = after;
+  }
+}
 function normalizeExistingWidgetContainers(target) {
   const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
   for (const widget of widgets) {
