@@ -65,6 +65,14 @@ type UserMessageProcessHandler = (
   request: UserMessageProcessRequest,
 ) => void | string | UserMessageProcessResult | Promise<void | string | UserMessageProcessResult>;
 
+type NativeResourceName = 'personas' | 'world_books';
+
+type PendingNativeResource = {
+  resolve: (value: unknown) => void;
+  reject: (error: Error) => void;
+  timer: ReturnType<typeof setTimeout>;
+};
+
 export function setup(ctx: SpindleFrontendContext) {
   const hooks = installMessageHooks(ctx);
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
@@ -83,11 +91,86 @@ export function setup(ctx: SpindleFrontendContext) {
     abortHandler?: () => void;
   };
   const pendingGenerates = new Map<string, PendingGenerate>();
+  const pendingNativeResources = new Map<string, PendingNativeResource>();
   const pendingWorldInfoLookups = new Map<string, { resolve: (entries: unknown[]) => void; reject: (error: Error) => void }>();
   const preGenerationHandlers = new Set<PreGenerationHandler>();
   const preGenerationControllers = new Map<string, { controller: AbortController; chatId: string }>();
   const userMessageHandlers = new Set<UserMessageProcessHandler>();
   const userMessageControllers = new Map<string, { controller: AbortController; chatId: string }>();
+
+  const callNativeResource = (
+    resource: NativeResourceName,
+    operation: string,
+    args: unknown[] = [],
+  ): Promise<unknown> => {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!pendingNativeResources.has(requestId)) return;
+        pendingNativeResources.delete(requestId);
+        reject(new Error(`Vishrun native ${resource}.${operation} request timed out`));
+      }, 15_000);
+
+      pendingNativeResources.set(requestId, { resolve, reject, timer });
+      try {
+        ctx.sendToBackend({
+          type: 'vsh_native_resource',
+          requestId,
+          resource,
+          operation,
+          args,
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        pendingNativeResources.delete(requestId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+
+  const personaBridge = Object.freeze({
+    list: (options: Record<string, unknown> = {}) => callNativeResource('personas', 'list', [options]),
+    get: (personaId: string) => callNativeResource('personas', 'get', [personaId]),
+    getDefault: () => callNativeResource('personas', 'getDefault'),
+    getActive: () => callNativeResource('personas', 'getActive'),
+    create: (input: Record<string, unknown>) => callNativeResource('personas', 'create', [input]),
+    update: (personaId: string, input: Record<string, unknown>) => callNativeResource('personas', 'update', [personaId, input]),
+    delete: (personaId: string) => callNativeResource('personas', 'delete', [personaId]),
+    switchActive: (personaId: string | null) => callNativeResource('personas', 'switchActive', [personaId]),
+    getWorldBook: (personaId: string) => callNativeResource('personas', 'getWorldBook', [personaId]),
+  });
+
+  const worldBookEntriesBridge = Object.freeze({
+    list: (worldBookId: string, options: Record<string, unknown> = {}) =>
+      callNativeResource('world_books', 'entries.list', [worldBookId, options]),
+    get: (entryId: string) => callNativeResource('world_books', 'entries.get', [entryId]),
+    create: (worldBookId: string, input: Record<string, unknown>) =>
+      callNativeResource('world_books', 'entries.create', [worldBookId, input]),
+    update: (entryId: string, input: Record<string, unknown>) =>
+      callNativeResource('world_books', 'entries.update', [entryId, input]),
+    delete: (entryId: string) => callNativeResource('world_books', 'entries.delete', [entryId]),
+  });
+
+  const worldBooksBridge = Object.freeze({
+    list: (options: Record<string, unknown> = {}) => callNativeResource('world_books', 'list', [options]),
+    get: (worldBookId: string) => callNativeResource('world_books', 'get', [worldBookId]),
+    create: (input: Record<string, unknown>) => callNativeResource('world_books', 'create', [input]),
+    update: (worldBookId: string, input: Record<string, unknown>) =>
+      callNativeResource('world_books', 'update', [worldBookId, input]),
+    delete: (worldBookId: string) => callNativeResource('world_books', 'delete', [worldBookId]),
+    getActivated: (chatId: string) => callNativeResource('world_books', 'getActivated', [chatId]),
+    getGlobal: () => callNativeResource('world_books', 'getGlobal'),
+    setGlobal: (worldBookIds: string[]) => callNativeResource('world_books', 'setGlobal', [worldBookIds]),
+    activateGlobal: (worldBookId: string) => callNativeResource('world_books', 'activateGlobal', [worldBookId]),
+    deactivateGlobal: (worldBookId: string) => callNativeResource('world_books', 'deactivateGlobal', [worldBookId]),
+    entries: worldBookEntriesBridge,
+  });
+
+  // Host-document bridge for Quill/Intro. These consumers already keep their
+  // Lumiverse path on window.parent, so they can use the native Spindle APIs
+  // without raw /api/v1/personas or /api/v1/world-books mutations.
+  (window as any).__vishrunPersonas = personaBridge;
+  (window as any).__vishrunWorldBooks = worldBooksBridge;
 
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
@@ -290,6 +373,18 @@ export function setup(ctx: SpindleFrontendContext) {
         pendingWorldInfoLookups.delete(m.requestId);
         pendingWorldInfo.reject(new DOMException('Generation aborted', 'AbortError'));
       }
+    } else if (m.type === 'vsh_native_resource_result' && m.requestId) {
+      const pending = pendingNativeResources.get(m.requestId);
+      if (!pending) return;
+      pendingNativeResources.delete(m.requestId);
+      clearTimeout(pending.timer);
+      pending.resolve(m.result);
+    } else if (m.type === 'vsh_native_resource_error' && m.requestId) {
+      const pending = pendingNativeResources.get(m.requestId);
+      if (!pending) return;
+      pendingNativeResources.delete(m.requestId);
+      clearTimeout(pending.timer);
+      pending.reject(new Error(m.error || 'Vishrun native resource request failed'));
     } else if (m.type === 'vsh_generate_result' && m.requestId) {
       const pending = pendingGenerates.get(m.requestId);
       if (!pending) return;
@@ -627,7 +722,14 @@ export function setup(ctx: SpindleFrontendContext) {
       pending.reject(new DOMException('Extension stopped', 'AbortError'));
     }
     pendingGenerates.clear();
+    for (const pending of pendingNativeResources.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error('Vishrun disposed'));
+    }
+    pendingNativeResources.clear();
     unsubBackendMsg();
+    delete (window as any).__vishrunPersonas;
+    delete (window as any).__vishrunWorldBooks;
     delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunRegisterUserMessageProcessor;
     delete (window as any).__vishrunGenerate;
