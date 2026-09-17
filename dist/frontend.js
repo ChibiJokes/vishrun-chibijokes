@@ -3350,7 +3350,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
-      if (isEmptyResidue(prev))
+      if (isEmptyResidue(prev) || isTransparentEmptyResidue(prev))
         prev.parentNode?.removeChild(prev);
       else
         break;
@@ -3359,7 +3359,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
-      if (isEmptyResidue(nxt))
+      if (isEmptyResidue(nxt) || isTransparentEmptyResidue(nxt))
         nxt.parentNode?.removeChild(nxt);
       else
         break;
@@ -3375,7 +3375,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
         break;
       while (parent.firstChild) {
         const child = parent.firstChild;
-        if (isEmptyResidue(child)) {
+        if (isEmptyResidue(child) || isTransparentEmptyResidue(child)) {
           parent.removeChild(child);
         } else {
           grandparent.insertBefore(child, parent);
@@ -3388,10 +3388,18 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
   }
 }
 function containsOnlyWidgetsAndResidue(container) {
-  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node));
+  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node) || isTransparentEmptyResidue(node));
 }
 function isWidgetNode(node) {
   return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute("data-vishrun-widget");
+}
+function isTransparentEmptyResidue(node) {
+  if (node.nodeType !== Node.ELEMENT_NODE)
+    return false;
+  const el = node;
+  if (!TRANSPARENT_WIDGET_WRAPPER_TAGS.has(el.tagName))
+    return false;
+  return Array.from(el.childNodes).every((child) => isEmptyResidue(child) || isTransparentEmptyResidue(child));
 }
 function isEmptyResidue(node) {
   if (node.nodeType === Node.TEXT_NODE) {
