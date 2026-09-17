@@ -488,14 +488,14 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
     let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
-      if (isEmptyResidue(prev)) prev.parentNode?.removeChild(prev);
+      if (isEmptyResidue(prev) || isTransparentEmptyResidue(prev)) prev.parentNode?.removeChild(prev);
       else break;
       prev = next;
     }
     let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
-      if (isEmptyResidue(nxt)) nxt.parentNode?.removeChild(nxt);
+      if (isEmptyResidue(nxt) || isTransparentEmptyResidue(nxt)) nxt.parentNode?.removeChild(nxt);
       else break;
       nxt = next;
     }
@@ -513,7 +513,7 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
       // the host DOM and an extension sandbox come from different JS realms.
       while (parent.firstChild) {
         const child = parent.firstChild;
-        if (isEmptyResidue(child)) {
+        if (isEmptyResidue(child) || isTransparentEmptyResidue(child)) {
           parent.removeChild(child);
         } else {
           grandparent.insertBefore(child, parent);
@@ -529,13 +529,22 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
 
 function containsOnlyWidgetsAndResidue(container: Element): boolean {
   return Array.from(container.childNodes).every((node) =>
-    isWidgetNode(node) || isEmptyResidue(node),
+    isWidgetNode(node) || isEmptyResidue(node) || isTransparentEmptyResidue(node),
   );
 }
 
 function isWidgetNode(node: Node): boolean {
   return node.nodeType === Node.ELEMENT_NODE
     && (node as Element).hasAttribute('data-vishrun-widget');
+}
+
+function isTransparentEmptyResidue(node: Node): boolean {
+  if (node.nodeType !== Node.ELEMENT_NODE) return false;
+  const el = node as HTMLElement;
+  if (!TRANSPARENT_WIDGET_WRAPPER_TAGS.has(el.tagName)) return false;
+  return Array.from(el.childNodes).every((child) =>
+    isEmptyResidue(child) || isTransparentEmptyResidue(child),
+  );
 }
 
 function isEmptyResidue(node: Node): boolean {
