@@ -231,7 +231,17 @@ export async function processNode(
       // Finalize against the DOM shape Lumiverse actually produced for this
       // generation. Newly inserted widgets can still be inside chunk-fade
       // spans / prose paragraphs even if the pre-pass was clean.
-      normalizeExistingWidgetContainers(findContentRoot(root));
+      const finalTarget = findContentRoot(root);
+      normalizeExistingWidgetContainers(finalTarget);
+
+      // SillyTavern's Showdown path preserves loose <...> spans as raw HTML
+      // before DOMPurify, so prose-shaped pseudo-tags such as
+      // <Yo, make sure to do this next.> disappear from display. Lumiverse's
+      // Marked/CommonMark parser is stricter and can escape those spans into
+      // visible text when punctuation/numbers make them invalid Markdown HTML.
+      // Strip only those rendered text-node remnants here. Real HTML is already
+      // DOM by this point; code/pre and Vishrun widgets are excluded below.
+      stripEscapedPseudoTags(finalTarget);
     } catch (err) {
       console.debug('[vishrun] processNode render error:', err);
     }
@@ -466,6 +476,43 @@ const MULTILINE_BLOCK_TAGS = new Set([
 // is hashed and may change between builds.
 const TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(['SPAN']);
 const EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
+
+// Lumiverse/Marked can render punctuation-heavy pseudo-tags as literal text
+// even though SillyTavern/Showdown passes the same angle span through as HTML.
+// Require a letter immediately after '<' so comparisons/emoticons such as <3
+// or < 5 are not treated as tags. After that opener, numbers and punctuation
+// are intentionally allowed. Newlines are excluded so removal cannot cross
+// paragraph boundaries.
+const ESCAPED_PSEUDO_TAG_RE = /<[A-Za-z][^>\r\n]*>/g;
+const PSEUDO_TAG_LITERAL_CONTEXTS = new Set(['CODE', 'PRE', 'TEXTAREA']);
+
+function stripEscapedPseudoTags(target: HTMLElement): void {
+  const candidates: Text[] = [];
+  const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = node.nodeValue ?? '';
+      if (!text.includes('<') || !text.includes('>')) return NodeFilter.FILTER_REJECT;
+
+      let parent = node.parentElement;
+      while (parent && parent !== target) {
+        if (parent.hasAttribute('data-vishrun-widget')) return NodeFilter.FILTER_REJECT;
+        if (PSEUDO_TAG_LITERAL_CONTEXTS.has(parent.tagName)) return NodeFilter.FILTER_REJECT;
+        parent = parent.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    },
+  });
+
+  let node: Node | null;
+  while ((node = walker.nextNode()) !== null) candidates.push(node as Text);
+
+  for (const textNode of candidates) {
+    const before = textNode.nodeValue ?? '';
+    ESCAPED_PSEUDO_TAG_RE.lastIndex = 0;
+    const after = before.replace(ESCAPED_PSEUDO_TAG_RE, '');
+    if (after !== before) textNode.nodeValue = after;
+  }
+}
 
 function normalizeExistingWidgetContainers(target: HTMLElement): void {
   // Static snapshot is intentional: unwrapping a later widget may also hoist
