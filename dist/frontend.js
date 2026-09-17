@@ -5508,11 +5508,70 @@ function setup(ctx) {
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   const pendingGenerates = new Map;
+  const pendingNativeResources = new Map;
   const pendingWorldInfoLookups = new Map;
   const preGenerationHandlers = new Set;
   const preGenerationControllers = new Map;
   const userMessageHandlers = new Set;
   const userMessageControllers = new Map;
+  const callNativeResource = (resource, operation, args = []) => {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!pendingNativeResources.has(requestId))
+          return;
+        pendingNativeResources.delete(requestId);
+        reject(new Error(`Vishrun native ${resource}.${operation} request timed out`));
+      }, 15000);
+      pendingNativeResources.set(requestId, { resolve, reject, timer });
+      try {
+        ctx.sendToBackend({
+          type: "vsh_native_resource",
+          requestId,
+          resource,
+          operation,
+          args
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        pendingNativeResources.delete(requestId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+  const personaBridge = Object.freeze({
+    list: (options = {}) => callNativeResource("personas", "list", [options]),
+    get: (personaId) => callNativeResource("personas", "get", [personaId]),
+    getDefault: () => callNativeResource("personas", "getDefault"),
+    getActive: () => callNativeResource("personas", "getActive"),
+    create: (input) => callNativeResource("personas", "create", [input]),
+    update: (personaId, input) => callNativeResource("personas", "update", [personaId, input]),
+    delete: (personaId) => callNativeResource("personas", "delete", [personaId]),
+    switchActive: (personaId) => callNativeResource("personas", "switchActive", [personaId]),
+    getWorldBook: (personaId) => callNativeResource("personas", "getWorldBook", [personaId])
+  });
+  const worldBookEntriesBridge = Object.freeze({
+    list: (worldBookId, options = {}) => callNativeResource("world_books", "entries.list", [worldBookId, options]),
+    get: (entryId) => callNativeResource("world_books", "entries.get", [entryId]),
+    create: (worldBookId, input) => callNativeResource("world_books", "entries.create", [worldBookId, input]),
+    update: (entryId, input) => callNativeResource("world_books", "entries.update", [entryId, input]),
+    delete: (entryId) => callNativeResource("world_books", "entries.delete", [entryId])
+  });
+  const worldBooksBridge = Object.freeze({
+    list: (options = {}) => callNativeResource("world_books", "list", [options]),
+    get: (worldBookId) => callNativeResource("world_books", "get", [worldBookId]),
+    create: (input) => callNativeResource("world_books", "create", [input]),
+    update: (worldBookId, input) => callNativeResource("world_books", "update", [worldBookId, input]),
+    delete: (worldBookId) => callNativeResource("world_books", "delete", [worldBookId]),
+    getActivated: (chatId) => callNativeResource("world_books", "getActivated", [chatId]),
+    getGlobal: () => callNativeResource("world_books", "getGlobal"),
+    setGlobal: (worldBookIds) => callNativeResource("world_books", "setGlobal", [worldBookIds]),
+    activateGlobal: (worldBookId) => callNativeResource("world_books", "activateGlobal", [worldBookId]),
+    deactivateGlobal: (worldBookId) => callNativeResource("world_books", "deactivateGlobal", [worldBookId]),
+    entries: worldBookEntriesBridge
+  });
+  window.__vishrunPersonas = personaBridge;
+  window.__vishrunWorldBooks = worldBooksBridge;
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: "vsh_pre_generation_subscription",
@@ -5692,6 +5751,20 @@ function setup(ctx) {
         pendingWorldInfoLookups.delete(m.requestId);
         pendingWorldInfo.reject(new DOMException("Generation aborted", "AbortError"));
       }
+    } else if (m.type === "vsh_native_resource_result" && m.requestId) {
+      const pending = pendingNativeResources.get(m.requestId);
+      if (!pending)
+        return;
+      pendingNativeResources.delete(m.requestId);
+      clearTimeout(pending.timer);
+      pending.resolve(m.result);
+    } else if (m.type === "vsh_native_resource_error" && m.requestId) {
+      const pending = pendingNativeResources.get(m.requestId);
+      if (!pending)
+        return;
+      pendingNativeResources.delete(m.requestId);
+      clearTimeout(pending.timer);
+      pending.reject(new Error(m.error || "Vishrun native resource request failed"));
     } else if (m.type === "vsh_generate_result" && m.requestId) {
       const pending = pendingGenerates.get(m.requestId);
       if (!pending)
@@ -5977,7 +6050,14 @@ function setup(ctx) {
       pending.reject(new DOMException("Extension stopped", "AbortError"));
     }
     pendingGenerates.clear();
+    for (const pending of pendingNativeResources.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Vishrun disposed"));
+    }
+    pendingNativeResources.clear();
     unsubBackendMsg();
+    delete window.__vishrunPersonas;
+    delete window.__vishrunWorldBooks;
     delete window.__vishrunRegisterPreGeneration;
     delete window.__vishrunRegisterUserMessageProcessor;
     delete window.__vishrunGenerate;

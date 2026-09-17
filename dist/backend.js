@@ -1781,6 +1781,88 @@ function installUserMessageBridgeHandler() {
 }
 
 // src/backend/index.ts
+function isNativeResourceRequest(payload) {
+  if (!payload || typeof payload !== "object")
+    return false;
+  const value = payload;
+  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
+}
+async function dispatchNativeResource(request, userId) {
+  const args = Array.isArray(request.args) ? request.args : [];
+  if (request.resource === "personas") {
+    switch (request.operation) {
+      case "list":
+        return api.personas.list({ ...args[0] ?? {}, userId });
+      case "get":
+        return api.personas.get(String(args[0] ?? ""), userId);
+      case "getDefault":
+        return api.personas.getDefault(userId);
+      case "getActive":
+        return api.personas.getActive(userId);
+      case "create":
+        return api.personas.create(args[0] ?? {}, userId);
+      case "update":
+        return api.personas.update(String(args[0] ?? ""), args[1] ?? {}, userId);
+      case "delete":
+        return api.personas.delete(String(args[0] ?? ""), userId);
+      case "switchActive":
+        return api.personas.switchActive(args[0] == null ? null : String(args[0]), userId);
+      case "getWorldBook":
+        return api.personas.getWorldBook(String(args[0] ?? ""), userId);
+      default:
+        throw new Error(`Unsupported personas operation: ${request.operation}`);
+    }
+  }
+  switch (request.operation) {
+    case "list":
+      return api.world_books.list({ ...args[0] ?? {}, userId });
+    case "get":
+      return api.world_books.get(String(args[0] ?? ""), userId);
+    case "create":
+      return api.world_books.create(args[0] ?? {}, userId);
+    case "update":
+      return api.world_books.update(String(args[0] ?? ""), args[1] ?? {}, userId);
+    case "delete":
+      return api.world_books.delete(String(args[0] ?? ""), userId);
+    case "getActivated":
+      return api.world_books.getActivated(String(args[0] ?? ""), userId);
+    case "getGlobal":
+      return api.world_books.getGlobal(userId);
+    case "setGlobal":
+      return api.world_books.setGlobal(Array.isArray(args[0]) ? args[0].map(String) : [], userId);
+    case "activateGlobal":
+      return api.world_books.activateGlobal(String(args[0] ?? ""), userId);
+    case "deactivateGlobal":
+      return api.world_books.deactivateGlobal(String(args[0] ?? ""), userId);
+    case "entries.list":
+      return api.world_books.entries.list(String(args[0] ?? ""), { ...args[1] ?? {}, userId });
+    case "entries.get":
+      return api.world_books.entries.get(String(args[0] ?? ""), userId);
+    case "entries.create":
+      return api.world_books.entries.create(String(args[0] ?? ""), args[1] ?? {}, userId);
+    case "entries.update":
+      return api.world_books.entries.update(String(args[0] ?? ""), args[1] ?? {}, userId);
+    case "entries.delete":
+      return api.world_books.entries.delete(String(args[0] ?? ""), userId);
+    default:
+      throw new Error(`Unsupported world_books operation: ${request.operation}`);
+  }
+}
+function installNativeResourceBridge() {
+  api.onFrontendMessage((payload, userId) => {
+    if (!isNativeResourceRequest(payload))
+      return;
+    dispatchNativeResource(payload, userId).then((result) => {
+      api.sendToFrontend({ type: "vsh_native_resource_result", requestId: payload.requestId, result }, userId);
+    }, (error) => {
+      api.sendToFrontend({
+        type: "vsh_native_resource_error",
+        requestId: payload.requestId,
+        error: error instanceof Error ? error.message : String(error)
+      }, userId);
+    });
+  });
+}
 installFetchExternalHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
@@ -1789,6 +1871,7 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
+installNativeResourceBridge();
 function setup() {}
 export {
   setup
