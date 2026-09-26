@@ -3268,7 +3268,7 @@ async function processNode(root, scripts, ctx) {
     cleanupOrphansForMessage(messageId, target);
     normalizeExistingWidgetContainers(target);
     let total = 0;
-    total += await renderJslrFrontendCodeBlocks(root, messageId, ctx);
+    total += await renderJslrFrontendCodeBlocks(root, messageId, scripts, ctx);
     if (scripts.length === 0) {
       const finalTarget = findContentRoot(root);
       normalizeExistingWidgetContainers(finalTarget);
@@ -3770,19 +3770,23 @@ function restoreJslrSourceHosts(target) {
 async function resolveJslrFrontendSourceMacros(source, ctx) {
   if (!hasMacros(source))
     return source;
-  const active = ctx.getActiveChat();
-  const chatId = active.chatId ?? "";
+  const cached = resolutionCache.get(source);
+  if (cached !== undefined)
+    return cached;
+  const { chatId, characterId } = ctx.getActiveChat();
   if (!chatId)
     return source;
   try {
-    const resolved = await resolveMacrosBatch(ctx, chatId, active.characterId ?? null, [source]);
-    return resolved[0] ?? source;
+    const [resolved] = await resolveMacrosBatch(ctx, chatId, characterId, [source]);
+    const out = resolved ?? source;
+    resolutionCache.set(source, out);
+    return out;
   } catch (err) {
-    console.warn("[vishrun:variables] native JSLR frontend macro resolve failed; using raw source:", err instanceof Error ? err.message : String(err));
+    console.warn("[vishrun:variables] native frontend macro resolve failed; using rendered source:", err instanceof Error ? err.message : String(err));
     return source;
   }
 }
-async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
+async function renderJslrFrontendCodeBlocks(root, messageId, scripts, ctx) {
   const target = findContentRoot(root);
   restoreJslrSourceHosts(target);
   const pres = Array.from(target.querySelectorAll("pre"));
@@ -3796,7 +3800,8 @@ async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
     const rawSource = code?.textContent ?? pre.textContent ?? "";
     if (!isJslrFrontendSource(rawSource))
       continue;
-    const source = await resolveJslrFrontendSourceMacros(rawSource, ctx);
+    const expanded = applyNestedPipeline(rawSource, scripts, new Set, 0);
+    const source = await resolveJslrFrontendSourceMacros(expanded, ctx);
     const ordinal = frontendOrdinal++;
     const ordinalKey = String(ordinal);
     const sourceHash = frontendSourceHash(source);
@@ -3817,9 +3822,12 @@ async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe;
     try {
-      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx, {
-        jslrFrontendParity: true
-      });
+      const widget = await buildWidget(source, scriptName, scriptId, messageId, ctx);
+      if (!(widget instanceof HTMLIFrameElement)) {
+        console.debug(`[vishrun] ${scriptName} did not produce an iframe; skipping`);
+        continue;
+      }
+      iframe = widget;
     } catch (err) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
