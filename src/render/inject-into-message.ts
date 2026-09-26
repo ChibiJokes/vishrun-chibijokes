@@ -202,12 +202,32 @@ export async function processNode(
     // normalization that an edit/cancel remount happened to provide.
     normalizeExistingWidgetContainers(target);
 
+    let total = 0;
+
+    // JS Slash Runner parity path. Lumiverse now owns its native display-regex
+    // pipeline, so an active regex can already have transformed the stored
+    // trigger into a fenced frontend code block before Vishrun sees the DOM.
+    // Detect those rendered code blocks and hand their source to the same
+    // sandbox runtime used by legacy card regex widgets. This deliberately
+    // runs before the legacy findRegex pass: if Lumiverse consumed the trigger,
+    // the old pass simply has nothing left to match; if it did not, legacy
+    // behavior remains unchanged.
+    total += await renderJslrFrontendCodeBlocks(root, messageId, ctx);
+
+    // When there are no legacy card regexes, stop here. This keeps the native
+    // JSLR path surgical: it must not run legacy-only cleanup (notably escaped
+    // pseudo-tag stripping) against ordinary Lumiverse messages.
+    if (scripts.length === 0) {
+      const finalTarget = findContentRoot(root);
+      normalizeExistingWidgetContainers(finalTarget);
+      return total;
+    }
+
     // Batch-resolve {{macros}} (e.g. {{getvar::player_grade}}) in this message's
-    // widget HTML before any widget is built. Always returns a map; missing
-    // entries → widget renders the raw template (no worse than pre-MVU-lite).
+    // widget HTML before any legacy regex widget is built. Always returns a map;
+    // missing entries → widget renders the raw template (no worse than pre-MVU-lite).
     const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
 
-    let total = 0;
     // Widget building is async now (buildWidgetIframe → injectShimsAndSizeReporter
     // → transformHtmlForTailwind may fetch the Tailwind bundle on first use).
     // Swallow errors so a single bad render doesn't reject for fire-and-forget
@@ -864,6 +884,96 @@ function findContentRoot(messageNode: HTMLElement): HTMLElement {
   // bubble, alongside the rendered markdown.
   const inner = messageNode.querySelector('[data-component="MessageContent"]') as HTMLElement | null;
   return inner ?? messageNode;
+}
+
+// ─── JS Slash Runner frontend-code path ─────────────────────────────────
+
+/**
+ * JS Slash Runner treats rendered fenced code as a frontend when it contains
+ * a document shell (<html>, <head>, or <body>). Keep the same semantic gate,
+ * but case-insensitive so valid HTML casing does not become a compatibility
+ * footgun. Plain code examples are left untouched.
+ */
+export function isJslrFrontendSource(source: string): boolean {
+  return /<(?:html|head|body)\b/i.test(source);
+}
+
+function frontendSourceHash(source: string): string {
+  // Small deterministic FNV-1a hash. This is identity only, not security.
+  let h = 0x811c9dc5;
+  for (let i = 0; i < source.length; i++) {
+    h ^= source.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0');
+}
+
+function frontendCodeBlockHost(pre: HTMLPreElement): HTMLElement {
+  const parent = pre.parentElement;
+  if (!parent) return pre;
+
+  // Lumiverse wraps fenced blocks in:
+  //   <div class=codeBlock>
+  //     <div class=codeHeader>...<button data-code-copy>...</button></div>
+  //     <pre>...</pre>
+  //   </div>
+  // Replace that whole shell so the language/copy header does not remain
+  // floating above the Vishrun iframe. The data attribute is stable even
+  // though the CSS-module class name is not.
+  if (parent.querySelector('[data-code-copy]') && Array.from(parent.children).includes(pre)) {
+    return parent;
+  }
+  return pre;
+}
+
+async function renderJslrFrontendCodeBlocks(
+  root: HTMLElement,
+  messageId: string,
+  ctx: SpindleFrontendContext,
+): Promise<number> {
+  const target = findContentRoot(root);
+  const pres = Array.from(target.querySelectorAll('pre'));
+  let frontendOrdinal = 0;
+  let rendered = 0;
+
+  for (const pre of pres) {
+    if (pre.closest('[data-vishrun-widget]')) continue;
+
+    const code = pre.querySelector('code');
+    const source = code?.textContent ?? pre.textContent ?? '';
+    if (!isJslrFrontendSource(source)) continue;
+
+    const ordinal = frontendOrdinal++;
+    const host = frontendCodeBlockHost(pre as HTMLPreElement);
+    if (!host.isConnected || !host.parentNode) continue;
+
+    // Stable for a given message/code-block identity, distinct for repeated
+    // identical frontends in the same message. The iframe registry accepts
+    // multiple frames per script id, but keeping the ids distinct makes
+    // diagnostics and targeted cleanup much easier to read.
+    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
+    let iframe: HTMLIFrameElement;
+    try {
+      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx);
+    } catch (err) {
+      console.debug(`[vishrun] failed to render ${scriptName}:`, err);
+      continue;
+    }
+
+    // React may have replaced the message subtree while buildWidgetIframe was
+    // awaiting snapshots/assets. Never attach into stale DOM, and release the
+    // host sandbox record immediately if that happened.
+    if (!host.isConnected || !host.parentNode) {
+      destroyWidgetIframe(iframe, 'jslr-codeblock-stale-host');
+      continue;
+    }
+
+    host.replaceWith(iframe);
+    rendered++;
+  }
+
+  return rendered;
 }
 
 // ─── Shared helpers ────────────────────────────────────────────────────

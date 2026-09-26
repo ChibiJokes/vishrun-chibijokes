@@ -3,6 +3,7 @@ import {
   clearEditingMessageIds,
   computeEditModeTransition,
   getEditingMessageIdsForTest,
+  isJslrFrontendSource,
   processNode,
   type EditTransition,
 } from './inject-into-message';
@@ -28,8 +29,8 @@ function normalCard(messageId: string, body = 'hello'): HTMLElement {
   );
 }
 
-// Minimal ctx stub. With empty scripts the pipeline never touches createSandboxFrame
-// or sendToBackend; getActiveChat() is only consulted if scripts have `{{` macros.
+// Minimal ctx stub. These tests use ordinary prose unless explicitly testing the
+// pure frontend detector, so createSandboxFrame/sendToBackend should stay untouched.
 const stubCtx = {
   getActiveChat: () => ({ chatId: 'chat-test', characterId: 'char-test' }),
   dom: {
@@ -54,6 +55,20 @@ const stubCtx = {
 
 beforeEach(() => {
   clearEditingMessageIds();
+});
+
+// ─── JS Slash Runner frontend detection ─────────────────────────────────
+
+test('isJslrFrontendSource: recognizes document-shell frontends', () => {
+  expect(isJslrFrontendSource('<html><body>Hello</body></html>')).toBe(true);
+  expect(isJslrFrontendSource('<HEAD><script>console.log(1)</script></HEAD>')).toBe(true);
+  expect(isJslrFrontendSource('<body class="app">Hello</body>')).toBe(true);
+});
+
+test('isJslrFrontendSource: leaves ordinary code examples alone', () => {
+  expect(isJslrFrontendSource('const html = "hello";')).toBe(false);
+  expect(isJslrFrontendSource('<div>plain fragment</div>')).toBe(false);
+  expect(isJslrFrontendSource('body { color: red; }')).toBe(false);
 });
 
 // ─── computeEditModeTransition: pure state machine ───────────────────────
