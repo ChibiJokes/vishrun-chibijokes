@@ -3627,7 +3627,7 @@ function isJslrFrontendSource(source) {
 }
 function frontendSourceHash(source) {
   let h = 2166136261;
-  for (let i = 0; i < source.length; i++) {
+  for (let i = 0;i < source.length; i++) {
     h ^= source.charCodeAt(i);
     h = Math.imul(h, 16777619) >>> 0;
   }
