@@ -1024,7 +1024,12 @@ async function renderJslrFrontendCodeBlocks(
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe: HTMLIFrameElement;
     try {
-      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx);
+      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx, {
+        // This source came from a rendered Lumiverse-native regex code block,
+        // so execute it with the same broad compatibility surface JSLR gives
+        // message iframes rather than the legacy lightweight classifier path.
+        jslrFrontendParity: true,
+      });
     } catch (err) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
