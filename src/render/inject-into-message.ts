@@ -212,7 +212,7 @@ export async function processNode(
     // runs before the legacy findRegex pass: if Lumiverse consumed the trigger,
     // the old pass simply has nothing left to match; if it did not, legacy
     // behavior remains unchanged.
-    total += await renderJslrFrontendCodeBlocks(root, messageId, scripts, ctx);
+    total += await renderJslrFrontendCodeBlocks(root, messageId, ctx);
 
     // When there are no legacy card regexes, stop here. This keeps the native
     // JSLR path surgical: it must not run legacy-only cleanup (notably escaped
@@ -934,34 +934,9 @@ function restoreJslrSourceHosts(target: HTMLElement): void {
   }
 }
 
-async function resolveJslrFrontendSourceMacros(
-  source: string,
-  ctx: SpindleFrontendContext,
-): Promise<string> {
-  if (!hasMacros(source)) return source;
-  const cached = resolutionCache.get(source);
-  if (cached !== undefined) return cached;
-
-  const { chatId, characterId } = ctx.getActiveChat();
-  if (!chatId) return source;
-  try {
-    const [resolved] = await resolveMacrosBatch(ctx, chatId, characterId, [source]);
-    const out = resolved ?? source;
-    resolutionCache.set(source, out);
-    return out;
-  } catch (err) {
-    console.warn(
-      '[vishrun:variables] native frontend macro resolve failed; using rendered source:',
-      err instanceof Error ? err.message : String(err),
-    );
-    return source;
-  }
-}
-
 async function renderJslrFrontendCodeBlocks(
   root: HTMLElement,
   messageId: string,
-  scripts: CompiledScript[],
   ctx: SpindleFrontendContext,
 ): Promise<number> {
   const target = findContentRoot(root);
@@ -981,14 +956,8 @@ async function renderJslrFrontendCodeBlocks(
     if (pre.closest('[data-vishrun-widget]')) continue;
 
     const code = pre.querySelector('code');
-    const rawSource = code?.textContent ?? pre.textContent ?? '';
-    if (!isJslrFrontendSource(rawSource)) continue;
-
-    // From this point forward, use the EXACT SAME transformation path as
-    // Vishrun's original imported-card regex renderer: nested regex expansion,
-    // macro resolution, then buildWidget(). The native path is only a detector.
-    const expanded = applyNestedPipeline(rawSource, scripts, new Set(), 0);
-    const source = await resolveJslrFrontendSourceMacros(expanded, ctx);
+    const source = code?.textContent ?? pre.textContent ?? '';
+    if (!isJslrFrontendSource(source)) continue;
 
     const ordinal = frontendOrdinal++;
     const ordinalKey = String(ordinal);
@@ -1020,15 +989,7 @@ async function renderJslrFrontendCodeBlocks(
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe: HTMLIFrameElement;
     try {
-      const widget = await buildWidget(source, scriptName, scriptId, messageId, ctx);
-      // A JSLR frontend necessarily contains a document shell, so buildWidget
-      // routes it through buildWidgetIframe. Keep this guard defensive in case
-      // the frontend detector is broadened in the future.
-      if (!(widget instanceof HTMLIFrameElement)) {
-        console.debug(`[vishrun] ${scriptName} did not produce an iframe; skipping`);
-        continue;
-      }
-      iframe = widget;
+      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx);
     } catch (err) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
@@ -1101,11 +1062,6 @@ function collectTextNodes(root: HTMLElement): Text[] {
       let p = node.parentElement;
       while (p && p !== root) {
         if (p.hasAttribute('data-vishrun-widget')) return NodeFilter.FILTER_REJECT;
-        // Native Lumiverse frontend source is React-owned input for the path
-        // above, not message prose for the legacy regex scanner. Never let the
-        // old pass mutate the hidden <pre>/<code> that we are rendering from.
-        if (p.hasAttribute('data-vishrun-jslr-source-host')) return NodeFilter.FILTER_REJECT;
-        if (p.tagName === 'PRE' || p.tagName === 'CODE') return NodeFilter.FILTER_REJECT;
         p = p.parentElement;
       }
       return NodeFilter.FILTER_ACCEPT;

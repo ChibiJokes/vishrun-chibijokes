@@ -53,8 +53,6 @@ export function linearizeBubble(root: HTMLElement): LinearResult {
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const el = node as HTMLElement;
     if (el.hasAttribute && el.hasAttribute('data-vishrun-widget')) return;
-    if (el.hasAttribute && el.hasAttribute('data-vishrun-jslr-source-host')) return;
-    if (el.tagName === 'PRE' || el.tagName === 'CODE') return;
     if (el.tagName === 'BR') {
       text += '\n';
       return;
