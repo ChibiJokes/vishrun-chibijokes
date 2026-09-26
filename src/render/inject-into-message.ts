@@ -212,7 +212,7 @@ export async function processNode(
     // runs before the legacy findRegex pass: if Lumiverse consumed the trigger,
     // the old pass simply has nothing left to match; if it did not, legacy
     // behavior remains unchanged.
-    total += await renderJslrFrontendCodeBlocks(root, messageId, ctx);
+    total += await renderJslrFrontendCodeBlocks(root, messageId, scripts, ctx);
 
     // When there are no legacy card regexes, stop here. This keeps the native
     // JSLR path surgical: it must not run legacy-only cleanup (notably escaped
@@ -938,26 +938,20 @@ async function resolveJslrFrontendSourceMacros(
   source: string,
   ctx: SpindleFrontendContext,
 ): Promise<string> {
-  // Legacy imported regex_scripts are macro-resolved by Vishrun before their
-  // replaceString enters buildWidgetIframe(). Native Lumiverse display-regex
-  // frontends must receive the same treatment or payloads containing macros
-  // such as {{user}} / {{getvar::...}} behave differently depending on which
-  // ingestion path created the widget.
   if (!hasMacros(source)) return source;
-  const active = ctx.getActiveChat();
-  const chatId = active.chatId ?? '';
+  const cached = resolutionCache.get(source);
+  if (cached !== undefined) return cached;
+
+  const { chatId, characterId } = ctx.getActiveChat();
   if (!chatId) return source;
   try {
-    const resolved = await resolveMacrosBatch(
-      ctx,
-      chatId,
-      active.characterId ?? null,
-      [source],
-    );
-    return resolved[0] ?? source;
+    const [resolved] = await resolveMacrosBatch(ctx, chatId, characterId, [source]);
+    const out = resolved ?? source;
+    resolutionCache.set(source, out);
+    return out;
   } catch (err) {
     console.warn(
-      '[vishrun:variables] native JSLR frontend macro resolve failed; using raw source:',
+      '[vishrun:variables] native frontend macro resolve failed; using rendered source:',
       err instanceof Error ? err.message : String(err),
     );
     return source;
@@ -967,6 +961,7 @@ async function resolveJslrFrontendSourceMacros(
 async function renderJslrFrontendCodeBlocks(
   root: HTMLElement,
   messageId: string,
+  scripts: CompiledScript[],
   ctx: SpindleFrontendContext,
 ): Promise<number> {
   const target = findContentRoot(root);
@@ -989,10 +984,11 @@ async function renderJslrFrontendCodeBlocks(
     const rawSource = code?.textContent ?? pre.textContent ?? '';
     if (!isJslrFrontendSource(rawSource)) continue;
 
-    // Match the legacy imported-regex path: resolve Vishrun macros before the
-    // HTML enters the shared iframe runtime. This is intentionally done after
-    // the frontend gate so ordinary code examples never invoke macro work.
-    const source = await resolveJslrFrontendSourceMacros(rawSource, ctx);
+    // From this point forward, use the EXACT SAME transformation path as
+    // Vishrun's original imported-card regex renderer: nested regex expansion,
+    // macro resolution, then buildWidget(). The native path is only a detector.
+    const expanded = applyNestedPipeline(rawSource, scripts, new Set(), 0);
+    const source = await resolveJslrFrontendSourceMacros(expanded, ctx);
 
     const ordinal = frontendOrdinal++;
     const ordinalKey = String(ordinal);
@@ -1024,12 +1020,15 @@ async function renderJslrFrontendCodeBlocks(
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe: HTMLIFrameElement;
     try {
-      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx, {
-        // This source came from a rendered Lumiverse-native regex code block,
-        // so execute it with the same broad compatibility surface JSLR gives
-        // message iframes rather than the legacy lightweight classifier path.
-        jslrFrontendParity: true,
-      });
+      const widget = await buildWidget(source, scriptName, scriptId, messageId, ctx);
+      // A JSLR frontend necessarily contains a document shell, so buildWidget
+      // routes it through buildWidgetIframe. Keep this guard defensive in case
+      // the frontend detector is broadened in the future.
+      if (!(widget instanceof HTMLIFrameElement)) {
+        console.debug(`[vishrun] ${scriptName} did not produce an iframe; skipping`);
+        continue;
+      }
+      iframe = widget;
     } catch (err) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
@@ -1102,13 +1101,9 @@ function collectTextNodes(root: HTMLElement): Text[] {
       let p = node.parentElement;
       while (p && p !== root) {
         if (p.hasAttribute('data-vishrun-widget')) return NodeFilter.FILTER_REJECT;
-        // A Lumiverse-native regex frontend remains in the DOM as a hidden
-        // <pre>/<code> source host so React can update it live. Treat that
-        // source exactly like an already-rendered widget boundary: legacy card
-        // regexes must never scan/mutate the frontend source text. Without
-        // this, characters that still carry imported regex_scripts can rewrite
-        // the hidden HTML and make the native frontend work on some cards but
-        // fail on others.
+        // Native Lumiverse frontend source is React-owned input for the path
+        // above, not message prose for the legacy regex scanner. Never let the
+        // old pass mutate the hidden <pre>/<code> that we are rendering from.
         if (p.hasAttribute('data-vishrun-jslr-source-host')) return NodeFilter.FILTER_REJECT;
         if (p.tagName === 'PRE' || p.tagName === 'CODE') return NodeFilter.FILTER_REJECT;
         p = p.parentElement;

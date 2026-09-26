@@ -53,10 +53,6 @@ export function linearizeBubble(root: HTMLElement): LinearResult {
     if (node.nodeType !== Node.ELEMENT_NODE) return;
     const el = node as HTMLElement;
     if (el.hasAttribute && el.hasAttribute('data-vishrun-widget')) return;
-    // Native Lumiverse regex frontends keep their fenced <pre>/<code> source
-    // hidden in the live DOM for React reconciliation. Never feed that source
-    // back into legacy multi-line regex matching; it is already-rendered
-    // frontend input, not chat prose.
     if (el.hasAttribute && el.hasAttribute('data-vishrun-jslr-source-host')) return;
     if (el.tagName === 'PRE' || el.tagName === 'CODE') return;
     if (el.tagName === 'BR') {
