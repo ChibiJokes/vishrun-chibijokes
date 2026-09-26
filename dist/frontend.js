@@ -2078,7 +2078,8 @@ function resolveCurrentMessageIndex(messageId, snapshot, domIndex) {
     return { index: snapPos, source: "snapshot" };
   return { index: domIndex, source: "dom-fallback" };
 }
-async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
+async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx, options = {}) {
+  const jslrFrontendParity = options.jslrFrontendParity === true;
   const detectedEnv = classifyWidgetEnvironment(html);
   const promotedForDynamicApi = !shouldInjectThHelpersShim(detectedEnv) && (containsScriptTag(html) || containsInlineEventHandler(html));
   const env = promotedForDynamicApi ? "tavern-helpers-light" : detectedEnv;
@@ -2094,14 +2095,15 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
       triggerKey
     }));
   }
+  const needsThHelpers = jslrFrontendParity || shouldInjectThHelpersShim(env);
   const [messagesSnapshot, variablesSnapshot, chatState] = await Promise.all([
-    shouldInjectThHelpersShim(env) && !promotedForDynamicApi ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
+    needsThHelpers && (jslrFrontendParity || !promotedForDynamicApi) ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
     shouldInjectMvuShim(env) ? fetchVariablesSnapshot(snapshotContext, ctx) : Promise.resolve({ stat_data: {} }),
-    shouldInjectThHelpersShim(env) ? fetchChatVariableState(chatId) : Promise.resolve(undefined)
+    needsThHelpers ? fetchChatVariableState(chatId) : Promise.resolve(undefined)
   ]);
   const resolved = resolveCurrentMessageIndex(messageId, messagesSnapshot, domIndex);
   const currentMessageIndex = resolved.index;
-  if (resolved.source === "dom-fallback" && VSH_VISHRUN_DIAG && shouldInjectThHelpersShim(env) && !promotedForDynamicApi) {
+  if (resolved.source === "dom-fallback" && VSH_VISHRUN_DIAG && needsThHelpers && (jslrFrontendParity || !promotedForDynamicApi)) {
     console.log("[vishrun:bridge] currentMessageDbIndex-fallback", JSON.stringify({
       messageId,
       reason: "not-in-snapshot",
@@ -2115,7 +2117,8 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     currentMessageIndex,
     messagesSnapshot,
     variablesSnapshot,
-    chatState
+    chatState,
+    jslrFrontendParity
   });
   const frame = ctx.dom.createSandboxFrame({
     html: srcdoc,
@@ -2144,8 +2147,23 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   iframe.style.maxHeight = "none";
   iframe.style.maxWidth = "100%";
   const unbindVariables = chatState ? bindChatVariableState(frame, ctx, chatState, false) : () => {};
+  const eventUnsubs = [];
+  if (jslrFrontendParity) {
+    for (const eventName of MESSAGE_IFRAME_BRIDGED_EVENTS) {
+      eventUnsubs.push(ctx.events.on(eventName, (data) => {
+        try {
+          frame.postMessage({ type: "vsh_event", event: eventName, data });
+        } catch {}
+      }));
+    }
+  }
   widgetFrameDestroyers.set(iframe, () => {
     unbindVariables();
+    for (const unsub of eventUnsubs) {
+      try {
+        unsub();
+      } catch {}
+    }
     frame.destroy();
   });
   registerWidget(messageId, scriptId, iframe);
@@ -2196,7 +2214,7 @@ function widgetNeedsIsolation(html) {
 async function injectShimsAndSizeReporter(html, ctx, iframeCtx) {
   const withExternalScripts = await transformHtmlForExternalScripts(html, ctx);
   const withFonts = await transformHtmlForGoogleFonts(withExternalScripts, ctx);
-  const withoutCdnJQuery = shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
+  const withoutCdnJQuery = iframeCtx.jslrFrontendParity || shouldInjectJQuery(iframeCtx.env) ? stripCdnJQuery(withFonts) : withFonts;
   const stripped = rewriteCssExternalUrls(stripExternalImageSrc(withoutCdnJQuery));
   const head = buildHeadInjection(iframeCtx);
   const withHead = injectIntoHead(stripped, head);
@@ -2219,10 +2237,60 @@ function rewriteCssExternalUrls(html) {
     return `url("${VISHRUN_CSS_SENTINEL_PREFIX}${encoded}")`;
   });
 }
+var MESSAGE_IFRAME_BRIDGED_EVENTS = [
+  "CHAT_CHANGED",
+  "CHAT_SWITCHED",
+  "MESSAGE_RECEIVED",
+  "MESSAGE_SENT",
+  "GENERATION_STARTED",
+  "GENERATION_ENDED",
+  "GENERATION_STOPPED",
+  "CHARACTER_MESSAGE_RENDERED",
+  "USER_MESSAGE_RENDERED",
+  "MESSAGE_SWIPED",
+  "MESSAGE_EDITED"
+];
+function jslrMessageEventBridgeShim() {
+  return `<script>(function(){
+var ET={
+  CHAT_CHANGED:'CHAT_CHANGED',CHAT_SWITCHED:'CHAT_SWITCHED',MESSAGE_RECEIVED:'MESSAGE_RECEIVED',
+  MESSAGE_SENT:'MESSAGE_SENT',GENERATION_STARTED:'GENERATION_STARTED',
+  GENERATION_ENDED:'GENERATION_ENDED',GENERATION_STOPPED:'GENERATION_STOPPED',
+  CHARACTER_MESSAGE_RENDERED:'CHARACTER_MESSAGE_RENDERED',USER_MESSAGE_RENDERED:'USER_MESSAGE_RENDERED',
+  MESSAGE_SWIPED:'MESSAGE_SWIPED',MESSAGE_EDITED:'MESSAGE_EDITED'
+};
+window.event_types=window.event_types||ET;
+var _h={};
+if(!window.eventSource){
+  window.eventSource={
+    on:function(e,fn){(_h[e]=_h[e]||[]).push(fn);},
+    makeFirst:function(e,fn){(_h[e]=_h[e]||[]).unshift(fn);},
+    off:function(e,fn){if(!fn){_h[e]=[];return;} _h[e]=(_h[e]||[]).filter(function(h){return h!==fn;});},
+    emit:function(e,d){(_h[e]||[]).slice().forEach(function(fn){try{fn(d);}catch(ex){console.error('[vishrun:jslr-event]',ex);}});}
+  };
+}
+if(window.spindleSandbox&&typeof window.spindleSandbox.onMessage==='function'){
+  window.spindleSandbox.onMessage(function(msg){
+    if(!msg||msg.type!=='vsh_event')return;
+    if(window.eventSource&&typeof window.eventSource.emit==='function') window.eventSource.emit(msg.event,msg.data);
+  });
+}
+})();</script>`;
+}
+function jslrTavernHelperFacadeShim() {
+  return `<script>(function(){
+var th=(window.TavernHelper&&typeof window.TavernHelper==='object')?window.TavernHelper:{};
+var names=['getCurrentMessageId','getChatId','getChatMessages','setChatMessage','createChatMessages','triggerSlash','triggerSlashWithResult','getAllVariables','getVariables','getVariable','setVariable','replaceVariables','updateVariablesWith','insertOrAssignVariables','insertVariables','deleteVariable'];
+for(var i=0;i<names.length;i++){var n=names[i];if(typeof window[n]==='function'&&typeof th[n]!=='function')th[n]=window[n].bind(window);}
+window.TavernHelper=th;
+})();</script>`;
+}
 function buildHeadInjection(iframeCtx) {
-  const jquery = shouldInjectJQuery(iframeCtx.env) ? jqueryShim() : "";
-  const lodash = shouldInjectLodash(iframeCtx.env) && !shouldInjectThHelpersShim(iframeCtx.env) ? lodashShim() : "";
-  const thHelpers = shouldInjectThHelpersShim(iframeCtx.env) ? thHelpersShim({
+  const parity = iframeCtx.jslrFrontendParity === true;
+  const jquery = parity || shouldInjectJQuery(iframeCtx.env) ? jqueryShim() : "";
+  const needsThHelpers = parity || shouldInjectThHelpersShim(iframeCtx.env);
+  const lodash = shouldInjectLodash(iframeCtx.env) && !needsThHelpers ? lodashShim() : "";
+  const thHelpers = needsThHelpers ? thHelpersShim({
     currentMessageIndex: iframeCtx.currentMessageIndex,
     currentMessageId: iframeCtx.messageId,
     chatId: iframeCtx.chatId,
@@ -2231,7 +2299,7 @@ function buildHeadInjection(iframeCtx) {
     chatVariablesSnapshot: iframeCtx.chatState?.ready === false ? undefined : iframeCtx.chatState?.variables
   }) : "";
   const mvu = shouldInjectMvuShim(iframeCtx.env) ? mvuShim({ variablesSnapshot: iframeCtx.variablesSnapshot }) : "";
-  return jsRunnerLayoutReset() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + thHelpers + mvu;
+  return jsRunnerLayoutReset() + buildViewportHeightShim() + setChatMessagesShim() + clipboardAlertShim() + externalImageProxyHelper() + fontFaceHelper() + jquery + lodash + (parity ? jslrMessageEventBridgeShim() : "") + thHelpers + (parity ? jslrTavernHelperFacadeShim() : "") + mvu;
 }
 function jsRunnerLayoutReset() {
   return `<style data-vishrun-jsr-layout>` + `*,*::before,*::after{box-sizing:border-box;-webkit-tap-highlight-color:transparent!important;}` + `html,body{margin:0!important;padding:0;overflow:hidden!important;max-width:100%!important;-webkit-tap-highlight-color:transparent!important;}` + `</style>`;
@@ -2355,63 +2423,77 @@ function externalImageProxyHelper() {
 
   var LOADING_KEY = 'data-vishrun-extimg-loading';
   var RETRY_KEY = 'data-vishrun-extimg-retries';
-  var MAX_IMAGE_RETRIES = 4;
+  var MAX_IMAGE_RETRIES = 3;
+  var IMAGE_RETRY_DELAYS = [250, 750, 1500];
 
   function setBlobSrc(img, blobUrl) {
-    // Keep the original URL until a valid blob URL exists. A transient
-    // corsProxy failure must not strand the image without a recoverable src.
-    // Only successful proxy resolution is allowed to consume KEY.
+    // Bypass the patched setter via the native descriptor — assigning
+    // \`img.src = blobUrl\` would route through our wrapper again. Using
+    // setAttribute avoids the IDL setter entirely.
     img.removeAttribute(KEY);
+    img.removeAttribute(LOADING_KEY);
     img.removeAttribute(RETRY_KEY);
     img.setAttribute('src', blobUrl);
   }
 
   function scheduleImgRetry(img, url, reason) {
-    if (!img || !url) return;
-    var attempts = parseInt(img.getAttribute(RETRY_KEY) || '0', 10);
-    if (!isFinite(attempts) || attempts < 0) attempts = 0;
-    if (attempts >= MAX_IMAGE_RETRIES) {
-      console.warn('[vishrun] external image retry limit reached for', url, reason || '');
+    if (!img || !img.isConnected) return;
+    // If script code changed the URL while the old request was in flight,
+    // immediately process the new URL instead of retrying the stale one.
+    if (img.getAttribute(KEY) !== url) {
+      img.removeAttribute(RETRY_KEY);
+      processImg(img);
       return;
     }
+
+    var attempts = Number(img.getAttribute(RETRY_KEY) || '0');
+    if (!Number.isFinite(attempts) || attempts < 0) attempts = 0;
+    if (attempts >= MAX_IMAGE_RETRIES) {
+      console.warn('[vishrun] external image failed after retries:', url, reason || 'unknown error');
+      return;
+    }
+
     attempts += 1;
     img.setAttribute(RETRY_KEY, String(attempts));
-    // Small backoff: 250ms, 500ms, 750ms, 1000ms. KEY remains on the
-    // element the entire time, so any later scan can recover the image too.
+    var delay = IMAGE_RETRY_DELAYS[Math.min(attempts - 1, IMAGE_RETRY_DELAYS.length - 1)];
     setTimeout(function() {
       if (!img.isConnected) return;
-      if (!img.getAttribute(KEY)) img.setAttribute(KEY, url);
+      if (img.getAttribute(KEY) !== url) {
+        img.removeAttribute(RETRY_KEY);
+      }
       processImg(img);
-    }, 250 * attempts);
-  }
-
-  function failImg(img, url, reason, err) {
-    img.removeAttribute(LOADING_KEY);
-    if (err !== undefined) console.warn(reason, url, err);
-    else console.warn(reason, url);
-    scheduleImgRetry(img, url, reason);
+    }, delay);
   }
 
   function processImg(img) {
     var url = img.getAttribute(KEY);
     if (!url) return;
-    // KEY intentionally stays present while loading. Guard explicitly so
-    // MutationObserver/subtree scans cannot start duplicate requests.
-    if (img.hasAttribute(LOADING_KEY)) return;
+    if (img.getAttribute(LOADING_KEY) === '1') return;
     if (!window.spindleSandbox || typeof window.spindleSandbox.corsProxy !== 'function') {
-      failImg(img, url, '[vishrun] corsProxy unavailable, retrying image:');
+      console.warn('[vishrun] corsProxy unavailable, leaving image unfetched:', url);
+      scheduleImgRetry(img, url, 'corsProxy unavailable');
       return;
     }
+
+    // Keep KEY intact while the request is in flight. The old implementation
+    // removed it before fetching, which made one transient proxy failure
+    // terminal: there was no src and no original URL left to retry.
     img.setAttribute(LOADING_KEY, '1');
     window.spindleSandbox.corsProxy(url, { responseType: 'arraybuffer' }).then(
       function(res) {
+        // The image may have been repointed while this request was pending.
+        // Never overwrite a newer URL with an older response.
+        if (img.getAttribute(KEY) !== url) {
+          img.removeAttribute(LOADING_KEY);
+          img.removeAttribute(RETRY_KEY);
+          processImg(img);
+          return;
+        }
         try {
-          // loader.ts:196-202 already converted base64 → Uint8Array on
-          // the host side. Treat the body as bytes; constructing a
-          // Blob from a Uint8Array preserves binary fidelity.
+          // loader.ts converts base64 → Uint8Array on the host side. Treat
+          // the body as bytes so PNG/JPEG/WebP binary data stays intact.
           if (!res || !res.body) {
-            failImg(img, url, '[vishrun] corsProxy returned no body for');
-            return;
+            throw new Error('corsProxy returned no body');
           }
           var ct = '';
           if (res.headers) {
@@ -2421,13 +2503,16 @@ function externalImageProxyHelper() {
           var blob = new Blob([res.body], { type: ct });
           var blobUrl = URL.createObjectURL(blob);
           setBlobSrc(img, blobUrl);
-          img.removeAttribute(LOADING_KEY);
         } catch (e) {
-          failImg(img, url, '[vishrun] corsProxy decode failed for', e);
+          img.removeAttribute(LOADING_KEY);
+          console.warn('[vishrun] corsProxy decode failed for', url, e);
+          scheduleImgRetry(img, url, e);
         }
       },
       function(err) {
-        failImg(img, url, '[vishrun] corsProxy fetch failed for', err);
+        img.removeAttribute(LOADING_KEY);
+        console.warn('[vishrun] corsProxy fetch failed for', url, err);
+        scheduleImgRetry(img, url, err);
       }
     );
   }
@@ -3062,6 +3147,10 @@ function linearizeBubble(root) {
     const el = node;
     if (el.hasAttribute && el.hasAttribute("data-vishrun-widget"))
       return;
+    if (el.hasAttribute && el.hasAttribute("data-vishrun-jslr-source-host"))
+      return;
+    if (el.tagName === "PRE" || el.tagName === "CODE")
+      return;
     if (el.tagName === "BR") {
       text += `
 `;
@@ -3672,37 +3761,84 @@ function frontendCodeBlockHost(pre) {
   }
   return pre;
 }
+function restoreJslrSourceHosts(target) {
+  for (const host of Array.from(target.querySelectorAll('[data-vishrun-jslr-source-host="true"]'))) {
+    host.style.display = "";
+    host.removeAttribute("data-vishrun-jslr-source-host");
+  }
+}
+async function resolveJslrFrontendSourceMacros(source, ctx) {
+  if (!hasMacros(source))
+    return source;
+  const active = ctx.getActiveChat();
+  const chatId = active.chatId ?? "";
+  if (!chatId)
+    return source;
+  try {
+    const resolved = await resolveMacrosBatch(ctx, chatId, active.characterId ?? null, [source]);
+    return resolved[0] ?? source;
+  } catch (err) {
+    console.warn("[vishrun:variables] native JSLR frontend macro resolve failed; using raw source:", err instanceof Error ? err.message : String(err));
+    return source;
+  }
+}
 async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
   const target = findContentRoot(root);
+  restoreJslrSourceHosts(target);
   const pres = Array.from(target.querySelectorAll("pre"));
+  const liveOrdinals = new Set;
   let frontendOrdinal = 0;
   let rendered = 0;
   for (const pre of pres) {
     if (pre.closest("[data-vishrun-widget]"))
       continue;
     const code = pre.querySelector("code");
-    const source = code?.textContent ?? pre.textContent ?? "";
-    if (!isJslrFrontendSource(source))
+    const rawSource = code?.textContent ?? pre.textContent ?? "";
+    if (!isJslrFrontendSource(rawSource))
       continue;
+    const source = await resolveJslrFrontendSourceMacros(rawSource, ctx);
     const ordinal = frontendOrdinal++;
+    const ordinalKey = String(ordinal);
+    const sourceHash = frontendSourceHash(source);
     const host = frontendCodeBlockHost(pre);
     if (!host.isConnected || !host.parentNode)
       continue;
-    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    liveOrdinals.add(ordinalKey);
+    host.setAttribute("data-vishrun-jslr-source-host", "true");
+    host.style.display = "none";
+    const existing = target.querySelector(`iframe[data-vishrun-jslr-frontend="true"][data-vishrun-jslr-ordinal="${ordinalKey}"]`);
+    if (existing?.getAttribute("data-vishrun-jslr-source-hash") === sourceHash) {
+      continue;
+    }
+    if (existing) {
+      destroyWidgetIframe(existing, "jslr-codeblock-source-changed");
+    }
+    const scriptId = `jslr-frontend-${ordinal}-${sourceHash}`;
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe;
     try {
-      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx);
+      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx, {
+        jslrFrontendParity: true
+      });
     } catch (err) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
     }
+    iframe.setAttribute("data-vishrun-jslr-frontend", "true");
+    iframe.setAttribute("data-vishrun-jslr-ordinal", ordinalKey);
+    iframe.setAttribute("data-vishrun-jslr-source-hash", sourceHash);
     if (!host.isConnected || !host.parentNode) {
       destroyWidgetIframe(iframe, "jslr-codeblock-stale-host");
       continue;
     }
-    host.replaceWith(iframe);
+    host.insertAdjacentElement("afterend", iframe);
     rendered++;
+  }
+  for (const iframe of Array.from(target.querySelectorAll('iframe[data-vishrun-jslr-frontend="true"]'))) {
+    const ordinal = iframe.getAttribute("data-vishrun-jslr-ordinal") ?? "";
+    if (!liveOrdinals.has(ordinal)) {
+      destroyWidgetIframe(iframe, "jslr-codeblock-no-longer-active");
+    }
   }
   return rendered;
 }
@@ -3727,6 +3863,10 @@ function collectTextNodes(root) {
       let p = node.parentElement;
       while (p && p !== root) {
         if (p.hasAttribute("data-vishrun-widget"))
+          return NodeFilter.FILTER_REJECT;
+        if (p.hasAttribute("data-vishrun-jslr-source-host"))
+          return NodeFilter.FILTER_REJECT;
+        if (p.tagName === "PRE" || p.tagName === "CODE")
           return NodeFilter.FILTER_REJECT;
         p = p.parentElement;
       }
