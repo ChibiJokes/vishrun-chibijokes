@@ -3642,9 +3642,17 @@ function frontendCodeBlockHost(pre) {
   }
   return pre;
 }
+function restoreJslrSourceHosts(target) {
+  for (const host of Array.from(target.querySelectorAll('[data-vishrun-jslr-source-host="true"]'))) {
+    host.style.display = "";
+    host.removeAttribute("data-vishrun-jslr-source-host");
+  }
+}
 async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
   const target = findContentRoot(root);
+  restoreJslrSourceHosts(target);
   const pres = Array.from(target.querySelectorAll("pre"));
+  const liveOrdinals = new Set;
   let frontendOrdinal = 0;
   let rendered = 0;
   for (const pre of pres) {
@@ -3655,10 +3663,22 @@ async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
     if (!isJslrFrontendSource(source))
       continue;
     const ordinal = frontendOrdinal++;
+    const ordinalKey = String(ordinal);
+    const sourceHash = frontendSourceHash(source);
     const host = frontendCodeBlockHost(pre);
     if (!host.isConnected || !host.parentNode)
       continue;
-    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    liveOrdinals.add(ordinalKey);
+    host.setAttribute("data-vishrun-jslr-source-host", "true");
+    host.style.display = "none";
+    const existing = target.querySelector(`iframe[data-vishrun-jslr-frontend="true"][data-vishrun-jslr-ordinal="${ordinalKey}"]`);
+    if (existing?.getAttribute("data-vishrun-jslr-source-hash") === sourceHash) {
+      continue;
+    }
+    if (existing) {
+      destroyWidgetIframe(existing, "jslr-codeblock-source-changed");
+    }
+    const scriptId = `jslr-frontend-${ordinal}-${sourceHash}`;
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe;
     try {
@@ -3667,12 +3687,21 @@ async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
     }
+    iframe.setAttribute("data-vishrun-jslr-frontend", "true");
+    iframe.setAttribute("data-vishrun-jslr-ordinal", ordinalKey);
+    iframe.setAttribute("data-vishrun-jslr-source-hash", sourceHash);
     if (!host.isConnected || !host.parentNode) {
       destroyWidgetIframe(iframe, "jslr-codeblock-stale-host");
       continue;
     }
-    host.replaceWith(iframe);
+    host.insertAdjacentElement("afterend", iframe);
     rendered++;
+  }
+  for (const iframe of Array.from(target.querySelectorAll('iframe[data-vishrun-jslr-frontend="true"]'))) {
+    const ordinal = iframe.getAttribute("data-vishrun-jslr-ordinal") ?? "";
+    if (!liveOrdinals.has(ordinal)) {
+      destroyWidgetIframe(iframe, "jslr-codeblock-no-longer-active");
+    }
   }
   return rendered;
 }
