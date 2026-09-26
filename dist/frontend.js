@@ -2353,24 +2353,56 @@ function externalImageProxyHelper() {
     }
   } catch (e) {}
 
+  var LOADING_KEY = 'data-vishrun-extimg-loading';
+  var RETRY_KEY = 'data-vishrun-extimg-retries';
+  var MAX_IMAGE_RETRIES = 4;
+
   function setBlobSrc(img, blobUrl) {
-    // Bypass the patched setter via the native descriptor — assigning
-    // \`img.src = blobUrl\` would route through our wrapper again. Using
-    // setAttribute avoids the IDL setter entirely.
+    // Keep the original URL until a valid blob URL exists. A transient
+    // corsProxy failure must not strand the image without a recoverable src.
+    // Only successful proxy resolution is allowed to consume KEY.
     img.removeAttribute(KEY);
+    img.removeAttribute(RETRY_KEY);
     img.setAttribute('src', blobUrl);
+  }
+
+  function scheduleImgRetry(img, url, reason) {
+    if (!img || !url) return;
+    var attempts = parseInt(img.getAttribute(RETRY_KEY) || '0', 10);
+    if (!isFinite(attempts) || attempts < 0) attempts = 0;
+    if (attempts >= MAX_IMAGE_RETRIES) {
+      console.warn('[vishrun] external image retry limit reached for', url, reason || '');
+      return;
+    }
+    attempts += 1;
+    img.setAttribute(RETRY_KEY, String(attempts));
+    // Small backoff: 250ms, 500ms, 750ms, 1000ms. KEY remains on the
+    // element the entire time, so any later scan can recover the image too.
+    setTimeout(function() {
+      if (!img.isConnected) return;
+      if (!img.getAttribute(KEY)) img.setAttribute(KEY, url);
+      processImg(img);
+    }, 250 * attempts);
+  }
+
+  function failImg(img, url, reason, err) {
+    img.removeAttribute(LOADING_KEY);
+    if (err !== undefined) console.warn(reason, url, err);
+    else console.warn(reason, url);
+    scheduleImgRetry(img, url, reason);
   }
 
   function processImg(img) {
     var url = img.getAttribute(KEY);
     if (!url) return;
+    // KEY intentionally stays present while loading. Guard explicitly so
+    // MutationObserver/subtree scans cannot start duplicate requests.
+    if (img.hasAttribute(LOADING_KEY)) return;
     if (!window.spindleSandbox || typeof window.spindleSandbox.corsProxy !== 'function') {
-      console.warn('[vishrun] corsProxy unavailable, leaving image unfetched:', url);
+      failImg(img, url, '[vishrun] corsProxy unavailable, retrying image:');
       return;
     }
-    // Mark in-flight so a MutationObserver re-fire doesn't double-fetch.
-    img.removeAttribute(KEY);
-    img.setAttribute('data-vishrun-extimg-loading', '1');
+    img.setAttribute(LOADING_KEY, '1');
     window.spindleSandbox.corsProxy(url, { responseType: 'arraybuffer' }).then(
       function(res) {
         try {
@@ -2378,7 +2410,7 @@ function externalImageProxyHelper() {
           // the host side. Treat the body as bytes; constructing a
           // Blob from a Uint8Array preserves binary fidelity.
           if (!res || !res.body) {
-            console.warn('[vishrun] corsProxy returned no body for', url);
+            failImg(img, url, '[vishrun] corsProxy returned no body for');
             return;
           }
           var ct = '';
@@ -2389,15 +2421,13 @@ function externalImageProxyHelper() {
           var blob = new Blob([res.body], { type: ct });
           var blobUrl = URL.createObjectURL(blob);
           setBlobSrc(img, blobUrl);
+          img.removeAttribute(LOADING_KEY);
         } catch (e) {
-          console.warn('[vishrun] corsProxy decode failed for', url, e);
-        } finally {
-          img.removeAttribute('data-vishrun-extimg-loading');
+          failImg(img, url, '[vishrun] corsProxy decode failed for', e);
         }
       },
       function(err) {
-        img.removeAttribute('data-vishrun-extimg-loading');
-        console.warn('[vishrun] corsProxy fetch failed for', url, err);
+        failImg(img, url, '[vishrun] corsProxy fetch failed for', err);
       }
     );
   }
