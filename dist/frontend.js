@@ -2037,6 +2037,14 @@ function hasRegisteredWidgetsFor(messageId, scriptId) {
   const set = iframeRegistry.get(registryKey(messageId, scriptId));
   return !!set && set.size > 0;
 }
+function hasRegisteredWidgetsForMessage(messageId) {
+  const prefix = messageId + REGISTRY_SEP;
+  for (const [key, set] of iframeRegistry) {
+    if (key.startsWith(prefix) && set.size > 0)
+      return true;
+  }
+  return false;
+}
 function destroyRegisteredWidgetsFor(messageId, scriptId, reason = "destroy-registered") {
   const set = iframeRegistry.get(registryKey(messageId, scriptId));
   if (!set)
@@ -3140,8 +3148,14 @@ async function processNode(root, scripts, ctx) {
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
     normalizeExistingWidgetContainers(target);
-    const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     let total = 0;
+    total += await renderJslrFrontendCodeBlocks(root, messageId, ctx);
+    if (scripts.length === 0) {
+      const finalTarget = findContentRoot(root);
+      normalizeExistingWidgetContainers(finalTarget);
+      return total;
+    }
+    const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     try {
       for (const script of scripts) {
         if (!isPlaceholderLikeKind(script.kind))
@@ -3608,6 +3622,60 @@ function findContentRoot(messageNode) {
   const inner = messageNode.querySelector('[data-component="MessageContent"]');
   return inner ?? messageNode;
 }
+function isJslrFrontendSource(source) {
+  return /<(?:html|head|body)\b/i.test(source);
+}
+function frontendSourceHash(source) {
+  let h = 2166136261;
+  for (let i = 0;i < source.length; i++) {
+    h ^= source.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+function frontendCodeBlockHost(pre) {
+  const parent = pre.parentElement;
+  if (!parent)
+    return pre;
+  if (parent.querySelector("[data-code-copy]") && Array.from(parent.children).includes(pre)) {
+    return parent;
+  }
+  return pre;
+}
+async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
+  const target = findContentRoot(root);
+  const pres = Array.from(target.querySelectorAll("pre"));
+  let frontendOrdinal = 0;
+  let rendered = 0;
+  for (const pre of pres) {
+    if (pre.closest("[data-vishrun-widget]"))
+      continue;
+    const code = pre.querySelector("code");
+    const source = code?.textContent ?? pre.textContent ?? "";
+    if (!isJslrFrontendSource(source))
+      continue;
+    const ordinal = frontendOrdinal++;
+    const host = frontendCodeBlockHost(pre);
+    if (!host.isConnected || !host.parentNode)
+      continue;
+    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
+    let iframe;
+    try {
+      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx);
+    } catch (err) {
+      console.debug(`[vishrun] failed to render ${scriptName}:`, err);
+      continue;
+    }
+    if (!host.isConnected || !host.parentNode) {
+      destroyWidgetIframe(iframe, "jslr-codeblock-stale-host");
+      continue;
+    }
+    host.replaceWith(iframe);
+    rendered++;
+  }
+  return rendered;
+}
 async function buildWidget(html, scriptName, scriptId, messageId, ctx) {
   if (widgetNeedsIsolation(html)) {
     return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
@@ -3752,9 +3820,7 @@ function installMessageHooks(ctx) {
     return active === chatId;
   }
   function processMessageById(messageId, retriesLeft = MAX_RAF_RETRIES) {
-    const compiled = compiledForActiveCard();
-    if (!compiled)
-      return;
+    const compiled = compiledForActiveCard() ?? [];
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel);
     if (node) {
@@ -3780,7 +3846,7 @@ function installMessageHooks(ctx) {
           return false;
         return true;
       });
-      if (scriptsForMessage.length === 0)
+      if (scriptsForMessage.length === 0 && !node.querySelector("pre") && !hasRegisteredWidgetsForMessage(messageId))
         return;
       processNode(node, scriptsForMessage, ctx);
       return;
@@ -3813,7 +3879,7 @@ function installMessageHooks(ctx) {
             return false;
           return true;
         });
-        if (scriptsForMessage.length === 0)
+        if (scriptsForMessage.length === 0 && !n.querySelector("pre") && !(nodeMessageId && hasRegisteredWidgetsForMessage(nodeMessageId)))
           return;
         tasks.push(processNode(n, scriptsForMessage, ctx).catch(() => {}));
       });
@@ -3833,11 +3899,7 @@ function installMessageHooks(ctx) {
       pendingFrame = 0;
       const batch = pendingRecords;
       pendingRecords = [];
-      const compiled = compiledForActiveCard();
-      if (!compiled) {
-        detachObserver();
-        return;
-      }
+      const compiled = compiledForActiveCard() ?? [];
       if (allSelf(batch))
         return;
       scanAllNow(compiled);
@@ -3891,9 +3953,7 @@ function installMessageHooks(ctx) {
         return;
       bodyWatcher.disconnect();
       bodyWatcher = null;
-      const compiled = compiledForActiveCard();
-      if (!compiled)
-        return;
+      const compiled = compiledForActiveCard() ?? [];
       attachObserver();
       scanAllNow(compiled);
     });
@@ -3927,11 +3987,7 @@ function installMessageHooks(ctx) {
       teardownTagInterceptors();
     }
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      const compiled = compiledForActiveCard();
-      if (!compiled) {
-        detachObserver();
-        return;
-      }
+      const compiled = compiledForActiveCard() ?? [];
       const allNodes = document.querySelectorAll("[data-message-id]");
       if (allNodes.length > 0) {
         latestMessageId = allNodes[allNodes.length - 1].getAttribute("data-message-id");
@@ -3957,6 +4013,7 @@ function installMessageHooks(ctx) {
       return;
     rescanAll();
   });
+  rescanAll();
   return {
     rescanAll,
     processMessageById,
