@@ -1308,20 +1308,26 @@ function resolveRangeToIndex(range, total, currentMessageIndex) {
   }
   return null;
 }
+var JSLR_DATA_EXTRA_KEY = "__vishrun_jslr_message_data_v1";
 function shapeSnapshotMessage(msg) {
   const role = msg.role === "system" || msg.role === "user" || msg.role === "assistant" ? msg.role : msg.is_user ? "user" : "assistant";
   const swipes = Array.isArray(msg.swipes) && msg.swipes.length > 0 ? msg.swipes : [msg.content];
+  const rawExtra = msg.extra ?? {};
+  const storedData = rawExtra[JSLR_DATA_EXTRA_KEY];
+  const data = storedData && typeof storedData === "object" && !Array.isArray(storedData) ? { ...storedData } : {};
+  const extra = { ...rawExtra };
+  delete extra[JSLR_DATA_EXTRA_KEY];
   return {
     id: msg.id,
     message_id: msg.index_in_chat,
     name: msg.name,
     role,
-    is_hidden: false,
+    is_hidden: rawExtra.hidden === true,
     message: msg.content,
     swipe_id: msg.swipe_id ?? 0,
     swipes,
-    data: {},
-    extra: msg.extra ?? {}
+    data,
+    extra
   };
 }
 async function fetchCharacterGreetings(messages, chatId, userId, chats, characters) {
@@ -1375,6 +1381,79 @@ async function handleGetVariablesSnapshot(chatId, userId, chat = api.chat, chats
     log.warn("getVariablesSnapshot failed:", err instanceof Error ? err.message : String(err));
     return emptyMvuData();
   }
+}
+async function handleCreateChatMessages(body, chatId, chat = api.chat) {
+  const rawMessages = body.chatMessages;
+  if (!Array.isArray(rawMessages))
+    throw new TypeError("chat_messages must be an array");
+  const messages = rawMessages.map((raw, index) => {
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) {
+      throw new TypeError(`chat_messages[${index}] must be an object`);
+    }
+    const item = raw;
+    if (item.role !== "system" && item.role !== "assistant" && item.role !== "user") {
+      throw new TypeError(`chat_messages[${index}].role must be system, assistant, or user`);
+    }
+    if (typeof item.message !== "string") {
+      throw new TypeError(`chat_messages[${index}].message must be a string`);
+    }
+    if (item.name !== undefined && typeof item.name !== "string") {
+      throw new TypeError(`chat_messages[${index}].name must be a string`);
+    }
+    if (item.is_hidden !== undefined && typeof item.is_hidden !== "boolean") {
+      throw new TypeError(`chat_messages[${index}].is_hidden must be a boolean`);
+    }
+    if (item.data !== undefined && (!item.data || typeof item.data !== "object" || Array.isArray(item.data))) {
+      throw new TypeError(`chat_messages[${index}].data must be an object`);
+    }
+    if (item.extra !== undefined && (!item.extra || typeof item.extra !== "object" || Array.isArray(item.extra))) {
+      throw new TypeError(`chat_messages[${index}].extra must be an object`);
+    }
+    return item;
+  });
+  const rawOptions = body.options;
+  const options = rawOptions && typeof rawOptions === "object" && !Array.isArray(rawOptions) ? rawOptions : {};
+  if (options.refresh !== undefined && options.refresh !== "none" && options.refresh !== "affected" && options.refresh !== "all") {
+    throw new TypeError("refresh must be none, affected, or all");
+  }
+  const before = options.insert_at ?? options.insert_before ?? "end";
+  if (before !== "end") {
+    if (typeof before !== "number" || !Number.isFinite(before)) {
+      throw new TypeError("insert_before must be a number or end");
+    }
+    const existing = await chat.getMessages(chatId);
+    const clamped = Math.max(-existing.length, Math.min(existing.length, Math.trunc(before)));
+    if (clamped !== existing.length) {
+      throw new Error("Lumiverse does not expose safe indexed message insertion; createChatMessages currently supports insert_before/insert_at only when it resolves to the end");
+    }
+  }
+  const ids = [];
+  for (const message of messages) {
+    const created = await chat.appendMessage(chatId, { role: message.role, content: message.message });
+    ids.push(created.id);
+  }
+  if (ids.length === 0)
+    return { created: [] };
+  const current = await chat.getMessages(chatId);
+  const indexById = new Map;
+  for (const message of current)
+    indexById.set(message.id, message.index_in_chat);
+  return {
+    created: ids.map((id, index) => ({
+      id,
+      message_id: indexById.get(id) ?? current.length - ids.length + index
+    }))
+  };
+}
+async function handleTriggerSlash(body, chatId, userId) {
+  const command = body.command;
+  if (typeof command !== "string")
+    throw new TypeError("triggerSlash command must be a string");
+  const result = await dispatchSlashText(command, chatId, userId);
+  if (!result.handled) {
+    throw new Error(`Unsupported slash command in Vishrun triggerSlash: ${command}`);
+  }
+  return "";
 }
 async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = api.chat) {
   const fieldValues = body.fieldValues ?? {};
@@ -1465,6 +1544,12 @@ function installThHelpersHandler() {
         } else if (op === "th-set-chat-message") {
           await handleSetChatMessage(body, chatId, currentMessageIndex);
           response = { type: "th_helpers_response", requestId, ok: true, result: undefined };
+        } else if (op === "th-create-chat-messages") {
+          const result = await handleCreateChatMessages(body, chatId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
+        } else if (op === "th-trigger-slash") {
+          const result = await handleTriggerSlash(body, chatId, userId);
+          response = { type: "th_helpers_response", requestId, ok: true, result };
         } else if (op === "th-replace-chat-variables") {
           const result = await handleReplaceChatVariables(body, chatId, userId);
           response = { type: "th_helpers_response", requestId, ok: true, result };
@@ -1696,6 +1781,88 @@ function installUserMessageBridgeHandler() {
 }
 
 // src/backend/index.ts
+function isNativeResourceRequest(payload) {
+  if (!payload || typeof payload !== "object")
+    return false;
+  const value = payload;
+  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
+}
+async function dispatchNativeResource(request, userId) {
+  const args = Array.isArray(request.args) ? request.args : [];
+  if (request.resource === "personas") {
+    switch (request.operation) {
+      case "list":
+        return api.personas.list({ ...args[0] ?? {}, userId });
+      case "get":
+        return api.personas.get(String(args[0] ?? ""), userId);
+      case "getDefault":
+        return api.personas.getDefault(userId);
+      case "getActive":
+        return api.personas.getActive(userId);
+      case "create":
+        return api.personas.create(args[0] ?? {}, userId);
+      case "update":
+        return api.personas.update(String(args[0] ?? ""), args[1] ?? {}, userId);
+      case "delete":
+        return api.personas.delete(String(args[0] ?? ""), userId);
+      case "switchActive":
+        return api.personas.switchActive(args[0] == null ? null : String(args[0]), userId);
+      case "getWorldBook":
+        return api.personas.getWorldBook(String(args[0] ?? ""), userId);
+      default:
+        throw new Error(`Unsupported personas operation: ${request.operation}`);
+    }
+  }
+  switch (request.operation) {
+    case "list":
+      return api.world_books.list({ ...args[0] ?? {}, userId });
+    case "get":
+      return api.world_books.get(String(args[0] ?? ""), userId);
+    case "create":
+      return api.world_books.create(args[0] ?? {}, userId);
+    case "update":
+      return api.world_books.update(String(args[0] ?? ""), args[1] ?? {}, userId);
+    case "delete":
+      return api.world_books.delete(String(args[0] ?? ""), userId);
+    case "getActivated":
+      return api.world_books.getActivated(String(args[0] ?? ""), userId);
+    case "getGlobal":
+      return api.world_books.getGlobal(userId);
+    case "setGlobal":
+      return api.world_books.setGlobal(Array.isArray(args[0]) ? args[0].map(String) : [], userId);
+    case "activateGlobal":
+      return api.world_books.activateGlobal(String(args[0] ?? ""), userId);
+    case "deactivateGlobal":
+      return api.world_books.deactivateGlobal(String(args[0] ?? ""), userId);
+    case "entries.list":
+      return api.world_books.entries.list(String(args[0] ?? ""), { ...args[1] ?? {}, userId });
+    case "entries.get":
+      return api.world_books.entries.get(String(args[0] ?? ""), userId);
+    case "entries.create":
+      return api.world_books.entries.create(String(args[0] ?? ""), args[1] ?? {}, userId);
+    case "entries.update":
+      return api.world_books.entries.update(String(args[0] ?? ""), args[1] ?? {}, userId);
+    case "entries.delete":
+      return api.world_books.entries.delete(String(args[0] ?? ""), userId);
+    default:
+      throw new Error(`Unsupported world_books operation: ${request.operation}`);
+  }
+}
+function installNativeResourceBridge() {
+  api.onFrontendMessage((payload, userId) => {
+    if (!isNativeResourceRequest(payload))
+      return;
+    dispatchNativeResource(payload, userId).then((result) => {
+      api.sendToFrontend({ type: "vsh_native_resource_result", requestId: payload.requestId, result }, userId);
+    }, (error) => {
+      api.sendToFrontend({
+        type: "vsh_native_resource_error",
+        requestId: payload.requestId,
+        error: error instanceof Error ? error.message : String(error)
+      }, userId);
+    });
+  });
+}
 installFetchExternalHandler();
 installMacroResolveHandler();
 installMessageContentProcessor();
@@ -1704,6 +1871,7 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
+installNativeResourceBridge();
 function setup() {}
 export {
   setup

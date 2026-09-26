@@ -339,7 +339,15 @@ function chatVariableState(chatId, metadata) {
   return { chatId, variables, allVariables: { ...record(macro.global), ...record(macro.local), ...variables } };
 }
 var listeners = new WeakMap;
+var chatStateCache = new Map;
+var chatStateInflight = new Map;
+function cacheChatVariableState(state) {
+  if (state.chatId && state.ready !== false)
+    chatStateCache.set(state.chatId, state);
+  return state;
+}
 function publishChatVariableState(ctx, state) {
+  cacheChatVariableState(state);
   for (const listener of listeners.get(ctx) ?? []) {
     try {
       listener(state);
@@ -348,22 +356,38 @@ function publishChatVariableState(ctx, state) {
     }
   }
 }
-async function fetchChatVariableState(chatId) {
+function fetchChatVariableState(chatId, force = false) {
   if (!chatId)
-    return chatVariableState("", {});
-  try {
-    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
-      cache: "no-store",
-      credentials: "same-origin"
-    });
-    if (!response.ok)
-      throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
-    const chat = await response.json();
-    return chatVariableState(chatId, chat?.metadata);
-  } catch (err) {
-    console.warn("[vishrun:variables]", err);
-    return { ...chatVariableState(chatId, {}), ready: false };
+    return Promise.resolve(chatVariableState("", {}));
+  if (!force) {
+    const cached = chatStateCache.get(chatId);
+    if (cached)
+      return Promise.resolve(cached);
   }
+  const existing = chatStateInflight.get(chatId);
+  if (existing)
+    return existing;
+  const request = (async () => {
+    try {
+      const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}`, {
+        cache: "no-store",
+        credentials: "same-origin"
+      });
+      if (!response.ok)
+        throw new Error(`Chat variables could not be loaded (HTTP ${response.status})`);
+      const chat = await response.json();
+      return cacheChatVariableState(chatVariableState(chatId, chat?.metadata));
+    } catch (err) {
+      console.warn("[vishrun:variables]", err);
+      return { ...chatVariableState(chatId, {}), ready: false };
+    }
+  })();
+  chatStateInflight.set(chatId, request);
+  request.finally(() => {
+    if (chatStateInflight.get(chatId) === request)
+      chatStateInflight.delete(chatId);
+  });
+  return request;
 }
 function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
   let state = initial;
@@ -385,14 +409,14 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
     if (next.chatId !== state.chatId)
       return;
     ++epoch;
-    state = next;
+    state = cacheChatVariableState(next);
     deliver();
   };
   const refresh = async () => {
     const currentEpoch = ++epoch;
     const chatId = state.chatId;
     try {
-      const next = await fetchChatVariableState(chatId);
+      const next = await fetchChatVariableState(chatId, true);
       if (!destroyed && next.ready !== false && currentEpoch === epoch && chatId === state.chatId)
         accept(next);
     } catch (err) {
@@ -420,9 +444,11 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
     const id = ctx.getActiveChat().chatId ?? "";
     if (id !== state.chatId) {
       ++epoch;
-      state = { ...chatVariableState(id, {}), ready: false };
+      const cached = id ? chatStateCache.get(id) : undefined;
+      state = cached ?? { ...chatVariableState(id, {}), ready: false };
       deliver();
-      refresh();
+      if (!cached)
+        refresh();
     }
   };
   const settings = ctx.events.on("SETTINGS_UPDATED", (data) => {
@@ -431,7 +457,8 @@ function bindChatVariableState(frame, ctx, initial, followsActiveChat) {
   });
   const switched = ctx.events.on("CHAT_SWITCHED", switchChat);
   frame.element.addEventListener("load", deliver);
-  refresh();
+  if (initial.ready === false)
+    refresh();
   return () => {
     destroyed = true;
     ++epoch;
@@ -1342,6 +1369,125 @@ window.setChatMessage = function(fieldValues, messageId, opts){
   var normalized = (typeof fieldValues === 'string') ? { message: fieldValues } : fieldValues;
   return postRequest('th-set-chat-message', { fieldValues: normalized, messageId: messageId, opts: opts || {} });
 };
+var JSLR_DATA_EXTRA_KEY = '__vishrun_jslr_message_data_v1';
+function isPlainRecord(value){ return !!value && typeof value === 'object' && !Array.isArray(value); }
+function cloneRecord(value){
+  var out = {};
+  if (!isPlainRecord(value)) return out;
+  for (var key in value) if (Object.prototype.hasOwnProperty.call(value, key)) out[key] = value[key];
+  return out;
+}
+function defaultMessageName(role){
+  if (role === 'system') return 'system';
+  var snap = THC.messagesSnapshot || [];
+  for (var i = snap.length - 1; i >= 0; i--) {
+    var item = snap[i];
+    if (item && item.role === role && typeof item.name === 'string' && item.name.trim()) return item.name;
+  }
+  return role === 'user' ? 'User' : 'Assistant';
+}
+function hostJsonFetch(path, init){
+  var hostWindow = window;
+  try { if (window.parent && window.parent !== window && window.parent.fetch) hostWindow = window.parent; } catch (_) {}
+  var fetcher = hostWindow.fetch ? hostWindow.fetch.bind(hostWindow) : window.fetch.bind(window);
+  var origin = '';
+  try { origin = hostWindow.location && hostWindow.location.origin ? hostWindow.location.origin : window.location.origin; } catch (_) { origin = window.location.origin; }
+  return fetcher(origin + path, init).then(function(response){
+    if (response.ok) return response.json().catch(function(){ return {}; });
+    return response.text().catch(function(){ return ''; }).then(function(text){
+      throw new Error('Lumiverse message update failed (HTTP ' + response.status + ')' + (text ? ': ' + text.slice(0, 300) : ''));
+    });
+  });
+}
+function normalizeCreatingMessage(raw, index){
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) throw new TypeError('chat_messages[' + index + '] must be an object');
+  if (raw.role !== 'system' && raw.role !== 'assistant' && raw.role !== 'user') throw new TypeError('chat_messages[' + index + '].role must be system, assistant, or user');
+  if (typeof raw.message !== 'string') throw new TypeError('chat_messages[' + index + '].message must be a string');
+  if (raw.name !== undefined && typeof raw.name !== 'string') throw new TypeError('chat_messages[' + index + '].name must be a string');
+  if (raw.is_hidden !== undefined && typeof raw.is_hidden !== 'boolean') throw new TypeError('chat_messages[' + index + '].is_hidden must be a boolean');
+  if (raw.data !== undefined && !isPlainRecord(raw.data)) throw new TypeError('chat_messages[' + index + '].data must be an object');
+  if (raw.extra !== undefined && !isPlainRecord(raw.extra)) throw new TypeError('chat_messages[' + index + '].extra must be an object');
+  return raw;
+}
+function patchCreatedMessage(chatId, created, message){
+  var extra = cloneRecord(message.extra);
+  // Lumiverse represents the three-way JSLR role on persisted chat rows with
+  // is_user + extra.spindle_role. Keep this host-native marker authoritative.
+  extra.spindle_role = message.role;
+  if (message.data !== undefined) extra[JSLR_DATA_EXTRA_KEY] = cloneRecord(message.data);
+  if (message.is_hidden !== undefined) {
+    if (message.is_hidden) extra.hidden = true;
+    else delete extra.hidden;
+  }
+  var name = message.name !== undefined ? message.name : defaultMessageName(message.role);
+  var path = '/api/v1/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(created.id);
+  return hostJsonFetch(path, {
+    method: 'PUT',
+    credentials: 'include',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ name: name, extra: extra })
+  }).then(function(){
+    var exposedExtra = cloneRecord(extra);
+    delete exposedExtra[JSLR_DATA_EXTRA_KEY];
+    return {
+      id: created.id,
+      message_id: created.message_id,
+      name: name,
+      role: message.role,
+      is_hidden: extra.hidden === true,
+      message: message.message,
+      swipe_id: 0,
+      swipes: [message.message],
+      data: message.data !== undefined ? cloneRecord(message.data) : {},
+      extra: exposedExtra
+    };
+  });
+}
+function rollbackCreatedMessages(chatId, created){
+  return Promise.all((created || []).map(function(row){
+    var path = '/api/v1/chats/' + encodeURIComponent(chatId) + '/messages/' + encodeURIComponent(row.id);
+    return hostJsonFetch(path, { method: 'DELETE', credentials: 'include' }).catch(function(){ return undefined; });
+  }));
+}
+window.triggerSlash = function(command){
+  if (typeof command !== 'string') return Promise.reject(new TypeError('triggerSlash command must be a string'));
+  return postRequest('th-trigger-slash', { command: command }).then(function(result){
+    return result == null ? '' : String(result);
+  });
+};
+window.triggerSlashWithResult = window.triggerSlash;
+window.createChatMessages = function(chatMessages, options){
+  if (!Array.isArray(chatMessages)) return Promise.reject(new TypeError('chat_messages must be an array'));
+  var normalized;
+  try {
+    normalized = chatMessages.map(function(message, index){ return normalizeCreatingMessage(message, index); });
+  } catch (error) {
+    return Promise.reject(error);
+  }
+  options = options || {};
+  if (!isPlainRecord(options)) return Promise.reject(new TypeError('createChatMessages options must be an object'));
+  if (options.refresh !== undefined && options.refresh !== 'none' && options.refresh !== 'affected' && options.refresh !== 'all') {
+    return Promise.reject(new TypeError('refresh must be none, affected, or all'));
+  }
+  return postRequest('th-create-chat-messages', { chatMessages: normalized, options: options }).then(function(result){
+    if (!result || !Array.isArray(result.created) || result.created.length !== normalized.length) {
+      throw new Error('createChatMessages backend returned an invalid creation result');
+    }
+    return Promise.all(normalized.map(function(message, index){
+      return patchCreatedMessage(THC.chatId, result.created[index], message);
+    })).then(function(rows){
+      // JSLR mutates the live chat array immediately. Vishrun's synchronous
+      // getChatMessages() reads a baked snapshot, so mirror the appended rows
+      // locally after persistence to keep same-frame reads coherent.
+      for (var i = 0; i < rows.length; i++) THC.messagesSnapshot.push(rows[i]);
+      THC.messagesSnapshot.sort(function(a, b){ return a.message_id - b.message_id; });
+      return undefined;
+    }, function(error){
+      // Avoid leaving half-customized rows behind if Lumiverse rejects a name/extra patch.
+      return rollbackCreatedMessages(THC.chatId, result.created).then(function(){ throw error; });
+    });
+  });
+};
 window.getAllVariables = function(){
   if (THC.variablesChatId !== THC.chatId) return {};
   var vars = chatVariablesReady ? allChatVariables : THC.variablesSnapshot || {};
@@ -1891,6 +2037,14 @@ function hasRegisteredWidgetsFor(messageId, scriptId) {
   const set = iframeRegistry.get(registryKey(messageId, scriptId));
   return !!set && set.size > 0;
 }
+function hasRegisteredWidgetsForMessage(messageId) {
+  const prefix = messageId + REGISTRY_SEP;
+  for (const [key, set] of iframeRegistry) {
+    if (key.startsWith(prefix) && set.size > 0)
+      return true;
+  }
+  return false;
+}
 function destroyRegisteredWidgetsFor(messageId, scriptId, reason = "destroy-registered") {
   const set = iframeRegistry.get(registryKey(messageId, scriptId));
   if (!set)
@@ -1926,7 +2080,8 @@ function resolveCurrentMessageIndex(messageId, snapshot, domIndex) {
 }
 async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
   const detectedEnv = classifyWidgetEnvironment(html);
-  const env = !shouldInjectThHelpersShim(detectedEnv) && (containsScriptTag(html) || containsInlineEventHandler(html)) ? "tavern-helpers-light" : detectedEnv;
+  const promotedForDynamicApi = !shouldInjectThHelpersShim(detectedEnv) && (containsScriptTag(html) || containsInlineEventHandler(html));
+  const env = promotedForDynamicApi ? "tavern-helpers-light" : detectedEnv;
   const active = ctx.getActiveChat();
   const chatId = active.chatId ?? "";
   const domIndex = computeMessageIndexInChat(messageId);
@@ -1940,13 +2095,13 @@ async function buildWidgetIframe(html, scriptName, scriptId, messageId, ctx) {
     }));
   }
   const [messagesSnapshot, variablesSnapshot, chatState] = await Promise.all([
-    shouldInjectThHelpersShim(env) ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
+    shouldInjectThHelpersShim(env) && !promotedForDynamicApi ? fetchMessagesSnapshot(snapshotContext, ctx) : Promise.resolve([]),
     shouldInjectMvuShim(env) ? fetchVariablesSnapshot(snapshotContext, ctx) : Promise.resolve({ stat_data: {} }),
     shouldInjectThHelpersShim(env) ? fetchChatVariableState(chatId) : Promise.resolve(undefined)
   ]);
   const resolved = resolveCurrentMessageIndex(messageId, messagesSnapshot, domIndex);
   const currentMessageIndex = resolved.index;
-  if (resolved.source === "dom-fallback" && VSH_VISHRUN_DIAG && shouldInjectThHelpersShim(env)) {
+  if (resolved.source === "dom-fallback" && VSH_VISHRUN_DIAG && shouldInjectThHelpersShim(env) && !promotedForDynamicApi) {
     console.log("[vishrun:bridge] currentMessageDbIndex-fallback", JSON.stringify({
       messageId,
       reason: "not-in-snapshot",
@@ -2993,8 +3148,14 @@ async function processNode(root, scripts, ctx) {
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
     normalizeExistingWidgetContainers(target);
-    const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     let total = 0;
+    total += await renderJslrFrontendCodeBlocks(root, messageId, ctx);
+    if (scripts.length === 0) {
+      const finalTarget = findContentRoot(root);
+      normalizeExistingWidgetContainers(finalTarget);
+      return total;
+    }
+    const resolvedMap = await resolveMacrosForMessage(root, scripts, messageId, ctx);
     try {
       for (const script of scripts) {
         if (!isPlaceholderLikeKind(script.kind))
@@ -3006,7 +3167,9 @@ async function processNode(root, scripts, ctx) {
         }
       }
       total += await renderPairedTagCaptures(root, scripts, messageId, ctx, resolvedMap);
-      normalizeExistingWidgetContainers(findContentRoot(root));
+      const finalTarget = findContentRoot(root);
+      normalizeExistingWidgetContainers(finalTarget);
+      stripEscapedPseudoTags(finalTarget);
     } catch (err) {
       console.debug("[vishrun] processNode render error:", err);
     }
@@ -3187,6 +3350,37 @@ var MULTILINE_BLOCK_TAGS = new Set([
 ]);
 var TRANSPARENT_WIDGET_WRAPPER_TAGS = new Set(["SPAN"]);
 var EMPTY_RESIDUE_RE = /[\s\u00A0\u200B-\u200D\uFEFF]/g;
+var ESCAPED_PSEUDO_TAG_RE = /<[A-Za-z][^>\r\n]*>/g;
+var PSEUDO_TAG_LITERAL_CONTEXTS = new Set(["CODE", "PRE", "TEXTAREA"]);
+function stripEscapedPseudoTags(target) {
+  const candidates = [];
+  const walker = document.createTreeWalker(target, NodeFilter.SHOW_TEXT, {
+    acceptNode(node) {
+      const text = node.nodeValue ?? "";
+      if (!text.includes("<") || !text.includes(">"))
+        return NodeFilter.FILTER_REJECT;
+      let parent = node.parentElement;
+      while (parent && parent !== target) {
+        if (parent.hasAttribute("data-vishrun-widget"))
+          return NodeFilter.FILTER_REJECT;
+        if (PSEUDO_TAG_LITERAL_CONTEXTS.has(parent.tagName))
+          return NodeFilter.FILTER_REJECT;
+        parent = parent.parentElement;
+      }
+      return NodeFilter.FILTER_ACCEPT;
+    }
+  });
+  let node;
+  while ((node = walker.nextNode()) !== null)
+    candidates.push(node);
+  for (const textNode of candidates) {
+    const before = textNode.nodeValue ?? "";
+    ESCAPED_PSEUDO_TAG_RE.lastIndex = 0;
+    const after = before.replace(ESCAPED_PSEUDO_TAG_RE, "");
+    if (after !== before)
+      textNode.nodeValue = after;
+  }
+}
 function normalizeExistingWidgetContainers(target) {
   const widgets = Array.from(target.querySelectorAll("[data-vishrun-widget]"));
   for (const widget of widgets) {
@@ -3203,7 +3397,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
-      if (isEmptyResidue(prev))
+      if (isEmptyResidue(prev) || isTransparentEmptyResidue(prev))
         prev.parentNode?.removeChild(prev);
       else
         break;
@@ -3212,7 +3406,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
-      if (isEmptyResidue(nxt))
+      if (isEmptyResidue(nxt) || isTransparentEmptyResidue(nxt))
         nxt.parentNode?.removeChild(nxt);
       else
         break;
@@ -3228,7 +3422,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
         break;
       while (parent.firstChild) {
         const child = parent.firstChild;
-        if (isEmptyResidue(child)) {
+        if (isEmptyResidue(child) || isTransparentEmptyResidue(child)) {
           parent.removeChild(child);
         } else {
           grandparent.insertBefore(child, parent);
@@ -3241,10 +3435,18 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
   }
 }
 function containsOnlyWidgetsAndResidue(container) {
-  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node));
+  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node) || isTransparentEmptyResidue(node));
 }
 function isWidgetNode(node) {
   return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute("data-vishrun-widget");
+}
+function isTransparentEmptyResidue(node) {
+  if (node.nodeType !== Node.ELEMENT_NODE)
+    return false;
+  const el = node;
+  if (!TRANSPARENT_WIDGET_WRAPPER_TAGS.has(el.tagName))
+    return false;
+  return Array.from(el.childNodes).every((child) => isEmptyResidue(child) || isTransparentEmptyResidue(child));
 }
 function isEmptyResidue(node) {
   if (node.nodeType === Node.TEXT_NODE) {
@@ -3420,6 +3622,60 @@ function findContentRoot(messageNode) {
   const inner = messageNode.querySelector('[data-component="MessageContent"]');
   return inner ?? messageNode;
 }
+function isJslrFrontendSource(source) {
+  return /<(?:html|head|body)\b/i.test(source);
+}
+function frontendSourceHash(source) {
+  let h = 2166136261;
+  for (let i = 0; i < source.length; i++) {
+    h ^= source.charCodeAt(i);
+    h = Math.imul(h, 16777619) >>> 0;
+  }
+  return h.toString(16).padStart(8, "0");
+}
+function frontendCodeBlockHost(pre) {
+  const parent = pre.parentElement;
+  if (!parent)
+    return pre;
+  if (parent.querySelector("[data-code-copy]") && Array.from(parent.children).includes(pre)) {
+    return parent;
+  }
+  return pre;
+}
+async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
+  const target = findContentRoot(root);
+  const pres = Array.from(target.querySelectorAll("pre"));
+  let frontendOrdinal = 0;
+  let rendered = 0;
+  for (const pre of pres) {
+    if (pre.closest("[data-vishrun-widget]"))
+      continue;
+    const code = pre.querySelector("code");
+    const source = code?.textContent ?? pre.textContent ?? "";
+    if (!isJslrFrontendSource(source))
+      continue;
+    const ordinal = frontendOrdinal++;
+    const host = frontendCodeBlockHost(pre);
+    if (!host.isConnected || !host.parentNode)
+      continue;
+    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
+    let iframe;
+    try {
+      iframe = await buildWidgetIframe(source, scriptName, scriptId, messageId, ctx);
+    } catch (err) {
+      console.debug(`[vishrun] failed to render ${scriptName}:`, err);
+      continue;
+    }
+    if (!host.isConnected || !host.parentNode) {
+      destroyWidgetIframe(iframe, "jslr-codeblock-stale-host");
+      continue;
+    }
+    host.replaceWith(iframe);
+    rendered++;
+  }
+  return rendered;
+}
 async function buildWidget(html, scriptName, scriptId, messageId, ctx) {
   if (widgetNeedsIsolation(html)) {
     return buildWidgetIframe(html, scriptName, scriptId, messageId, ctx);
@@ -3564,9 +3820,7 @@ function installMessageHooks(ctx) {
     return active === chatId;
   }
   function processMessageById(messageId, retriesLeft = MAX_RAF_RETRIES) {
-    const compiled = compiledForActiveCard();
-    if (!compiled)
-      return;
+    const compiled = compiledForActiveCard() ?? [];
     const sel = buildMessageSelector(messageId);
     const node = document.querySelector(sel);
     if (node) {
@@ -3592,7 +3846,7 @@ function installMessageHooks(ctx) {
           return false;
         return true;
       });
-      if (scriptsForMessage.length === 0)
+      if (scriptsForMessage.length === 0 && !node.querySelector("pre") && !hasRegisteredWidgetsForMessage(messageId))
         return;
       processNode(node, scriptsForMessage, ctx);
       return;
@@ -3625,7 +3879,7 @@ function installMessageHooks(ctx) {
             return false;
           return true;
         });
-        if (scriptsForMessage.length === 0)
+        if (scriptsForMessage.length === 0 && !n.querySelector("pre") && !(nodeMessageId && hasRegisteredWidgetsForMessage(nodeMessageId)))
           return;
         tasks.push(processNode(n, scriptsForMessage, ctx).catch(() => {}));
       });
@@ -3645,11 +3899,7 @@ function installMessageHooks(ctx) {
       pendingFrame = 0;
       const batch = pendingRecords;
       pendingRecords = [];
-      const compiled = compiledForActiveCard();
-      if (!compiled) {
-        detachObserver();
-        return;
-      }
+      const compiled = compiledForActiveCard() ?? [];
       if (allSelf(batch))
         return;
       scanAllNow(compiled);
@@ -3703,9 +3953,7 @@ function installMessageHooks(ctx) {
         return;
       bodyWatcher.disconnect();
       bodyWatcher = null;
-      const compiled = compiledForActiveCard();
-      if (!compiled)
-        return;
+      const compiled = compiledForActiveCard() ?? [];
       attachObserver();
       scanAllNow(compiled);
     });
@@ -3739,11 +3987,7 @@ function installMessageHooks(ctx) {
       teardownTagInterceptors();
     }
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      const compiled = compiledForActiveCard();
-      if (!compiled) {
-        detachObserver();
-        return;
-      }
+      const compiled = compiledForActiveCard() ?? [];
       const allNodes = document.querySelectorAll("[data-message-id]");
       if (allNodes.length > 0) {
         latestMessageId = allNodes[allNodes.length - 1].getAttribute("data-message-id");
@@ -3769,6 +4013,7 @@ function installMessageHooks(ctx) {
       return;
     rescanAll();
   });
+  rescanAll();
   return {
     rescanAll,
     processMessageById,
@@ -5361,11 +5606,70 @@ function setup(ctx) {
   const unsubMvuDisplayStrip = registerMvuDisplayStrip(ctx);
   const unsubStatusBarInject = installStatusBarInjectHook(ctx);
   const pendingGenerates = new Map;
+  const pendingNativeResources = new Map;
   const pendingWorldInfoLookups = new Map;
   const preGenerationHandlers = new Set;
   const preGenerationControllers = new Map;
   const userMessageHandlers = new Set;
   const userMessageControllers = new Map;
+  const callNativeResource = (resource, operation, args = []) => {
+    const requestId = crypto.randomUUID();
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (!pendingNativeResources.has(requestId))
+          return;
+        pendingNativeResources.delete(requestId);
+        reject(new Error(`Vishrun native ${resource}.${operation} request timed out`));
+      }, 15000);
+      pendingNativeResources.set(requestId, { resolve, reject, timer });
+      try {
+        ctx.sendToBackend({
+          type: "vsh_native_resource",
+          requestId,
+          resource,
+          operation,
+          args
+        });
+      } catch (error) {
+        clearTimeout(timer);
+        pendingNativeResources.delete(requestId);
+        reject(error instanceof Error ? error : new Error(String(error)));
+      }
+    });
+  };
+  const personaBridge = Object.freeze({
+    list: (options = {}) => callNativeResource("personas", "list", [options]),
+    get: (personaId) => callNativeResource("personas", "get", [personaId]),
+    getDefault: () => callNativeResource("personas", "getDefault"),
+    getActive: () => callNativeResource("personas", "getActive"),
+    create: (input) => callNativeResource("personas", "create", [input]),
+    update: (personaId, input) => callNativeResource("personas", "update", [personaId, input]),
+    delete: (personaId) => callNativeResource("personas", "delete", [personaId]),
+    switchActive: (personaId) => callNativeResource("personas", "switchActive", [personaId]),
+    getWorldBook: (personaId) => callNativeResource("personas", "getWorldBook", [personaId])
+  });
+  const worldBookEntriesBridge = Object.freeze({
+    list: (worldBookId, options = {}) => callNativeResource("world_books", "entries.list", [worldBookId, options]),
+    get: (entryId) => callNativeResource("world_books", "entries.get", [entryId]),
+    create: (worldBookId, input) => callNativeResource("world_books", "entries.create", [worldBookId, input]),
+    update: (entryId, input) => callNativeResource("world_books", "entries.update", [entryId, input]),
+    delete: (entryId) => callNativeResource("world_books", "entries.delete", [entryId])
+  });
+  const worldBooksBridge = Object.freeze({
+    list: (options = {}) => callNativeResource("world_books", "list", [options]),
+    get: (worldBookId) => callNativeResource("world_books", "get", [worldBookId]),
+    create: (input) => callNativeResource("world_books", "create", [input]),
+    update: (worldBookId, input) => callNativeResource("world_books", "update", [worldBookId, input]),
+    delete: (worldBookId) => callNativeResource("world_books", "delete", [worldBookId]),
+    getActivated: (chatId) => callNativeResource("world_books", "getActivated", [chatId]),
+    getGlobal: () => callNativeResource("world_books", "getGlobal"),
+    setGlobal: (worldBookIds) => callNativeResource("world_books", "setGlobal", [worldBookIds]),
+    activateGlobal: (worldBookId) => callNativeResource("world_books", "activateGlobal", [worldBookId]),
+    deactivateGlobal: (worldBookId) => callNativeResource("world_books", "deactivateGlobal", [worldBookId]),
+    entries: worldBookEntriesBridge
+  });
+  window.__vishrunPersonas = personaBridge;
+  window.__vishrunWorldBooks = worldBooksBridge;
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: "vsh_pre_generation_subscription",
@@ -5545,6 +5849,20 @@ function setup(ctx) {
         pendingWorldInfoLookups.delete(m.requestId);
         pendingWorldInfo.reject(new DOMException("Generation aborted", "AbortError"));
       }
+    } else if (m.type === "vsh_native_resource_result" && m.requestId) {
+      const pending = pendingNativeResources.get(m.requestId);
+      if (!pending)
+        return;
+      pendingNativeResources.delete(m.requestId);
+      clearTimeout(pending.timer);
+      pending.resolve(m.result);
+    } else if (m.type === "vsh_native_resource_error" && m.requestId) {
+      const pending = pendingNativeResources.get(m.requestId);
+      if (!pending)
+        return;
+      pendingNativeResources.delete(m.requestId);
+      clearTimeout(pending.timer);
+      pending.reject(new Error(m.error || "Vishrun native resource request failed"));
     } else if (m.type === "vsh_generate_result" && m.requestId) {
       const pending = pendingGenerates.get(m.requestId);
       if (!pending)
@@ -5830,7 +6148,14 @@ function setup(ctx) {
       pending.reject(new DOMException("Extension stopped", "AbortError"));
     }
     pendingGenerates.clear();
+    for (const pending of pendingNativeResources.values()) {
+      clearTimeout(pending.timer);
+      pending.reject(new Error("Vishrun disposed"));
+    }
+    pendingNativeResources.clear();
     unsubBackendMsg();
+    delete window.__vishrunPersonas;
+    delete window.__vishrunWorldBooks;
     delete window.__vishrunRegisterPreGeneration;
     delete window.__vishrunRegisterUserMessageProcessor;
     delete window.__vishrunGenerate;

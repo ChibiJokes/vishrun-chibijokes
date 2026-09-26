@@ -6,6 +6,7 @@ import { syncTagInterceptors, teardownTagInterceptors } from './tag-interceptor'
 import { fetchMessageContentById } from '../lumiverse/fetch-message';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
 import { allSelf } from '../render/self-mutation';
+import { hasRegisteredWidgetsForMessage } from '../render/widget-iframe';
 
 const MAX_RAF_RETRIES = 3;
 const MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
@@ -20,10 +21,11 @@ interface GenerationEndedPayload {
 
 export interface MessageHooks {
   /**
-   * Scan all rendered messages and (re)attach the MutationObserver if the
-   * card has scripts. Detaches the observer if there's no active card or
-   * the card has no scripts. Frontend bootstrap calls this after every
-   * card-load outcome (load with scripts, load without scripts, clear).
+   * Scan all rendered messages and (re)attach the MutationObserver. The
+   * observer stays active even when the card has no legacy regex_scripts so
+   * Vishrun can provide JS Slash Runner parity for Lumiverse-native display
+   * regex output (fenced frontend code blocks). Frontend bootstrap also calls
+   * this after every card-load outcome.
    */
   rescanAll: () => void;
   /**
@@ -102,8 +104,7 @@ export function installMessageHooks(ctx: SpindleFrontendContext): MessageHooks {
   }
 
 function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RETRIES): void {
-  const compiled = compiledForActiveCard(); //
-  if (!compiled) return; //
+  const compiled = compiledForActiveCard() ?? []; // native JSLR path works without legacy card regexes
   
   const sel = buildMessageSelector(messageId); //
   const node = document.querySelector(sel) as HTMLElement | null; //
@@ -144,9 +145,9 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       return true;
     });
 
-    if (scriptsForMessage.length === 0) return;
-
-    // 4. Safely execute the contextual scripts explicitly tailored for this message node's location
+    // 4. Empty legacy-script lists still matter when Lumiverse rendered a
+    // frontend code block. Avoid invoking the pipeline for ordinary prose.
+    if (scriptsForMessage.length === 0 && !node.querySelector('pre') && !hasRegisteredWidgetsForMessage(messageId)) return;
     void processNode(node, scriptsForMessage, ctx); //
     return;
   }
@@ -177,7 +178,9 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
           if (s.minDepth !== null && depthFromLatest < s.minDepth) return false;
           return true;
         });
-        if (scriptsForMessage.length === 0) return;
+        // Empty legacy-script lists only need work when a rendered code block
+        // exists; the native JSLR detector decides whether that block is frontend.
+        if (scriptsForMessage.length === 0 && !n.querySelector('pre') && !(nodeMessageId && hasRegisteredWidgetsForMessage(nodeMessageId))) return;
         tasks.push(processNode(n as HTMLElement, scriptsForMessage, ctx).catch(() => {}));
       });
       await Promise.all(tasks);
@@ -195,12 +198,7 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       pendingFrame = 0;
       const batch = pendingRecords;
       pendingRecords = [];
-      const compiled = compiledForActiveCard();
-      if (!compiled) {
-        // Card cleared between mutation and frame — observer should be off.
-        detachObserver();
-        return;
-      }
+      const compiled = compiledForActiveCard() ?? [];
       if (allSelf(batch)) return;
       void scanAllNow(compiled);
     });
@@ -265,8 +263,7 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       // messages.
       bodyWatcher!.disconnect();
       bodyWatcher = null;
-      const compiled = compiledForActiveCard();
-      if (!compiled) return; // card was cleared between insert and now
+      const compiled = compiledForActiveCard() ?? [];
       attachObserver();
       void scanAllNow(compiled);
     });
@@ -309,11 +306,7 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     // Two rAFs: lets the message list paint after a card change before we
     // scan. The observer takes over reactive coverage from there.
     requestAnimationFrame(() => requestAnimationFrame(() => {
-      const compiled = compiledForActiveCard();
-      if (!compiled) {
-        detachObserver();
-        return;
-      }
+      const compiled = compiledForActiveCard() ?? [];
       const allNodes = document.querySelectorAll('[data-message-id]');
       if (allNodes.length > 0) {
         latestMessageId = allNodes[allNodes.length - 1].getAttribute('data-message-id');
@@ -341,6 +334,12 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     // (debounced — no fetch) but new messages need scanning.
     rescanAll();
   });
+
+  // Start the generic frontend-code watcher immediately. This does not wait
+  // for fetchCharacter(), because Lumiverse-native regex scripts live outside
+  // the character card and can produce a JS Slash Runner frontend even when
+  // extensions.regex_scripts is empty.
+  rescanAll();
 
   return {
     rescanAll,
