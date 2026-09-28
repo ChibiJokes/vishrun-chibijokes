@@ -7,15 +7,15 @@ import { installGenerateRelayHandler } from './generate-relay';
 import { installPreGenerationBridgeHandler } from './pre-generation-bridge';
 import { installUserMessageBridgeHandler } from './user-message-bridge';
 import {
-  armResponseCurtain,
-  commitResponseCurtain,
-  installResponseInterceptorBridge,
-  releaseResponseCurtain,
-  responseCurtainStatus,
-} from './response-interceptor-bridge';
+  allowMessageRender,
+  holdMessageRender,
+  installMessageRenderBridge,
+  messageRenderStatus,
+  releaseMessageRender,
+} from './message-render-bridge';
 import { api } from './common';
 
-type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'response_interceptor';
+type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'message_render';
 
 interface NativeResourceRequest {
   type: 'vsh_native_resource';
@@ -31,7 +31,7 @@ function isNativeResourceRequest(payload: unknown): payload is NativeResourceReq
   return (
     value.type === 'vsh_native_resource' &&
     typeof value.requestId === 'string' &&
-    (value.resource === 'personas' || value.resource === 'world_books' || value.resource === 'chat' || value.resource === 'response_interceptor') &&
+    (value.resource === 'personas' || value.resource === 'world_books' || value.resource === 'chat' || value.resource === 'message_render') &&
     typeof value.operation === 'string' &&
     (value.args === undefined || Array.isArray(value.args))
   );
@@ -83,18 +83,18 @@ async function dispatchNativeResource(
     }
   }
 
-  if (request.resource === 'response_interceptor') {
+  if (request.resource === 'message_render') {
     switch (request.operation) {
-      case 'arm':
-        return armResponseCurtain((args[0] ?? {}) as any);
-      case 'commit':
-        return commitResponseCurtain((args[0] ?? {}) as any);
+      case 'hold':
+        return holdMessageRender((args[0] ?? {}) as any);
+      case 'allow':
+        return allowMessageRender(String(args[0] ?? ''), String(args[1] ?? ''));
       case 'release':
-        return releaseResponseCurtain(String(args[0] ?? ''), (args[1] ?? {}) as any);
+        return releaseMessageRender(String(args[0] ?? ''), (args[1] ?? {}) as any);
       case 'status':
-        return responseCurtainStatus(args[0] == null ? undefined : String(args[0]));
+        return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
       default:
-        throw new Error(`Unsupported response_interceptor operation: ${request.operation}`);
+        throw new Error(`Unsupported message_render operation: ${request.operation}`);
     }
   }
 
@@ -181,7 +181,7 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
-installResponseInterceptorBridge();
+installMessageRenderBridge();
 installNativeResourceBridge();
 
 export function setup(): void {

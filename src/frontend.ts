@@ -65,7 +65,7 @@ type UserMessageProcessHandler = (
   request: UserMessageProcessRequest,
 ) => void | string | UserMessageProcessResult | Promise<void | string | UserMessageProcessResult>;
 
-type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'response_interceptor';
+type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'message_render';
 
 type PendingNativeResource = {
   resolve: (value: unknown) => void;
@@ -172,117 +172,38 @@ export function setup(ctx: SpindleFrontendContext) {
       callNativeResource('chat', 'updateMessage', [chatId, messageId, patch]),
   });
 
-  // Host-document bridge for Quill/Intro. These consumers already keep their
-  // Lumiverse path on window.parent, so they can use the native Spindle APIs
-  // without raw /api/v1/personas or /api/v1/world-books mutations.
-  (window as any).__vishrunPersonas = personaBridge;
-  (window as any).__vishrunWorldBooks = worldBooksBridge;
-  (window as any).__vishrunChat = chatBridge;
-
-  // Host-window lifecycle bridge for character-card/JSLR scripts whose global
-  // engines intentionally live on window.parent (Quill is one of them). The
-  // ScriptRunner already mirrors these events into each sandbox as eventSource;
-  // this companion bridge exposes the same native Spindle frontend event bus to
-  // parent-global engines without forcing them to open a second raw WebSocket.
-  const hostEventBridge = Object.freeze({
+  const eventBridge = Object.freeze({
     on(eventName: string, handler: unknown) {
       if (typeof eventName !== 'string' || !eventName.trim()) {
-        throw new TypeError('Vishrun event name must be a non-empty string');
+        throw new TypeError('Event name must be a non-empty string');
       }
       if (typeof handler !== 'function') {
-        throw new TypeError('Vishrun event handler must be a function');
+        throw new TypeError('Event handler must be a function');
       }
       return (ctx.events as any).on(eventName, handler);
     },
   });
-  (window as any).__vishrunEvents = hostEventBridge;
 
-  // Quill post-generation response curtain. Lumiverse stages a real assistant
-  // message id before GENERATION_STARTED, so Quill can hide exactly that row while
-  // Council/Workshop processes the completed output, then atomically commit the
-  // canonical swipe through the backend Spindle chat API.
-  type ResponseCurtainTarget = {
-    generationId: string;
-    chatId: string;
-    messageId: string;
-    swipeId: number;
-  };
-  const responseCurtainTargets = new Map<string, ResponseCurtainTarget>();
-  const responseCurtainStyleCleanup = ctx.dom.addStyle(`
-    [data-vishrun-quill-response-curtain="true"] {
-      visibility: hidden !important;
-    }
-  `);
-  const markResponseCurtainDom = () => {
-    if (responseCurtainTargets.size === 0) return;
-    const ids = new Set(Array.from(responseCurtainTargets.values()).map((target) => target.messageId));
-    document.querySelectorAll<HTMLElement>('[data-message-id]').forEach((element) => {
-      if (ids.has(String(element.dataset.messageId || ''))) {
-        element.setAttribute('data-vishrun-quill-response-curtain', 'true');
-      }
-    });
-  };
-  const clearResponseCurtainDom = (messageId?: string) => {
-    document.querySelectorAll<HTMLElement>('[data-vishrun-quill-response-curtain="true"]').forEach((element) => {
-      if (!messageId || String(element.dataset.messageId || '') === String(messageId)) {
-        element.removeAttribute('data-vishrun-quill-response-curtain');
-      }
-    });
-  };
-  const responseCurtainObserver = new MutationObserver(() => markResponseCurtainDom());
-  if (document.body) responseCurtainObserver.observe(document.body, { childList: true, subtree: true });
-
-  const responseInterceptorBridge = Object.freeze({
-    async arm(spec: Record<string, unknown>) {
-      const generationId = String(spec?.generationId || '');
-      const chatId = String(spec?.chatId || '');
-      const messageId = String(spec?.messageId || '');
-      const swipeId = Number.isFinite(Number(spec?.swipeId)) ? Math.max(0, Math.trunc(Number(spec?.swipeId))) : 0;
-      if (!generationId || !chatId || !messageId) throw new Error('Lumiverse Response Interceptor target is incomplete.');
-      const target = { generationId, chatId, messageId, swipeId };
-      responseCurtainTargets.set(generationId, target);
-      markResponseCurtainDom();
-      try {
-        return await callNativeResource('response_interceptor', 'arm', [target]);
-      } catch (error) {
-        responseCurtainTargets.delete(generationId);
-        clearResponseCurtainDom(messageId);
-        throw error;
-      }
+  const messageRenderBridge = Object.freeze({
+    hold(spec: Record<string, unknown>) {
+      return callNativeResource('message_render', 'hold', [spec]);
     },
-    async commit(spec: Record<string, unknown>) {
-      const generationId = String(spec?.generationId || '');
-      const target = responseCurtainTargets.get(generationId);
-      if (!target) throw new Error('Lumiverse Response Interceptor curtain is not armed.');
-      const result = await callNativeResource('response_interceptor', 'commit', [{
-        ...target,
-        content: String(spec?.content ?? ''),
-      }]);
-      // Let MESSAGE_EDITED/SWIPE_EDITED land while the backend render curtain
-      // permits only the committed canonical content, then reveal the same row.
-      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-      responseCurtainTargets.delete(generationId);
-      clearResponseCurtainDom(target.messageId);
-      void callNativeResource('response_interceptor', 'release', [generationId, { refresh: false }]).catch(() => {});
-      return result;
+    allow(holdId: string, content: string) {
+      return callNativeResource('message_render', 'allow', [holdId, content]);
     },
-    async release(generationIdValue: unknown, options: Record<string, unknown> = {}) {
-      const generationId = String(generationIdValue || '');
-      const target = responseCurtainTargets.get(generationId);
-      try {
-        return await callNativeResource('response_interceptor', 'release', [generationId, {
-          refresh: options.refresh !== false,
-        }]);
-      } finally {
-        responseCurtainTargets.delete(generationId);
-        clearResponseCurtainDom(target?.messageId);
-      }
+    release(holdId: string, options: Record<string, unknown> = {}) {
+      return callNativeResource('message_render', 'release', [holdId, options]);
     },
-    status(generationId?: string) {
-      return callNativeResource('response_interceptor', 'status', generationId ? [generationId] : []);
+    status(holdId?: string) {
+      return callNativeResource('message_render', 'status', holdId ? [holdId] : []);
     },
   });
-  (window as any).__vishrunResponseInterceptor = responseInterceptorBridge;
+
+  (window as any).__vishrunPersonas = personaBridge;
+  (window as any).__vishrunWorldBooks = worldBooksBridge;
+  (window as any).__vishrunChat = chatBridge;
+  (window as any).__vishrunEvents = eventBridge;
+  (window as any).__vishrunMessageRender = messageRenderBridge;
 
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
@@ -844,11 +765,7 @@ export function setup(ctx: SpindleFrontendContext) {
     delete (window as any).__vishrunWorldBooks;
     delete (window as any).__vishrunChat;
     delete (window as any).__vishrunEvents;
-    delete (window as any).__vishrunResponseInterceptor;
-    responseCurtainTargets.clear();
-    responseCurtainObserver.disconnect();
-    clearResponseCurtainDom();
-    responseCurtainStyleCleanup();
+    delete (window as any).__vishrunMessageRender;
     delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunRegisterUserMessageProcessor;
     delete (window as any).__vishrunGenerate;
