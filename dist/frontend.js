@@ -5746,6 +5746,9 @@ function setup(ctx) {
     hold(spec) {
       return callNativeResource("message_render", "hold", [spec]);
     },
+    bind(holdId, messageId) {
+      return callNativeResource("message_render", "bind", [holdId, messageId]);
+    },
     allow(holdId, content) {
       return callNativeResource("message_render", "allow", [holdId, content]);
     },
@@ -5756,11 +5759,17 @@ function setup(ctx) {
       return callNativeResource("message_render", "status", holdId ? [holdId] : []);
     }
   });
+  const tokensBridge = Object.freeze({
+    countText(text, options = {}) {
+      return callNativeResource("tokens", "countText", [text, options]);
+    }
+  });
   window.__vishrunPersonas = personaBridge;
   window.__vishrunWorldBooks = worldBooksBridge;
   window.__vishrunChat = chatBridge;
   window.__vishrunEvents = eventBridge;
   window.__vishrunMessageRender = messageRenderBridge;
+  window.__vishrunTokens = tokensBridge;
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: "vsh_pre_generation_subscription",
@@ -6250,6 +6259,7 @@ function setup(ctx) {
     delete window.__vishrunChat;
     delete window.__vishrunEvents;
     delete window.__vishrunMessageRender;
+    delete window.__vishrunTokens;
     delete window.__vishrunRegisterPreGeneration;
     delete window.__vishrunRegisterUserMessageProcessor;
     delete window.__vishrunGenerate;

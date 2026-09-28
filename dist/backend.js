@@ -1784,29 +1784,32 @@ function installUserMessageBridgeHandler() {
 var HOLD_TTL_MS = 5 * 60 * 1000;
 var holds = new Map;
 var targetOwners = new Map;
+var pendingOwners = new Map;
 function targetKey(chatId, messageId) {
   return `${chatId}\x00${messageId}`;
 }
 function normalizeHold(spec) {
   const id = String(spec?.id || "").trim();
   const chatId = String(spec?.chatId || "").trim();
-  const messageId = String(spec?.messageId || "").trim();
+  const messageId = spec?.messageId == null ? "" : String(spec.messageId).trim();
   if (!id)
     throw new Error("Message render hold id is required.");
   if (!chatId)
     throw new Error("Message render chatId is required.");
-  if (!messageId)
-    throw new Error("Message render messageId is required.");
-  return { id, chatId, messageId, content: String(spec?.content ?? "") };
+  return { id, chatId, ...messageId ? { messageId } : {}, content: String(spec?.content ?? "") };
 }
 function removeHold(id) {
   const hold = holds.get(id) ?? null;
   if (!hold)
     return null;
   holds.delete(id);
-  const key = targetKey(hold.chatId, hold.messageId);
-  if (targetOwners.get(key) === id)
-    targetOwners.delete(key);
+  if (hold.messageId) {
+    const key = targetKey(hold.chatId, hold.messageId);
+    if (targetOwners.get(key) === id)
+      targetOwners.delete(key);
+  }
+  if (pendingOwners.get(hold.chatId) === id)
+    pendingOwners.delete(hold.chatId);
   return hold;
 }
 function pruneExpired() {
@@ -1823,20 +1826,55 @@ async function getMessage(chatId, messageId) {
 async function holdMessageRender(spec) {
   pruneExpired();
   const safe = normalizeHold(spec);
-  const key = targetKey(safe.chatId, safe.messageId);
-  const previous = targetOwners.get(key);
-  if (previous && previous !== safe.id)
-    removeHold(previous);
+  removeHold(safe.id);
   const hold = {
     id: safe.id,
     chatId: safe.chatId,
-    messageId: safe.messageId,
+    messageId: safe.messageId || null,
     overrideContent: safe.content,
     expiresAt: Date.now() + HOLD_TTL_MS
   };
   holds.set(hold.id, hold);
-  targetOwners.set(key, hold.id);
-  return { held: true, id: hold.id, chatId: hold.chatId, messageId: hold.messageId };
+  if (hold.messageId) {
+    const key = targetKey(hold.chatId, hold.messageId);
+    const previous = targetOwners.get(key);
+    if (previous && previous !== hold.id)
+      removeHold(previous);
+    targetOwners.set(key, hold.id);
+  } else {
+    const previous = pendingOwners.get(hold.chatId);
+    if (previous && previous !== hold.id)
+      removeHold(previous);
+    pendingOwners.set(hold.chatId, hold.id);
+  }
+  return { held: true, pending: !hold.messageId, id: hold.id, chatId: hold.chatId, messageId: hold.messageId };
+}
+async function bindMessageRender(idValue, messageIdValue) {
+  pruneExpired();
+  const id = String(idValue || "").trim();
+  const messageId = String(messageIdValue || "").trim();
+  if (!id)
+    throw new Error("Message render hold id is required.");
+  if (!messageId)
+    throw new Error("Message render messageId is required.");
+  const hold = holds.get(id);
+  if (!hold)
+    throw new Error("Message render hold is not active.");
+  if (hold.messageId) {
+    const previousKey = targetKey(hold.chatId, hold.messageId);
+    if (targetOwners.get(previousKey) === id)
+      targetOwners.delete(previousKey);
+  }
+  if (pendingOwners.get(hold.chatId) === id)
+    pendingOwners.delete(hold.chatId);
+  const key = targetKey(hold.chatId, messageId);
+  const previous = targetOwners.get(key);
+  if (previous && previous !== id)
+    removeHold(previous);
+  hold.messageId = messageId;
+  hold.expiresAt = Date.now() + HOLD_TTL_MS;
+  targetOwners.set(key, id);
+  return { bound: true, id, chatId: hold.chatId, messageId };
 }
 async function allowMessageRender(idValue, content) {
   pruneExpired();
@@ -1856,7 +1894,7 @@ async function releaseMessageRender(idValue, options = {}) {
   const hold = removeHold(id);
   if (!hold)
     return { released: false };
-  if (options.refresh) {
+  if (options.refresh && hold.messageId) {
     const message = await getMessage(hold.chatId, hold.messageId);
     if (message) {
       await api.chat.updateMessage(hold.chatId, hold.messageId, {
@@ -1876,7 +1914,17 @@ async function processMessageRender(ctx) {
   if (ctx.origin !== "render" || ctx.isUser || !ctx.messageId)
     return;
   pruneExpired();
-  const id = targetOwners.get(targetKey(String(ctx.chatId), String(ctx.messageId)));
+  const chatId = String(ctx.chatId);
+  const messageId = String(ctx.messageId);
+  let id = targetOwners.get(targetKey(chatId, messageId));
+  if (!id) {
+    const pendingId = pendingOwners.get(chatId);
+    const pending = pendingId ? holds.get(pendingId) : null;
+    if (pending && !pending.messageId) {
+      await bindMessageRender(pending.id, messageId);
+      id = pending.id;
+    }
+  }
   if (!id)
     return;
   const hold = holds.get(id);
@@ -1896,7 +1944,7 @@ function isNativeResourceRequest(payload) {
   if (!payload || typeof payload !== "object")
     return false;
   const value = payload;
-  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books" || value.resource === "chat" || value.resource === "message_render") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
+  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books" || value.resource === "chat" || value.resource === "message_render" || value.resource === "tokens") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
 }
 async function dispatchNativeResource(request, userId) {
   const args = Array.isArray(request.args) ? request.args : [];
@@ -1938,6 +1986,8 @@ async function dispatchNativeResource(request, userId) {
     switch (request.operation) {
       case "hold":
         return holdMessageRender(args[0] ?? {});
+      case "bind":
+        return bindMessageRender(String(args[0] ?? ""), String(args[1] ?? ""));
       case "allow":
         return allowMessageRender(String(args[0] ?? ""), String(args[1] ?? ""));
       case "release":
@@ -1946,6 +1996,14 @@ async function dispatchNativeResource(request, userId) {
         return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
       default:
         throw new Error(`Unsupported message_render operation: ${request.operation}`);
+    }
+  }
+  if (request.resource === "tokens") {
+    switch (request.operation) {
+      case "countText":
+        return api.tokens.countText(String(args[0] ?? ""), args[1] ?? {});
+      default:
+        throw new Error(`Unsupported tokens operation: ${request.operation}`);
     }
   }
   switch (request.operation) {
