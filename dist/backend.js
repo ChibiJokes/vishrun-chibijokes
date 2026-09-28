@@ -1780,186 +1780,12 @@ function installUserMessageBridgeHandler() {
   api.registerContextHandler(async (rawContext) => processGenerationContext(rawContext), 40, { timeoutMs: HOST_TIMEOUT_MS });
 }
 
-// src/backend/message-render-bridge.ts
-var HOLD_TTL_MS = 5 * 60 * 1000;
-var DISPLAY_OWNER_NAMESPACE = "vishrun_chibijokes";
-var holds = new Map;
-var targetOwners = new Map;
-var pendingOwners = new Map;
-function targetKey(chatId, messageId) {
-  return `${chatId}\x00${messageId}`;
-}
-function normalizeHold(spec) {
-  const id = String(spec?.id || "").trim();
-  const chatId = String(spec?.chatId || "").trim();
-  const messageId = spec?.messageId == null ? "" : String(spec.messageId).trim();
-  if (!id)
-    throw new Error("Message render hold id is required.");
-  if (!chatId)
-    throw new Error("Message render chatId is required.");
-  return { id, chatId, ...messageId ? { messageId } : {}, content: String(spec?.content ?? "") };
-}
-function removeHold(id) {
-  const hold = holds.get(id) ?? null;
-  if (!hold)
-    return null;
-  holds.delete(id);
-  if (hold.messageId) {
-    const key = targetKey(hold.chatId, hold.messageId);
-    if (targetOwners.get(key) === id)
-      targetOwners.delete(key);
-  }
-  if (pendingOwners.get(hold.chatId) === id)
-    pendingOwners.delete(hold.chatId);
-  return hold;
-}
-function pruneExpired() {
-  const now = Date.now();
-  for (const [id, hold] of holds) {
-    if (hold.expiresAt <= now)
-      removeHold(id);
-  }
-}
-async function getMessage(chatId, messageId) {
-  const rows = await api.chat.getMessages(chatId);
-  return Array.isArray(rows) ? rows.find((row) => String(row?.id) === messageId) ?? null : null;
-}
-async function holdMessageRender(spec) {
-  pruneExpired();
-  const safe = normalizeHold(spec);
-  removeHold(safe.id);
-  const hold = {
-    id: safe.id,
-    chatId: safe.chatId,
-    messageId: safe.messageId || null,
-    overrideContent: safe.content,
-    expiresAt: Date.now() + HOLD_TTL_MS
-  };
-  holds.set(hold.id, hold);
-  if (hold.messageId) {
-    const key = targetKey(hold.chatId, hold.messageId);
-    const previous = targetOwners.get(key);
-    if (previous && previous !== hold.id)
-      removeHold(previous);
-    targetOwners.set(key, hold.id);
-  } else {
-    const previous = pendingOwners.get(hold.chatId);
-    if (previous && previous !== hold.id)
-      removeHold(previous);
-    pendingOwners.set(hold.chatId, hold.id);
-  }
-  return { held: true, pending: !hold.messageId, id: hold.id, chatId: hold.chatId, messageId: hold.messageId };
-}
-async function bindMessageRender(idValue, messageIdValue) {
-  pruneExpired();
-  const id = String(idValue || "").trim();
-  const messageId = String(messageIdValue || "").trim();
-  if (!id)
-    throw new Error("Message render hold id is required.");
-  if (!messageId)
-    throw new Error("Message render messageId is required.");
-  const hold = holds.get(id);
-  if (!hold)
-    throw new Error("Message render hold is not active.");
-  if (hold.messageId) {
-    const previousKey = targetKey(hold.chatId, hold.messageId);
-    if (targetOwners.get(previousKey) === id)
-      targetOwners.delete(previousKey);
-  }
-  if (pendingOwners.get(hold.chatId) === id)
-    pendingOwners.delete(hold.chatId);
-  const key = targetKey(hold.chatId, messageId);
-  const previous = targetOwners.get(key);
-  if (previous && previous !== id)
-    removeHold(previous);
-  hold.messageId = messageId;
-  hold.expiresAt = Date.now() + HOLD_TTL_MS;
-  targetOwners.set(key, id);
-  return { bound: true, id, chatId: hold.chatId, messageId };
-}
-async function allowMessageRender(idValue, content) {
-  pruneExpired();
-  const id = String(idValue || "").trim();
-  const hold = holds.get(id);
-  if (!hold)
-    throw new Error("Message render hold is not active.");
-  hold.allowedContent = String(content ?? "");
-  hold.expiresAt = Date.now() + HOLD_TTL_MS;
-  return { allowed: true, id };
-}
-async function releaseMessageRender(idValue, options = {}) {
-  pruneExpired();
-  const id = String(idValue || "").trim();
-  if (!id)
-    return { released: false };
-  const hold = removeHold(id);
-  if (!hold)
-    return { released: false };
-  if (options.refresh && hold.messageId) {
-    const message = await getMessage(hold.chatId, hold.messageId);
-    if (message) {
-      await api.chat.updateMessage(hold.chatId, hold.messageId, {
-        content: String(message.content ?? "")
-      });
-    }
-  }
-  return { released: true, id, chatId: hold.chatId, messageId: hold.messageId };
-}
-function messageRenderStatus(idValue) {
-  pruneExpired();
-  if (idValue)
-    return holds.get(String(idValue)) ?? null;
-  return Array.from(holds.values()).map((hold) => ({ ...hold }));
-}
-async function ensureMessageRenderDisplayOwner(characterIdValue, userId) {
-  const characterId = String(characterIdValue || "").trim();
-  if (!characterId)
-    throw new Error("Character id is required.");
-  const character = await api.characters.get(characterId, userId);
-  if (!character)
-    throw new Error("Character not found.");
-  const extensions = character.extensions && typeof character.extensions === "object" ? character.extensions : {};
-  const own = extensions[DISPLAY_OWNER_NAMESPACE] && typeof extensions[DISPLAY_OWNER_NAMESPACE] === "object" ? { ...extensions[DISPLAY_OWNER_NAMESPACE] } : {};
-  if (own.display_owner === true) {
-    return { changed: false, characterId, owner: DISPLAY_OWNER_NAMESPACE };
-  }
-  await api.characters.update(characterId, {
-    extensions: {
-      [DISPLAY_OWNER_NAMESPACE]: {
-        ...own,
-        display_owner: true
-      }
-    }
-  }, userId);
-  return { changed: true, characterId, owner: DISPLAY_OWNER_NAMESPACE };
-}
-async function processMessageRender(ctx) {
-  if (ctx.origin !== "render" || ctx.isUser || !ctx.messageId)
-    return;
-  pruneExpired();
-  const chatId = String(ctx.chatId);
-  const messageId = String(ctx.messageId);
-  const id = targetOwners.get(targetKey(chatId, messageId));
-  if (!id)
-    return;
-  const hold = holds.get(id);
-  if (!hold)
-    return;
-  const content = String(ctx.content ?? "");
-  if (hold.allowedContent !== undefined && content === hold.allowedContent)
-    return;
-  return { content: hold.overrideContent };
-}
-function installMessageRenderBridge() {
-  api.registerMessageContentProcessor((ctx) => processMessageRender(ctx), 5);
-}
-
 // src/backend/index.ts
 function isNativeResourceRequest(payload) {
   if (!payload || typeof payload !== "object")
     return false;
   const value = payload;
-  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books" || value.resource === "chat" || value.resource === "message_render" || value.resource === "tokens") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
+  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
 }
 async function dispatchNativeResource(request, userId) {
   const args = Array.isArray(request.args) ? request.args : [];
@@ -1985,42 +1811,6 @@ async function dispatchNativeResource(request, userId) {
         return api.personas.getWorldBook(String(args[0] ?? ""), userId);
       default:
         throw new Error(`Unsupported personas operation: ${request.operation}`);
-    }
-  }
-  if (request.resource === "chat") {
-    switch (request.operation) {
-      case "getMessages":
-        return api.chat.getMessages(String(args[0] ?? ""));
-      case "updateMessage":
-        return api.chat.updateMessage(String(args[0] ?? ""), String(args[1] ?? ""), args[2] ?? {});
-      default:
-        throw new Error(`Unsupported chat operation: ${request.operation}`);
-    }
-  }
-  if (request.resource === "message_render") {
-    switch (request.operation) {
-      case "hold":
-        return holdMessageRender(args[0] ?? {});
-      case "bind":
-        return bindMessageRender(String(args[0] ?? ""), String(args[1] ?? ""));
-      case "allow":
-        return allowMessageRender(String(args[0] ?? ""), String(args[1] ?? ""));
-      case "release":
-        return releaseMessageRender(String(args[0] ?? ""), args[1] ?? {});
-      case "status":
-        return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
-      case "ensureOwner":
-        return ensureMessageRenderDisplayOwner(String(args[0] ?? ""), userId);
-      default:
-        throw new Error(`Unsupported message_render operation: ${request.operation}`);
-    }
-  }
-  if (request.resource === "tokens") {
-    switch (request.operation) {
-      case "countText":
-        return api.tokens.countText(String(args[0] ?? ""), args[1] ?? {});
-      default:
-        throw new Error(`Unsupported tokens operation: ${request.operation}`);
     }
   }
   switch (request.operation) {
@@ -2081,7 +1871,6 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
-installMessageRenderBridge();
 installNativeResourceBridge();
 function setup() {}
 export {
