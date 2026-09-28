@@ -1780,157 +1780,115 @@ function installUserMessageBridgeHandler() {
   api.registerContextHandler(async (rawContext) => processGenerationContext(rawContext), 40, { timeoutMs: HOST_TIMEOUT_MS });
 }
 
-// src/backend/response-interceptor-bridge.ts
-var CURTAIN_TTL_MS = 5 * 60 * 1000;
-var curtains = new Map;
+// src/backend/message-render-bridge.ts
+var HOLD_TTL_MS = 5 * 60 * 1000;
+var holds = new Map;
 var targetOwners = new Map;
 function targetKey(chatId, messageId) {
   return `${chatId}\x00${messageId}`;
 }
-function sanitizeSpec(spec) {
-  const generationId = String(spec?.generationId || "").trim();
+function normalizeHold(spec) {
+  const id = String(spec?.id || "").trim();
   const chatId = String(spec?.chatId || "").trim();
   const messageId = String(spec?.messageId || "").trim();
-  const swipeId = Number.isFinite(Number(spec?.swipeId)) ? Math.max(0, Math.trunc(Number(spec.swipeId))) : 0;
-  if (!generationId)
-    throw new Error("Response Interceptor generationId is required.");
+  if (!id)
+    throw new Error("Message render hold id is required.");
   if (!chatId)
-    throw new Error("Response Interceptor chatId is required.");
+    throw new Error("Message render chatId is required.");
   if (!messageId)
-    throw new Error("Response Interceptor messageId is required.");
-  return { generationId, chatId, messageId, swipeId };
+    throw new Error("Message render messageId is required.");
+  return { id, chatId, messageId, content: String(spec?.content ?? "") };
 }
-function clearCurtain(generationId) {
-  const state = curtains.get(generationId) ?? null;
-  if (!state)
+function removeHold(id) {
+  const hold = holds.get(id) ?? null;
+  if (!hold)
     return null;
-  curtains.delete(generationId);
-  const key = targetKey(state.chatId, state.messageId);
-  if (targetOwners.get(key) === generationId)
+  holds.delete(id);
+  const key = targetKey(hold.chatId, hold.messageId);
+  if (targetOwners.get(key) === id)
     targetOwners.delete(key);
-  return state;
+  return hold;
 }
 function pruneExpired() {
   const now = Date.now();
-  for (const [generationId, state] of curtains) {
-    if (state.expiresAt <= now)
-      clearCurtain(generationId);
+  for (const [id, hold] of holds) {
+    if (hold.expiresAt <= now)
+      removeHold(id);
   }
 }
 async function getMessage(chatId, messageId) {
   const rows = await api.chat.getMessages(chatId);
   return Array.isArray(rows) ? rows.find((row) => String(row?.id) === messageId) ?? null : null;
 }
-async function armResponseCurtain(spec) {
+async function holdMessageRender(spec) {
   pruneExpired();
-  const safe = sanitizeSpec(spec);
-  for (const [generationId, state] of curtains) {
-    if (state.chatId === safe.chatId && generationId !== safe.generationId)
-      clearCurtain(generationId);
-  }
+  const safe = normalizeHold(spec);
   const key = targetKey(safe.chatId, safe.messageId);
-  const previousOwner = targetOwners.get(key);
-  if (previousOwner && previousOwner !== safe.generationId)
-    clearCurtain(previousOwner);
-  const state = {
-    generationId: safe.generationId,
+  const previous = targetOwners.get(key);
+  if (previous && previous !== safe.id)
+    removeHold(previous);
+  const hold = {
+    id: safe.id,
     chatId: safe.chatId,
     messageId: safe.messageId,
-    swipeId: safe.swipeId ?? 0,
-    mode: "holding",
-    armedAt: Date.now(),
-    expiresAt: Date.now() + CURTAIN_TTL_MS
+    overrideContent: safe.content,
+    expiresAt: Date.now() + HOLD_TTL_MS
   };
-  curtains.set(state.generationId, state);
-  targetOwners.set(key, state.generationId);
-  return { armed: true, ...state };
+  holds.set(hold.id, hold);
+  targetOwners.set(key, hold.id);
+  return { held: true, id: hold.id, chatId: hold.chatId, messageId: hold.messageId };
 }
-async function commitResponseCurtain(spec) {
+async function allowMessageRender(idValue, content) {
   pruneExpired();
-  const safe = sanitizeSpec(spec);
-  const replacement = String(spec?.content ?? "");
-  const state = curtains.get(safe.generationId);
-  if (!state)
-    throw new Error("Response Interceptor curtain is no longer armed for this generation.");
-  if (state.chatId !== safe.chatId || state.messageId !== safe.messageId) {
-    throw new Error("Response Interceptor target changed before commit.");
-  }
-  const message = await getMessage(safe.chatId, safe.messageId);
-  if (!message)
-    throw new Error("Lumiverse target message no longer exists.");
-  const swipes = Array.isArray(message.swipes) ? message.swipes.map((value) => String(value ?? "")) : [String(message.content ?? "")];
-  const targetSwipe = safe.swipeId ?? state.swipeId;
-  if (targetSwipe < 0 || targetSwipe >= swipes.length) {
-    throw new Error(`Lumiverse target swipe ${targetSwipe} no longer exists.`);
-  }
-  const activeSwipe = Number.isFinite(Number(message.swipe_id)) ? Math.trunc(Number(message.swipe_id)) : 0;
-  swipes[targetSwipe] = replacement;
-  state.mode = "committing";
-  state.swipeId = targetSwipe;
-  state.allowedContent = targetSwipe === activeSwipe ? replacement : String(message.content ?? swipes[activeSwipe] ?? "");
-  state.expiresAt = Date.now() + CURTAIN_TTL_MS;
-  await api.chat.updateMessage(safe.chatId, safe.messageId, {
-    swipes,
-    swipe_id: activeSwipe
-  });
-  const updated = await getMessage(safe.chatId, safe.messageId);
-  if (!updated)
-    throw new Error("Lumiverse target disappeared after the Interceptor commit.");
-  state.allowedContent = String(updated.content ?? "");
-  return {
-    committed: true,
-    generationId: safe.generationId,
-    chatId: safe.chatId,
-    messageId: safe.messageId,
-    swipeId: targetSwipe,
-    activeSwipeId: Number(updated.swipe_id ?? activeSwipe),
-    content: String(updated.content ?? ""),
-    targetContent: Array.isArray(updated.swipes) ? String(updated.swipes[targetSwipe] ?? "") : replacement,
-    swipes: Array.isArray(updated.swipes) ? updated.swipes : undefined
-  };
+  const id = String(idValue || "").trim();
+  const hold = holds.get(id);
+  if (!hold)
+    throw new Error("Message render hold is not active.");
+  hold.allowedContent = String(content ?? "");
+  hold.expiresAt = Date.now() + HOLD_TTL_MS;
+  return { allowed: true, id };
 }
-async function releaseResponseCurtain(generationId, options = {}) {
+async function releaseMessageRender(idValue, options = {}) {
   pruneExpired();
-  const id = String(generationId || "").trim();
+  const id = String(idValue || "").trim();
   if (!id)
     return { released: false };
-  const state = clearCurtain(id);
-  if (!state)
+  const hold = removeHold(id);
+  if (!hold)
     return { released: false };
   if (options.refresh) {
-    const message = await getMessage(state.chatId, state.messageId);
+    const message = await getMessage(hold.chatId, hold.messageId);
     if (message) {
-      await api.chat.updateMessage(state.chatId, state.messageId, {
+      await api.chat.updateMessage(hold.chatId, hold.messageId, {
         content: String(message.content ?? "")
       });
     }
   }
-  return { released: true, generationId: id, chatId: state.chatId, messageId: state.messageId };
+  return { released: true, id, chatId: hold.chatId, messageId: hold.messageId };
 }
-function responseCurtainStatus(generationId) {
+function messageRenderStatus(idValue) {
   pruneExpired();
-  if (generationId)
-    return curtains.get(String(generationId)) ?? null;
-  return Array.from(curtains.values()).map((state) => ({ ...state }));
+  if (idValue)
+    return holds.get(String(idValue)) ?? null;
+  return Array.from(holds.values()).map((hold) => ({ ...hold }));
 }
-async function processResponseCurtain(ctx) {
+async function processMessageRender(ctx) {
   if (ctx.origin !== "render" || ctx.isUser || !ctx.messageId)
     return;
   pruneExpired();
-  const generationId = targetOwners.get(targetKey(String(ctx.chatId), String(ctx.messageId)));
-  if (!generationId)
+  const id = targetOwners.get(targetKey(String(ctx.chatId), String(ctx.messageId)));
+  if (!id)
     return;
-  const state = curtains.get(generationId);
-  if (!state)
+  const hold = holds.get(id);
+  if (!hold)
     return;
   const content = String(ctx.content ?? "");
-  if (state.mode === "committing" && state.allowedContent !== undefined && content === state.allowedContent) {
+  if (hold.allowedContent !== undefined && content === hold.allowedContent)
     return;
-  }
-  return { content: "\u2063" };
+  return { content: hold.overrideContent };
 }
-function installResponseInterceptorBridge() {
-  api.registerMessageContentProcessor((ctx) => processResponseCurtain(ctx), 5);
+function installMessageRenderBridge() {
+  api.registerMessageContentProcessor((ctx) => processMessageRender(ctx), 5);
 }
 
 // src/backend/index.ts
@@ -1938,7 +1896,7 @@ function isNativeResourceRequest(payload) {
   if (!payload || typeof payload !== "object")
     return false;
   const value = payload;
-  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books" || value.resource === "chat" || value.resource === "response_interceptor") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
+  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books" || value.resource === "chat" || value.resource === "message_render") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
 }
 async function dispatchNativeResource(request, userId) {
   const args = Array.isArray(request.args) ? request.args : [];
@@ -1976,18 +1934,18 @@ async function dispatchNativeResource(request, userId) {
         throw new Error(`Unsupported chat operation: ${request.operation}`);
     }
   }
-  if (request.resource === "response_interceptor") {
+  if (request.resource === "message_render") {
     switch (request.operation) {
-      case "arm":
-        return armResponseCurtain(args[0] ?? {});
-      case "commit":
-        return commitResponseCurtain(args[0] ?? {});
+      case "hold":
+        return holdMessageRender(args[0] ?? {});
+      case "allow":
+        return allowMessageRender(String(args[0] ?? ""), String(args[1] ?? ""));
       case "release":
-        return releaseResponseCurtain(String(args[0] ?? ""), args[1] ?? {});
+        return releaseMessageRender(String(args[0] ?? ""), args[1] ?? {});
       case "status":
-        return responseCurtainStatus(args[0] == null ? undefined : String(args[0]));
+        return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
       default:
-        throw new Error(`Unsupported response_interceptor operation: ${request.operation}`);
+        throw new Error(`Unsupported message_render operation: ${request.operation}`);
     }
   }
   switch (request.operation) {
@@ -2048,7 +2006,7 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
-installResponseInterceptorBridge();
+installMessageRenderBridge();
 installNativeResourceBridge();
 function setup() {}
 export {

@@ -5731,98 +5731,36 @@ function setup(ctx) {
     getMessages: (chatId) => callNativeResource("chat", "getMessages", [chatId]),
     updateMessage: (chatId, messageId, patch) => callNativeResource("chat", "updateMessage", [chatId, messageId, patch])
   });
-  window.__vishrunPersonas = personaBridge;
-  window.__vishrunWorldBooks = worldBooksBridge;
-  window.__vishrunChat = chatBridge;
-  const hostEventBridge = Object.freeze({
+  const eventBridge = Object.freeze({
     on(eventName, handler) {
       if (typeof eventName !== "string" || !eventName.trim()) {
-        throw new TypeError("Vishrun event name must be a non-empty string");
+        throw new TypeError("Event name must be a non-empty string");
       }
       if (typeof handler !== "function") {
-        throw new TypeError("Vishrun event handler must be a function");
+        throw new TypeError("Event handler must be a function");
       }
       return ctx.events.on(eventName, handler);
     }
   });
-  window.__vishrunEvents = hostEventBridge;
-  const responseCurtainTargets = new Map;
-  const responseCurtainStyleCleanup = ctx.dom.addStyle(`
-    [data-vishrun-quill-response-curtain="true"] {
-      visibility: hidden !important;
-    }
-  `);
-  const markResponseCurtainDom = () => {
-    if (responseCurtainTargets.size === 0)
-      return;
-    const ids = new Set(Array.from(responseCurtainTargets.values()).map((target) => target.messageId));
-    document.querySelectorAll("[data-message-id]").forEach((element) => {
-      if (ids.has(String(element.dataset.messageId || ""))) {
-        element.setAttribute("data-vishrun-quill-response-curtain", "true");
-      }
-    });
-  };
-  const clearResponseCurtainDom = (messageId) => {
-    document.querySelectorAll('[data-vishrun-quill-response-curtain="true"]').forEach((element) => {
-      if (!messageId || String(element.dataset.messageId || "") === String(messageId)) {
-        element.removeAttribute("data-vishrun-quill-response-curtain");
-      }
-    });
-  };
-  const responseCurtainObserver = new MutationObserver(() => markResponseCurtainDom());
-  if (document.body)
-    responseCurtainObserver.observe(document.body, { childList: true, subtree: true });
-  const responseInterceptorBridge = Object.freeze({
-    async arm(spec) {
-      const generationId = String(spec?.generationId || "");
-      const chatId = String(spec?.chatId || "");
-      const messageId = String(spec?.messageId || "");
-      const swipeId = Number.isFinite(Number(spec?.swipeId)) ? Math.max(0, Math.trunc(Number(spec?.swipeId))) : 0;
-      if (!generationId || !chatId || !messageId)
-        throw new Error("Lumiverse Response Interceptor target is incomplete.");
-      const target = { generationId, chatId, messageId, swipeId };
-      responseCurtainTargets.set(generationId, target);
-      markResponseCurtainDom();
-      try {
-        return await callNativeResource("response_interceptor", "arm", [target]);
-      } catch (error) {
-        responseCurtainTargets.delete(generationId);
-        clearResponseCurtainDom(messageId);
-        throw error;
-      }
+  const messageRenderBridge = Object.freeze({
+    hold(spec) {
+      return callNativeResource("message_render", "hold", [spec]);
     },
-    async commit(spec) {
-      const generationId = String(spec?.generationId || "");
-      const target = responseCurtainTargets.get(generationId);
-      if (!target)
-        throw new Error("Lumiverse Response Interceptor curtain is not armed.");
-      const result = await callNativeResource("response_interceptor", "commit", [{
-        ...target,
-        content: String(spec?.content ?? "")
-      }]);
-      await new Promise((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
-      responseCurtainTargets.delete(generationId);
-      clearResponseCurtainDom(target.messageId);
-      callNativeResource("response_interceptor", "release", [generationId, { refresh: false }]).catch(() => {});
-      return result;
+    allow(holdId, content) {
+      return callNativeResource("message_render", "allow", [holdId, content]);
     },
-    async release(generationIdValue, options = {}) {
-      const generationId = String(generationIdValue || "");
-      const target = responseCurtainTargets.get(generationId);
-      try {
-        return await callNativeResource("response_interceptor", "release", [generationId, {
-          refresh: options.refresh !== false
-        }]);
-      } finally {
-        responseCurtainTargets.delete(generationId);
-        clearResponseCurtainDom(target?.messageId);
-      }
+    release(holdId, options = {}) {
+      return callNativeResource("message_render", "release", [holdId, options]);
     },
-    status(generationId) {
-      return callNativeResource("response_interceptor", "status", generationId ? [generationId] : []);
+    status(holdId) {
+      return callNativeResource("message_render", "status", holdId ? [holdId] : []);
     }
   });
-  window.__vishrunResponseInterceptor = responseInterceptorBridge;
+  window.__vishrunPersonas = personaBridge;
+  window.__vishrunWorldBooks = worldBooksBridge;
+  window.__vishrunChat = chatBridge;
+  window.__vishrunEvents = eventBridge;
+  window.__vishrunMessageRender = messageRenderBridge;
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: "vsh_pre_generation_subscription",
@@ -6311,11 +6249,7 @@ function setup(ctx) {
     delete window.__vishrunWorldBooks;
     delete window.__vishrunChat;
     delete window.__vishrunEvents;
-    delete window.__vishrunResponseInterceptor;
-    responseCurtainTargets.clear();
-    responseCurtainObserver.disconnect();
-    clearResponseCurtainDom();
-    responseCurtainStyleCleanup();
+    delete window.__vishrunMessageRender;
     delete window.__vishrunRegisterPreGeneration;
     delete window.__vishrunRegisterUserMessageProcessor;
     delete window.__vishrunGenerate;
