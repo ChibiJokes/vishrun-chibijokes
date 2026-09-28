@@ -172,6 +172,24 @@ export function setup(ctx: SpindleFrontendContext) {
   (window as any).__vishrunPersonas = personaBridge;
   (window as any).__vishrunWorldBooks = worldBooksBridge;
 
+  // Host-window lifecycle bridge for character-card/JSLR scripts whose global
+  // engines intentionally live on window.parent (Quill is one of them). The
+  // ScriptRunner already mirrors these events into each sandbox as eventSource;
+  // this companion bridge exposes the same native Spindle frontend event bus to
+  // parent-global engines without forcing them to open a second raw WebSocket.
+  const hostEventBridge = Object.freeze({
+    on(eventName: string, handler: unknown) {
+      if (typeof eventName !== 'string' || !eventName.trim()) {
+        throw new TypeError('Vishrun event name must be a non-empty string');
+      }
+      if (typeof handler !== 'function') {
+        throw new TypeError('Vishrun event handler must be a function');
+      }
+      return (ctx.events as any).on(eventName, handler);
+    },
+  });
+  (window as any).__vishrunEvents = hostEventBridge;
+
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: 'vsh_pre_generation_subscription',
@@ -730,6 +748,7 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubBackendMsg();
     delete (window as any).__vishrunPersonas;
     delete (window as any).__vishrunWorldBooks;
+    delete (window as any).__vishrunEvents;
     delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunRegisterUserMessageProcessor;
     delete (window as any).__vishrunGenerate;
