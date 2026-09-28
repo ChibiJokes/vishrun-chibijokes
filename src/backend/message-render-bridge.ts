@@ -18,6 +18,7 @@ export interface MessageRenderHoldSpec {
 }
 
 const HOLD_TTL_MS = 5 * 60 * 1000;
+const DISPLAY_OWNER_NAMESPACE = 'vishrun_chibijokes';
 const holds = new Map<string, MessageRenderHold>();
 const targetOwners = new Map<string, string>();
 const pendingOwners = new Map<string, string>();
@@ -151,6 +152,46 @@ export function messageRenderStatus(idValue?: string): unknown {
   return Array.from(holds.values()).map((hold) => ({ ...hold }));
 }
 
+
+export async function ensureMessageRenderDisplayOwner(
+  characterIdValue: string,
+  userId?: string,
+): Promise<Record<string, unknown>> {
+  const characterId = String(characterIdValue || '').trim();
+  if (!characterId) throw new Error('Character id is required.');
+
+  const character = await (api.characters.get as any)(characterId, userId);
+  if (!character) throw new Error('Character not found.');
+
+  const extensions =
+    character.extensions && typeof character.extensions === 'object'
+      ? character.extensions as Record<string, unknown>
+      : {};
+  const own =
+    extensions[DISPLAY_OWNER_NAMESPACE] && typeof extensions[DISPLAY_OWNER_NAMESPACE] === 'object'
+      ? { ...(extensions[DISPLAY_OWNER_NAMESPACE] as Record<string, unknown>) }
+      : {};
+
+  if (own.display_owner === true) {
+    return { changed: false, characterId, owner: DISPLAY_OWNER_NAMESPACE };
+  }
+
+  await (api.characters.update as any)(
+    characterId,
+    {
+      extensions: {
+        [DISPLAY_OWNER_NAMESPACE]: {
+          ...own,
+          display_owner: true,
+        },
+      },
+    },
+    userId,
+  );
+
+  return { changed: true, characterId, owner: DISPLAY_OWNER_NAMESPACE };
+}
+
 async function processMessageRender(
   ctx: MessageContentProcessorCtxDTO,
 ): Promise<MessageContentProcessorResultDTO | void> {
@@ -158,15 +199,7 @@ async function processMessageRender(
   pruneExpired();
   const chatId = String(ctx.chatId);
   const messageId = String(ctx.messageId);
-  let id = targetOwners.get(targetKey(chatId, messageId));
-  if (!id) {
-    const pendingId = pendingOwners.get(chatId);
-    const pending = pendingId ? holds.get(pendingId) : null;
-    if (pending && !pending.messageId) {
-      await bindMessageRender(pending.id, messageId);
-      id = pending.id;
-    }
-  }
+  const id = targetOwners.get(targetKey(chatId, messageId));
   if (!id) return;
   const hold = holds.get(id);
   if (!hold) return;

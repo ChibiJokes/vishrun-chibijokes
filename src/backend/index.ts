@@ -11,6 +11,7 @@ import {
   bindMessageRender,
   holdMessageRender,
   installMessageRenderBridge,
+  ensureMessageRenderDisplayOwner,
   messageRenderStatus,
   releaseMessageRender,
 } from './message-render-bridge';
@@ -96,6 +97,8 @@ async function dispatchNativeResource(
         return releaseMessageRender(String(args[0] ?? ''), (args[1] ?? {}) as any);
       case 'status':
         return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
+      case 'ensureOwner':
+        return ensureMessageRenderDisplayOwner(String(args[0] ?? ''), userId);
       default:
         throw new Error(`Unsupported message_render operation: ${request.operation}`);
     }
