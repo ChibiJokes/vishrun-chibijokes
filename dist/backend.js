@@ -1782,6 +1782,7 @@ function installUserMessageBridgeHandler() {
 
 // src/backend/message-render-bridge.ts
 var HOLD_TTL_MS = 5 * 60 * 1000;
+var DISPLAY_OWNER_NAMESPACE = "vishrun_chibijokes";
 var holds = new Map;
 var targetOwners = new Map;
 var pendingOwners = new Map;
@@ -1910,21 +1911,35 @@ function messageRenderStatus(idValue) {
     return holds.get(String(idValue)) ?? null;
   return Array.from(holds.values()).map((hold) => ({ ...hold }));
 }
+async function ensureMessageRenderDisplayOwner(characterIdValue, userId) {
+  const characterId = String(characterIdValue || "").trim();
+  if (!characterId)
+    throw new Error("Character id is required.");
+  const character = await api.characters.get(characterId, userId);
+  if (!character)
+    throw new Error("Character not found.");
+  const extensions = character.extensions && typeof character.extensions === "object" ? character.extensions : {};
+  const own = extensions[DISPLAY_OWNER_NAMESPACE] && typeof extensions[DISPLAY_OWNER_NAMESPACE] === "object" ? { ...extensions[DISPLAY_OWNER_NAMESPACE] } : {};
+  if (own.display_owner === true) {
+    return { changed: false, characterId, owner: DISPLAY_OWNER_NAMESPACE };
+  }
+  await api.characters.update(characterId, {
+    extensions: {
+      [DISPLAY_OWNER_NAMESPACE]: {
+        ...own,
+        display_owner: true
+      }
+    }
+  }, userId);
+  return { changed: true, characterId, owner: DISPLAY_OWNER_NAMESPACE };
+}
 async function processMessageRender(ctx) {
   if (ctx.origin !== "render" || ctx.isUser || !ctx.messageId)
     return;
   pruneExpired();
   const chatId = String(ctx.chatId);
   const messageId = String(ctx.messageId);
-  let id = targetOwners.get(targetKey(chatId, messageId));
-  if (!id) {
-    const pendingId = pendingOwners.get(chatId);
-    const pending = pendingId ? holds.get(pendingId) : null;
-    if (pending && !pending.messageId) {
-      await bindMessageRender(pending.id, messageId);
-      id = pending.id;
-    }
-  }
+  const id = targetOwners.get(targetKey(chatId, messageId));
   if (!id)
     return;
   const hold = holds.get(id);
@@ -1994,6 +2009,8 @@ async function dispatchNativeResource(request, userId) {
         return releaseMessageRender(String(args[0] ?? ""), args[1] ?? {});
       case "status":
         return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
+      case "ensureOwner":
+        return ensureMessageRenderDisplayOwner(String(args[0] ?? ""), userId);
       default:
         throw new Error(`Unsupported message_render operation: ${request.operation}`);
     }

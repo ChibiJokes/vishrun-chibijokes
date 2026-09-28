@@ -5696,6 +5696,211 @@ function setup(ctx) {
       }
     });
   };
+  const DISPLAY_OWNER_IDENTIFIER = "vishrun_chibijokes";
+  const localRenderHolds = new Map;
+  const localRenderTargets = new Map;
+  let displayOwnerReloadRequired = false;
+  const renderTargetKey = (chatId, messageId) => `${chatId}\x00${messageId}`;
+  const invalidateDisplay = () => {
+    try {
+      ctx.display?.invalidate(["*"]);
+    } catch (_) {}
+  };
+  const removeLocalRenderHold = (idValue) => {
+    const id = String(idValue || "");
+    const hold = localRenderHolds.get(id);
+    if (!hold)
+      return null;
+    localRenderHolds.delete(id);
+    if (hold.messageId) {
+      const key = renderTargetKey(hold.chatId, hold.messageId);
+      if (localRenderTargets.get(key) === id)
+        localRenderTargets.delete(key);
+    }
+    return hold;
+  };
+  const setLocalRenderHold = (spec) => {
+    const id = String(spec?.id || "").trim();
+    const chatId = String(spec?.chatId || "").trim();
+    const messageId = spec?.messageId == null ? "" : String(spec.messageId).trim();
+    if (!id)
+      throw new Error("Message render hold id is required.");
+    if (!chatId)
+      throw new Error("Message render chatId is required.");
+    removeLocalRenderHold(id);
+    const hold = {
+      id,
+      chatId,
+      messageId: messageId || null,
+      overrideContent: String(spec?.content ?? "")
+    };
+    localRenderHolds.set(id, hold);
+    if (hold.messageId)
+      localRenderTargets.set(renderTargetKey(chatId, hold.messageId), id);
+    invalidateDisplay();
+    return hold;
+  };
+  const bindLocalRenderHold = (holdIdValue, messageIdValue) => {
+    const holdId = String(holdIdValue || "").trim();
+    const messageId = String(messageIdValue || "").trim();
+    const hold = localRenderHolds.get(holdId);
+    if (!hold)
+      throw new Error("Message render hold is not active.");
+    if (!messageId)
+      throw new Error("Message render messageId is required.");
+    if (hold.messageId) {
+      const oldKey = renderTargetKey(hold.chatId, hold.messageId);
+      if (localRenderTargets.get(oldKey) === hold.id)
+        localRenderTargets.delete(oldKey);
+    }
+    hold.messageId = messageId;
+    localRenderTargets.set(renderTargetKey(hold.chatId, messageId), hold.id);
+    invalidateDisplay();
+    return hold;
+  };
+  const localRenderHoldFor = (chatIdValue, messageIdValue) => {
+    const chatId = String(chatIdValue || "");
+    const messageId = String(messageIdValue || "");
+    if (!chatId || !messageId)
+      return null;
+    const id = localRenderTargets.get(renderTargetKey(chatId, messageId));
+    return id ? localRenderHolds.get(id) ?? null : null;
+  };
+  const postJson = async (url, body) => {
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        detail = String(await response.text()).slice(0, 300);
+      } catch (_) {}
+      throw new Error(`Display resolver request failed: HTTP ${response.status}${detail ? ` · ${detail}` : ""}`);
+    }
+    return await response.json();
+  };
+  const readChatDisplayOwner = async (chatId) => {
+    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}?messages=false`, {
+      credentials: "include",
+      headers: { accept: "application/json" }
+    });
+    if (!response.ok)
+      throw new Error(`Chat display-owner lookup failed: HTTP ${response.status}`);
+    const body = await response.json();
+    return typeof body.character_display_owner === "string" && body.character_display_owner ? body.character_display_owner : null;
+  };
+  const prepareDisplayOwnership = async (options = {}) => {
+    if (!ctx.display)
+      return { ready: false, reason: "display-resolver-unavailable" };
+    const active = ctx.getActiveChat();
+    const chatId = String(options.chatId || active.chatId || "").trim();
+    const characterId = String(options.characterId || active.characterId || "").trim();
+    if (!chatId || !characterId)
+      return { ready: false, reason: "chat-or-character-unavailable" };
+    const currentOwner = await readChatDisplayOwner(chatId);
+    if (currentOwner && currentOwner !== DISPLAY_OWNER_IDENTIFIER) {
+      return { ready: false, conflict: true, owner: currentOwner, chatId, characterId };
+    }
+    if (currentOwner === DISPLAY_OWNER_IDENTIFIER && !displayOwnerReloadRequired) {
+      return { ready: true, owner: currentOwner, chatId, characterId, reloadRequired: false };
+    }
+    const result = await callNativeResource("message_render", "ensureOwner", [characterId]);
+    if (result?.changed === true)
+      displayOwnerReloadRequired = true;
+    const owner = await readChatDisplayOwner(chatId);
+    return {
+      ready: owner === DISPLAY_OWNER_IDENTIFIER && !displayOwnerReloadRequired,
+      owner,
+      chatId,
+      characterId,
+      reloadRequired: displayOwnerReloadRequired,
+      changed: result?.changed === true
+    };
+  };
+  const unregisterDisplayResolver = ctx.display?.registerResolver({
+    ready: (_chatId) => true,
+    finalizeWithoutScripts: true,
+    resolveBody: async ({ content, context }) => {
+      const hold = !context?.isUser ? localRenderHoldFor(context?.chatId, context?.messageId) : null;
+      if (hold) {
+        const raw = String(content ?? "");
+        if (hold.allowedContent !== undefined && raw === hold.allowedContent) {
+          return {
+            content: raw,
+            processingState: `vsh-allow:${hold.id}`,
+            cacheable: false
+          };
+        }
+        return {
+          content: hold.overrideContent,
+          processingState: `vsh-hold:${hold.id}`,
+          cacheable: false
+        };
+      }
+      const chatId = String(context?.chatId || "");
+      if (!chatId)
+        return { content: String(content ?? ""), cacheable: false };
+      const body = await postJson(`/api/v1/chats/${encodeURIComponent(chatId)}/display-preprocess`, {
+        rawContent: String(content ?? ""),
+        ...context?.messageId ? { messageId: String(context.messageId) } : {},
+        ...typeof context?.messageIndex === "number" ? { messageIndex: context.messageIndex } : {},
+        ...context?.role ? { role: String(context.role) } : {}
+      });
+      return {
+        content: typeof body?.content === "string" ? body.content : String(content ?? ""),
+        cacheable: false
+      };
+    },
+    resolveTemplates: async ({ templates, context }) => {
+      const body = await postJson("/api/v1/macros/resolve-batch", {
+        templates: templates && typeof templates === "object" ? templates : {},
+        ...context?.chatId ? { chat_id: String(context.chatId) } : {},
+        ...context?.characterId ? { character_id: String(context.characterId) } : {},
+        ...context?.personaId ? { persona_id: String(context.personaId) } : {}
+      });
+      return {
+        resolved: body?.resolved && typeof body.resolved === "object" ? body.resolved : { ...templates || {} },
+        ...body?.touched_vars && typeof body.touched_vars === "object" ? { touchedVars: body.touched_vars } : {},
+        ...body?.cacheable && typeof body.cacheable === "object" ? { cacheable: body.cacheable } : {}
+      };
+    },
+    applyScripts: async (args) => {
+      const processingState = String(args?.processingState || "");
+      if (processingState.startsWith("vsh-hold:") || processingState.startsWith("vsh-allow:")) {
+        return {
+          content: String(args?.content ?? ""),
+          processingState,
+          cacheable: false
+        };
+      }
+      const context = args?.context || {};
+      const body = await postJson("/api/v1/regex-scripts/apply", {
+        content: String(args?.content ?? ""),
+        scripts: Array.isArray(args?.scripts) ? args.scripts : [],
+        resolved_find_patterns: args?.resolvedFindPatterns || undefined,
+        resolved_replacements: args?.resolvedReplacements || undefined,
+        dynamic_macros: context?.dynamicMacros || undefined,
+        context: {
+          chat_id: context?.chatId,
+          character_id: context?.characterId,
+          persona_id: context?.personaId,
+          is_user: context?.isUser === true,
+          depth: Number(context?.depth || 0),
+          ...context?.messageId ? { message_id: String(context.messageId) } : {},
+          ...typeof context?.messageIndex === "number" ? { message_index: context.messageIndex } : {},
+          ...context?.role ? { role: String(context.role) } : {}
+        }
+      });
+      return {
+        content: typeof body?.result === "string" ? body.result : String(args?.content ?? ""),
+        ...Array.isArray(body?.touched_vars) ? { touchedVars: body.touched_vars } : {},
+        ...typeof body?.cacheable === "boolean" ? { cacheable: body.cacheable } : {}
+      };
+    }
+  }) ?? null;
   const personaBridge = Object.freeze({
     list: (options = {}) => callNativeResource("personas", "list", [options]),
     get: (personaId) => callNativeResource("personas", "get", [personaId]),
@@ -5743,17 +5948,50 @@ function setup(ctx) {
     }
   });
   const messageRenderBridge = Object.freeze({
-    hold(spec) {
-      return callNativeResource("message_render", "hold", [spec]);
+    prepare(options = {}) {
+      return prepareDisplayOwnership(options);
     },
-    bind(holdId, messageId) {
-      return callNativeResource("message_render", "bind", [holdId, messageId]);
+    async hold(spec) {
+      const local = setLocalRenderHold(spec);
+      try {
+        return await callNativeResource("message_render", "hold", [spec]);
+      } catch (error) {
+        removeLocalRenderHold(local.id);
+        invalidateDisplay();
+        throw error;
+      }
     },
-    allow(holdId, content) {
-      return callNativeResource("message_render", "allow", [holdId, content]);
+    async bind(holdId, messageId) {
+      bindLocalRenderHold(holdId, messageId);
+      try {
+        return await callNativeResource("message_render", "bind", [holdId, messageId]);
+      } catch (error) {
+        removeLocalRenderHold(holdId);
+        invalidateDisplay();
+        throw error;
+      }
     },
-    release(holdId, options = {}) {
-      return callNativeResource("message_render", "release", [holdId, options]);
+    async allow(holdId, content) {
+      const hold = localRenderHolds.get(String(holdId || ""));
+      if (hold) {
+        hold.allowedContent = String(content ?? "");
+        invalidateDisplay();
+      }
+      try {
+        return await callNativeResource("message_render", "allow", [holdId, content]);
+      } catch (error) {
+        if (hold) {
+          delete hold.allowedContent;
+          invalidateDisplay();
+        }
+        throw error;
+      }
+    },
+    async release(holdId, options = {}) {
+      const result = await callNativeResource("message_render", "release", [holdId, options]);
+      removeLocalRenderHold(holdId);
+      invalidateDisplay();
+      return result;
     },
     status(holdId) {
       return callNativeResource("message_render", "status", holdId ? [holdId] : []);
@@ -6253,6 +6491,11 @@ function setup(ctx) {
       pending.reject(new Error("Vishrun disposed"));
     }
     pendingNativeResources.clear();
+    try {
+      unregisterDisplayResolver?.();
+    } catch (_) {}
+    localRenderHolds.clear();
+    localRenderTargets.clear();
     unsubBackendMsg();
     delete window.__vishrunPersonas;
     delete window.__vishrunWorldBooks;
