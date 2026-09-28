@@ -5729,6 +5729,18 @@ function setup(ctx) {
   });
   window.__vishrunPersonas = personaBridge;
   window.__vishrunWorldBooks = worldBooksBridge;
+  const hostEventBridge = Object.freeze({
+    on(eventName, handler) {
+      if (typeof eventName !== "string" || !eventName.trim()) {
+        throw new TypeError("Vishrun event name must be a non-empty string");
+      }
+      if (typeof handler !== "function") {
+        throw new TypeError("Vishrun event handler must be a function");
+      }
+      return ctx.events.on(eventName, handler);
+    }
+  });
+  window.__vishrunEvents = hostEventBridge;
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: "vsh_pre_generation_subscription",
@@ -6215,6 +6227,7 @@ function setup(ctx) {
     unsubBackendMsg();
     delete window.__vishrunPersonas;
     delete window.__vishrunWorldBooks;
+    delete window.__vishrunEvents;
     delete window.__vishrunRegisterPreGeneration;
     delete window.__vishrunRegisterUserMessageProcessor;
     delete window.__vishrunGenerate;
