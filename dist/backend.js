@@ -1780,12 +1780,165 @@ function installUserMessageBridgeHandler() {
   api.registerContextHandler(async (rawContext) => processGenerationContext(rawContext), 40, { timeoutMs: HOST_TIMEOUT_MS });
 }
 
+// src/backend/response-interceptor-bridge.ts
+var CURTAIN_TTL_MS = 5 * 60 * 1000;
+var curtains = new Map;
+var targetOwners = new Map;
+function targetKey(chatId, messageId) {
+  return `${chatId}\x00${messageId}`;
+}
+function sanitizeSpec(spec) {
+  const generationId = String(spec?.generationId || "").trim();
+  const chatId = String(spec?.chatId || "").trim();
+  const messageId = String(spec?.messageId || "").trim();
+  const swipeId = Number.isFinite(Number(spec?.swipeId)) ? Math.max(0, Math.trunc(Number(spec.swipeId))) : 0;
+  if (!generationId)
+    throw new Error("Response Interceptor generationId is required.");
+  if (!chatId)
+    throw new Error("Response Interceptor chatId is required.");
+  if (!messageId)
+    throw new Error("Response Interceptor messageId is required.");
+  return { generationId, chatId, messageId, swipeId };
+}
+function clearCurtain(generationId) {
+  const state = curtains.get(generationId) ?? null;
+  if (!state)
+    return null;
+  curtains.delete(generationId);
+  const key = targetKey(state.chatId, state.messageId);
+  if (targetOwners.get(key) === generationId)
+    targetOwners.delete(key);
+  return state;
+}
+function pruneExpired() {
+  const now = Date.now();
+  for (const [generationId, state] of curtains) {
+    if (state.expiresAt <= now)
+      clearCurtain(generationId);
+  }
+}
+async function getMessage(chatId, messageId) {
+  const rows = await api.chat.getMessages(chatId);
+  return Array.isArray(rows) ? rows.find((row) => String(row?.id) === messageId) ?? null : null;
+}
+async function armResponseCurtain(spec) {
+  pruneExpired();
+  const safe = sanitizeSpec(spec);
+  for (const [generationId, state] of curtains) {
+    if (state.chatId === safe.chatId && generationId !== safe.generationId)
+      clearCurtain(generationId);
+  }
+  const key = targetKey(safe.chatId, safe.messageId);
+  const previousOwner = targetOwners.get(key);
+  if (previousOwner && previousOwner !== safe.generationId)
+    clearCurtain(previousOwner);
+  const state = {
+    generationId: safe.generationId,
+    chatId: safe.chatId,
+    messageId: safe.messageId,
+    swipeId: safe.swipeId ?? 0,
+    mode: "holding",
+    armedAt: Date.now(),
+    expiresAt: Date.now() + CURTAIN_TTL_MS
+  };
+  curtains.set(state.generationId, state);
+  targetOwners.set(key, state.generationId);
+  return { armed: true, ...state };
+}
+async function commitResponseCurtain(spec) {
+  pruneExpired();
+  const safe = sanitizeSpec(spec);
+  const replacement = String(spec?.content ?? "");
+  const state = curtains.get(safe.generationId);
+  if (!state)
+    throw new Error("Response Interceptor curtain is no longer armed for this generation.");
+  if (state.chatId !== safe.chatId || state.messageId !== safe.messageId) {
+    throw new Error("Response Interceptor target changed before commit.");
+  }
+  const message = await getMessage(safe.chatId, safe.messageId);
+  if (!message)
+    throw new Error("Lumiverse target message no longer exists.");
+  const swipes = Array.isArray(message.swipes) ? message.swipes.map((value) => String(value ?? "")) : [String(message.content ?? "")];
+  const targetSwipe = safe.swipeId ?? state.swipeId;
+  if (targetSwipe < 0 || targetSwipe >= swipes.length) {
+    throw new Error(`Lumiverse target swipe ${targetSwipe} no longer exists.`);
+  }
+  const activeSwipe = Number.isFinite(Number(message.swipe_id)) ? Math.trunc(Number(message.swipe_id)) : 0;
+  swipes[targetSwipe] = replacement;
+  state.mode = "committing";
+  state.swipeId = targetSwipe;
+  state.allowedContent = targetSwipe === activeSwipe ? replacement : String(message.content ?? swipes[activeSwipe] ?? "");
+  state.expiresAt = Date.now() + CURTAIN_TTL_MS;
+  await api.chat.updateMessage(safe.chatId, safe.messageId, {
+    swipes,
+    swipe_id: activeSwipe
+  });
+  const updated = await getMessage(safe.chatId, safe.messageId);
+  if (!updated)
+    throw new Error("Lumiverse target disappeared after the Interceptor commit.");
+  state.allowedContent = String(updated.content ?? "");
+  return {
+    committed: true,
+    generationId: safe.generationId,
+    chatId: safe.chatId,
+    messageId: safe.messageId,
+    swipeId: targetSwipe,
+    activeSwipeId: Number(updated.swipe_id ?? activeSwipe),
+    content: String(updated.content ?? ""),
+    targetContent: Array.isArray(updated.swipes) ? String(updated.swipes[targetSwipe] ?? "") : replacement,
+    swipes: Array.isArray(updated.swipes) ? updated.swipes : undefined
+  };
+}
+async function releaseResponseCurtain(generationId, options = {}) {
+  pruneExpired();
+  const id = String(generationId || "").trim();
+  if (!id)
+    return { released: false };
+  const state = clearCurtain(id);
+  if (!state)
+    return { released: false };
+  if (options.refresh) {
+    const message = await getMessage(state.chatId, state.messageId);
+    if (message) {
+      await api.chat.updateMessage(state.chatId, state.messageId, {
+        content: String(message.content ?? "")
+      });
+    }
+  }
+  return { released: true, generationId: id, chatId: state.chatId, messageId: state.messageId };
+}
+function responseCurtainStatus(generationId) {
+  pruneExpired();
+  if (generationId)
+    return curtains.get(String(generationId)) ?? null;
+  return Array.from(curtains.values()).map((state) => ({ ...state }));
+}
+async function processResponseCurtain(ctx) {
+  if (ctx.origin !== "render" || ctx.isUser || !ctx.messageId)
+    return;
+  pruneExpired();
+  const generationId = targetOwners.get(targetKey(String(ctx.chatId), String(ctx.messageId)));
+  if (!generationId)
+    return;
+  const state = curtains.get(generationId);
+  if (!state)
+    return;
+  const content = String(ctx.content ?? "");
+  if (state.mode === "committing" && state.allowedContent !== undefined && content === state.allowedContent) {
+    return;
+  }
+  return { content: "\u2063" };
+}
+function installResponseInterceptorBridge() {
+  api.registerMessageContentProcessor((ctx) => processResponseCurtain(ctx), 5);
+}
+
 // src/backend/index.ts
 function isNativeResourceRequest(payload) {
   if (!payload || typeof payload !== "object")
     return false;
   const value = payload;
-  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
+  return value.type === "vsh_native_resource" && typeof value.requestId === "string" && (value.resource === "personas" || value.resource === "world_books" || value.resource === "chat" || value.resource === "response_interceptor") && typeof value.operation === "string" && (value.args === undefined || Array.isArray(value.args));
 }
 async function dispatchNativeResource(request, userId) {
   const args = Array.isArray(request.args) ? request.args : [];
@@ -1811,6 +1964,30 @@ async function dispatchNativeResource(request, userId) {
         return api.personas.getWorldBook(String(args[0] ?? ""), userId);
       default:
         throw new Error(`Unsupported personas operation: ${request.operation}`);
+    }
+  }
+  if (request.resource === "chat") {
+    switch (request.operation) {
+      case "getMessages":
+        return api.chat.getMessages(String(args[0] ?? ""));
+      case "updateMessage":
+        return api.chat.updateMessage(String(args[0] ?? ""), String(args[1] ?? ""), args[2] ?? {});
+      default:
+        throw new Error(`Unsupported chat operation: ${request.operation}`);
+    }
+  }
+  if (request.resource === "response_interceptor") {
+    switch (request.operation) {
+      case "arm":
+        return armResponseCurtain(args[0] ?? {});
+      case "commit":
+        return commitResponseCurtain(args[0] ?? {});
+      case "release":
+        return releaseResponseCurtain(String(args[0] ?? ""), args[1] ?? {});
+      case "status":
+        return responseCurtainStatus(args[0] == null ? undefined : String(args[0]));
+      default:
+        throw new Error(`Unsupported response_interceptor operation: ${request.operation}`);
     }
   }
   switch (request.operation) {
@@ -1871,6 +2048,7 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
+installResponseInterceptorBridge();
 installNativeResourceBridge();
 function setup() {}
 export {
