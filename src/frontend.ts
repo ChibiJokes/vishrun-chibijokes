@@ -65,7 +65,7 @@ type UserMessageProcessHandler = (
   request: UserMessageProcessRequest,
 ) => void | string | UserMessageProcessResult | Promise<void | string | UserMessageProcessResult>;
 
-type NativeResourceName = 'personas' | 'world_books';
+type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'response_interceptor';
 
 type PendingNativeResource = {
   resolve: (value: unknown) => void;
@@ -166,11 +166,18 @@ export function setup(ctx: SpindleFrontendContext) {
     entries: worldBookEntriesBridge,
   });
 
+  const chatBridge = Object.freeze({
+    getMessages: (chatId: string) => callNativeResource('chat', 'getMessages', [chatId]),
+    updateMessage: (chatId: string, messageId: string, patch: Record<string, unknown>) =>
+      callNativeResource('chat', 'updateMessage', [chatId, messageId, patch]),
+  });
+
   // Host-document bridge for Quill/Intro. These consumers already keep their
   // Lumiverse path on window.parent, so they can use the native Spindle APIs
   // without raw /api/v1/personas or /api/v1/world-books mutations.
   (window as any).__vishrunPersonas = personaBridge;
   (window as any).__vishrunWorldBooks = worldBooksBridge;
+  (window as any).__vishrunChat = chatBridge;
 
   // Host-window lifecycle bridge for character-card/JSLR scripts whose global
   // engines intentionally live on window.parent (Quill is one of them). The
@@ -189,6 +196,93 @@ export function setup(ctx: SpindleFrontendContext) {
     },
   });
   (window as any).__vishrunEvents = hostEventBridge;
+
+  // Quill post-generation response curtain. Lumiverse stages a real assistant
+  // message id before GENERATION_STARTED, so Quill can hide exactly that row while
+  // Council/Workshop processes the completed output, then atomically commit the
+  // canonical swipe through the backend Spindle chat API.
+  type ResponseCurtainTarget = {
+    generationId: string;
+    chatId: string;
+    messageId: string;
+    swipeId: number;
+  };
+  const responseCurtainTargets = new Map<string, ResponseCurtainTarget>();
+  const responseCurtainStyleCleanup = ctx.dom.addStyle(`
+    [data-vishrun-quill-response-curtain="true"] {
+      visibility: hidden !important;
+    }
+  `);
+  const markResponseCurtainDom = () => {
+    if (responseCurtainTargets.size === 0) return;
+    const ids = new Set(Array.from(responseCurtainTargets.values()).map((target) => target.messageId));
+    document.querySelectorAll<HTMLElement>('[data-message-id]').forEach((element) => {
+      if (ids.has(String(element.dataset.messageId || ''))) {
+        element.setAttribute('data-vishrun-quill-response-curtain', 'true');
+      }
+    });
+  };
+  const clearResponseCurtainDom = (messageId?: string) => {
+    document.querySelectorAll<HTMLElement>('[data-vishrun-quill-response-curtain="true"]').forEach((element) => {
+      if (!messageId || String(element.dataset.messageId || '') === String(messageId)) {
+        element.removeAttribute('data-vishrun-quill-response-curtain');
+      }
+    });
+  };
+  const responseCurtainObserver = new MutationObserver(() => markResponseCurtainDom());
+  if (document.body) responseCurtainObserver.observe(document.body, { childList: true, subtree: true });
+
+  const responseInterceptorBridge = Object.freeze({
+    async arm(spec: Record<string, unknown>) {
+      const generationId = String(spec?.generationId || '');
+      const chatId = String(spec?.chatId || '');
+      const messageId = String(spec?.messageId || '');
+      const swipeId = Number.isFinite(Number(spec?.swipeId)) ? Math.max(0, Math.trunc(Number(spec?.swipeId))) : 0;
+      if (!generationId || !chatId || !messageId) throw new Error('Lumiverse Response Interceptor target is incomplete.');
+      const target = { generationId, chatId, messageId, swipeId };
+      responseCurtainTargets.set(generationId, target);
+      markResponseCurtainDom();
+      try {
+        return await callNativeResource('response_interceptor', 'arm', [target]);
+      } catch (error) {
+        responseCurtainTargets.delete(generationId);
+        clearResponseCurtainDom(messageId);
+        throw error;
+      }
+    },
+    async commit(spec: Record<string, unknown>) {
+      const generationId = String(spec?.generationId || '');
+      const target = responseCurtainTargets.get(generationId);
+      if (!target) throw new Error('Lumiverse Response Interceptor curtain is not armed.');
+      const result = await callNativeResource('response_interceptor', 'commit', [{
+        ...target,
+        content: String(spec?.content ?? ''),
+      }]);
+      // Let MESSAGE_EDITED/SWIPE_EDITED land while the backend render curtain
+      // permits only the committed canonical content, then reveal the same row.
+      await new Promise<void>((resolve) => requestAnimationFrame(() => requestAnimationFrame(() => resolve())));
+      responseCurtainTargets.delete(generationId);
+      clearResponseCurtainDom(target.messageId);
+      void callNativeResource('response_interceptor', 'release', [generationId, { refresh: false }]).catch(() => {});
+      return result;
+    },
+    async release(generationIdValue: unknown, options: Record<string, unknown> = {}) {
+      const generationId = String(generationIdValue || '');
+      const target = responseCurtainTargets.get(generationId);
+      try {
+        return await callNativeResource('response_interceptor', 'release', [generationId, {
+          refresh: options.refresh !== false,
+        }]);
+      } finally {
+        responseCurtainTargets.delete(generationId);
+        clearResponseCurtainDom(target?.messageId);
+      }
+    },
+    status(generationId?: string) {
+      return callNativeResource('response_interceptor', 'status', generationId ? [generationId] : []);
+    },
+  });
+  (window as any).__vishrunResponseInterceptor = responseInterceptorBridge;
 
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
@@ -748,7 +842,13 @@ export function setup(ctx: SpindleFrontendContext) {
     unsubBackendMsg();
     delete (window as any).__vishrunPersonas;
     delete (window as any).__vishrunWorldBooks;
+    delete (window as any).__vishrunChat;
     delete (window as any).__vishrunEvents;
+    delete (window as any).__vishrunResponseInterceptor;
+    responseCurtainTargets.clear();
+    responseCurtainObserver.disconnect();
+    clearResponseCurtainDom();
+    responseCurtainStyleCleanup();
     delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunRegisterUserMessageProcessor;
     delete (window as any).__vishrunGenerate;
