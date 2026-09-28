@@ -4,7 +4,7 @@ import { api } from './common';
 interface MessageRenderHold {
   id: string;
   chatId: string;
-  messageId: string;
+  messageId: string | null;
   overrideContent: string;
   allowedContent?: string;
   expiresAt: number;
@@ -13,13 +13,14 @@ interface MessageRenderHold {
 export interface MessageRenderHoldSpec {
   id: string;
   chatId: string;
-  messageId: string;
+  messageId?: string;
   content: string;
 }
 
 const HOLD_TTL_MS = 5 * 60 * 1000;
 const holds = new Map<string, MessageRenderHold>();
 const targetOwners = new Map<string, string>();
+const pendingOwners = new Map<string, string>();
 
 function targetKey(chatId: string, messageId: string): string {
   return `${chatId}\u0000${messageId}`;
@@ -28,19 +29,21 @@ function targetKey(chatId: string, messageId: string): string {
 function normalizeHold(spec: MessageRenderHoldSpec): MessageRenderHoldSpec {
   const id = String(spec?.id || '').trim();
   const chatId = String(spec?.chatId || '').trim();
-  const messageId = String(spec?.messageId || '').trim();
+  const messageId = spec?.messageId == null ? '' : String(spec.messageId).trim();
   if (!id) throw new Error('Message render hold id is required.');
   if (!chatId) throw new Error('Message render chatId is required.');
-  if (!messageId) throw new Error('Message render messageId is required.');
-  return { id, chatId, messageId, content: String(spec?.content ?? '') };
+  return { id, chatId, ...(messageId ? { messageId } : {}), content: String(spec?.content ?? '') };
 }
 
 function removeHold(id: string): MessageRenderHold | null {
   const hold = holds.get(id) ?? null;
   if (!hold) return null;
   holds.delete(id);
-  const key = targetKey(hold.chatId, hold.messageId);
-  if (targetOwners.get(key) === id) targetOwners.delete(key);
+  if (hold.messageId) {
+    const key = targetKey(hold.chatId, hold.messageId);
+    if (targetOwners.get(key) === id) targetOwners.delete(key);
+  }
+  if (pendingOwners.get(hold.chatId) === id) pendingOwners.delete(hold.chatId);
   return hold;
 }
 
@@ -61,20 +64,53 @@ async function getMessage(chatId: string, messageId: string): Promise<any | null
 export async function holdMessageRender(spec: MessageRenderHoldSpec): Promise<Record<string, unknown>> {
   pruneExpired();
   const safe = normalizeHold(spec);
-  const key = targetKey(safe.chatId, safe.messageId);
-  const previous = targetOwners.get(key);
-  if (previous && previous !== safe.id) removeHold(previous);
+  removeHold(safe.id);
 
   const hold: MessageRenderHold = {
     id: safe.id,
     chatId: safe.chatId,
-    messageId: safe.messageId,
+    messageId: safe.messageId || null,
     overrideContent: safe.content,
     expiresAt: Date.now() + HOLD_TTL_MS,
   };
   holds.set(hold.id, hold);
-  targetOwners.set(key, hold.id);
-  return { held: true, id: hold.id, chatId: hold.chatId, messageId: hold.messageId };
+
+  if (hold.messageId) {
+    const key = targetKey(hold.chatId, hold.messageId);
+    const previous = targetOwners.get(key);
+    if (previous && previous !== hold.id) removeHold(previous);
+    targetOwners.set(key, hold.id);
+  } else {
+    const previous = pendingOwners.get(hold.chatId);
+    if (previous && previous !== hold.id) removeHold(previous);
+    pendingOwners.set(hold.chatId, hold.id);
+  }
+
+  return { held: true, pending: !hold.messageId, id: hold.id, chatId: hold.chatId, messageId: hold.messageId };
+}
+
+export async function bindMessageRender(idValue: string, messageIdValue: string): Promise<Record<string, unknown>> {
+  pruneExpired();
+  const id = String(idValue || '').trim();
+  const messageId = String(messageIdValue || '').trim();
+  if (!id) throw new Error('Message render hold id is required.');
+  if (!messageId) throw new Error('Message render messageId is required.');
+  const hold = holds.get(id);
+  if (!hold) throw new Error('Message render hold is not active.');
+
+  if (hold.messageId) {
+    const previousKey = targetKey(hold.chatId, hold.messageId);
+    if (targetOwners.get(previousKey) === id) targetOwners.delete(previousKey);
+  }
+  if (pendingOwners.get(hold.chatId) === id) pendingOwners.delete(hold.chatId);
+
+  const key = targetKey(hold.chatId, messageId);
+  const previous = targetOwners.get(key);
+  if (previous && previous !== id) removeHold(previous);
+  hold.messageId = messageId;
+  hold.expiresAt = Date.now() + HOLD_TTL_MS;
+  targetOwners.set(key, id);
+  return { bound: true, id, chatId: hold.chatId, messageId };
 }
 
 export async function allowMessageRender(idValue: string, content: string): Promise<Record<string, unknown>> {
@@ -97,7 +133,7 @@ export async function releaseMessageRender(
   const hold = removeHold(id);
   if (!hold) return { released: false };
 
-  if (options.refresh) {
+  if (options.refresh && hold.messageId) {
     const message = await getMessage(hold.chatId, hold.messageId);
     if (message) {
       await api.chat.updateMessage(hold.chatId, hold.messageId, {
@@ -120,7 +156,17 @@ async function processMessageRender(
 ): Promise<MessageContentProcessorResultDTO | void> {
   if (ctx.origin !== 'render' || ctx.isUser || !ctx.messageId) return;
   pruneExpired();
-  const id = targetOwners.get(targetKey(String(ctx.chatId), String(ctx.messageId)));
+  const chatId = String(ctx.chatId);
+  const messageId = String(ctx.messageId);
+  let id = targetOwners.get(targetKey(chatId, messageId));
+  if (!id) {
+    const pendingId = pendingOwners.get(chatId);
+    const pending = pendingId ? holds.get(pendingId) : null;
+    if (pending && !pending.messageId) {
+      await bindMessageRender(pending.id, messageId);
+      id = pending.id;
+    }
+  }
   if (!id) return;
   const hold = holds.get(id);
   if (!hold) return;

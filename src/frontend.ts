@@ -65,7 +65,7 @@ type UserMessageProcessHandler = (
   request: UserMessageProcessRequest,
 ) => void | string | UserMessageProcessResult | Promise<void | string | UserMessageProcessResult>;
 
-type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'message_render';
+type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'message_render' | 'tokens';
 
 type PendingNativeResource = {
   resolve: (value: unknown) => void;
@@ -188,6 +188,9 @@ export function setup(ctx: SpindleFrontendContext) {
     hold(spec: Record<string, unknown>) {
       return callNativeResource('message_render', 'hold', [spec]);
     },
+    bind(holdId: string, messageId: string) {
+      return callNativeResource('message_render', 'bind', [holdId, messageId]);
+    },
     allow(holdId: string, content: string) {
       return callNativeResource('message_render', 'allow', [holdId, content]);
     },
@@ -199,11 +202,18 @@ export function setup(ctx: SpindleFrontendContext) {
     },
   });
 
+  const tokensBridge = Object.freeze({
+    countText(text: string, options: Record<string, unknown> = {}) {
+      return callNativeResource('tokens', 'countText', [text, options]);
+    },
+  });
+
   (window as any).__vishrunPersonas = personaBridge;
   (window as any).__vishrunWorldBooks = worldBooksBridge;
   (window as any).__vishrunChat = chatBridge;
   (window as any).__vishrunEvents = eventBridge;
   (window as any).__vishrunMessageRender = messageRenderBridge;
+  (window as any).__vishrunTokens = tokensBridge;
 
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
@@ -766,6 +776,7 @@ export function setup(ctx: SpindleFrontendContext) {
     delete (window as any).__vishrunChat;
     delete (window as any).__vishrunEvents;
     delete (window as any).__vishrunMessageRender;
+    delete (window as any).__vishrunTokens;
     delete (window as any).__vishrunRegisterPreGeneration;
     delete (window as any).__vishrunRegisterUserMessageProcessor;
     delete (window as any).__vishrunGenerate;
