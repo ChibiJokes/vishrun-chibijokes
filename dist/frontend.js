@@ -2353,24 +2353,56 @@ function externalImageProxyHelper() {
     }
   } catch (e) {}
 
+  var LOADING_KEY = 'data-vishrun-extimg-loading';
+  var RETRY_KEY = 'data-vishrun-extimg-retries';
+  var MAX_IMAGE_RETRIES = 4;
+
   function setBlobSrc(img, blobUrl) {
-    // Bypass the patched setter via the native descriptor — assigning
-    // \`img.src = blobUrl\` would route through our wrapper again. Using
-    // setAttribute avoids the IDL setter entirely.
+    // Keep the original URL until a valid blob URL exists. A transient
+    // corsProxy failure must not strand the image without a recoverable src.
+    // Only successful proxy resolution is allowed to consume KEY.
     img.removeAttribute(KEY);
+    img.removeAttribute(RETRY_KEY);
     img.setAttribute('src', blobUrl);
+  }
+
+  function scheduleImgRetry(img, url, reason) {
+    if (!img || !url) return;
+    var attempts = parseInt(img.getAttribute(RETRY_KEY) || '0', 10);
+    if (!isFinite(attempts) || attempts < 0) attempts = 0;
+    if (attempts >= MAX_IMAGE_RETRIES) {
+      console.warn('[vishrun] external image retry limit reached for', url, reason || '');
+      return;
+    }
+    attempts += 1;
+    img.setAttribute(RETRY_KEY, String(attempts));
+    // Small backoff: 250ms, 500ms, 750ms, 1000ms. KEY remains on the
+    // element the entire time, so any later scan can recover the image too.
+    setTimeout(function() {
+      if (!img.isConnected) return;
+      if (!img.getAttribute(KEY)) img.setAttribute(KEY, url);
+      processImg(img);
+    }, 250 * attempts);
+  }
+
+  function failImg(img, url, reason, err) {
+    img.removeAttribute(LOADING_KEY);
+    if (err !== undefined) console.warn(reason, url, err);
+    else console.warn(reason, url);
+    scheduleImgRetry(img, url, reason);
   }
 
   function processImg(img) {
     var url = img.getAttribute(KEY);
     if (!url) return;
+    // KEY intentionally stays present while loading. Guard explicitly so
+    // MutationObserver/subtree scans cannot start duplicate requests.
+    if (img.hasAttribute(LOADING_KEY)) return;
     if (!window.spindleSandbox || typeof window.spindleSandbox.corsProxy !== 'function') {
-      console.warn('[vishrun] corsProxy unavailable, leaving image unfetched:', url);
+      failImg(img, url, '[vishrun] corsProxy unavailable, retrying image:');
       return;
     }
-    // Mark in-flight so a MutationObserver re-fire doesn't double-fetch.
-    img.removeAttribute(KEY);
-    img.setAttribute('data-vishrun-extimg-loading', '1');
+    img.setAttribute(LOADING_KEY, '1');
     window.spindleSandbox.corsProxy(url, { responseType: 'arraybuffer' }).then(
       function(res) {
         try {
@@ -2378,7 +2410,7 @@ function externalImageProxyHelper() {
           // the host side. Treat the body as bytes; constructing a
           // Blob from a Uint8Array preserves binary fidelity.
           if (!res || !res.body) {
-            console.warn('[vishrun] corsProxy returned no body for', url);
+            failImg(img, url, '[vishrun] corsProxy returned no body for');
             return;
           }
           var ct = '';
@@ -2389,15 +2421,13 @@ function externalImageProxyHelper() {
           var blob = new Blob([res.body], { type: ct });
           var blobUrl = URL.createObjectURL(blob);
           setBlobSrc(img, blobUrl);
+          img.removeAttribute(LOADING_KEY);
         } catch (e) {
-          console.warn('[vishrun] corsProxy decode failed for', url, e);
-        } finally {
-          img.removeAttribute('data-vishrun-extimg-loading');
+          failImg(img, url, '[vishrun] corsProxy decode failed for', e);
         }
       },
       function(err) {
-        img.removeAttribute('data-vishrun-extimg-loading');
-        console.warn('[vishrun] corsProxy fetch failed for', url, err);
+        failImg(img, url, '[vishrun] corsProxy fetch failed for', err);
       }
     );
   }
@@ -3642,9 +3672,17 @@ function frontendCodeBlockHost(pre) {
   }
   return pre;
 }
+function restoreJslrSourceHosts(target) {
+  for (const host of Array.from(target.querySelectorAll('[data-vishrun-jslr-source-host="true"]'))) {
+    host.style.display = "";
+    host.removeAttribute("data-vishrun-jslr-source-host");
+  }
+}
 async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
   const target = findContentRoot(root);
+  restoreJslrSourceHosts(target);
   const pres = Array.from(target.querySelectorAll("pre"));
+  const liveOrdinals = new Set;
   let frontendOrdinal = 0;
   let rendered = 0;
   for (const pre of pres) {
@@ -3655,10 +3693,22 @@ async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
     if (!isJslrFrontendSource(source))
       continue;
     const ordinal = frontendOrdinal++;
+    const ordinalKey = String(ordinal);
+    const sourceHash = frontendSourceHash(source);
     const host = frontendCodeBlockHost(pre);
     if (!host.isConnected || !host.parentNode)
       continue;
-    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    liveOrdinals.add(ordinalKey);
+    host.setAttribute("data-vishrun-jslr-source-host", "true");
+    host.style.display = "none";
+    const existing = target.querySelector(`iframe[data-vishrun-jslr-frontend="true"][data-vishrun-jslr-ordinal="${ordinalKey}"]`);
+    if (existing?.getAttribute("data-vishrun-jslr-source-hash") === sourceHash) {
+      continue;
+    }
+    if (existing) {
+      destroyWidgetIframe(existing, "jslr-codeblock-source-changed");
+    }
+    const scriptId = `jslr-frontend-${ordinal}-${sourceHash}`;
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe;
     try {
@@ -3667,12 +3717,21 @@ async function renderJslrFrontendCodeBlocks(root, messageId, ctx) {
       console.debug(`[vishrun] failed to render ${scriptName}:`, err);
       continue;
     }
+    iframe.setAttribute("data-vishrun-jslr-frontend", "true");
+    iframe.setAttribute("data-vishrun-jslr-ordinal", ordinalKey);
+    iframe.setAttribute("data-vishrun-jslr-source-hash", sourceHash);
     if (!host.isConnected || !host.parentNode) {
       destroyWidgetIframe(iframe, "jslr-codeblock-stale-host");
       continue;
     }
-    host.replaceWith(iframe);
+    host.insertAdjacentElement("afterend", iframe);
     rendered++;
+  }
+  for (const iframe of Array.from(target.querySelectorAll('iframe[data-vishrun-jslr-frontend="true"]'))) {
+    const ordinal = iframe.getAttribute("data-vishrun-jslr-ordinal") ?? "";
+    if (!liveOrdinals.has(ordinal)) {
+      destroyWidgetIframe(iframe, "jslr-codeblock-no-longer-active");
+    }
   }
   return rendered;
 }
@@ -5637,6 +5696,211 @@ function setup(ctx) {
       }
     });
   };
+  const DISPLAY_OWNER_IDENTIFIER = "vishrun_chibijokes";
+  const localRenderHolds = new Map;
+  const localRenderTargets = new Map;
+  let displayOwnerReloadRequired = false;
+  const renderTargetKey = (chatId, messageId) => `${chatId}\x00${messageId}`;
+  const invalidateDisplay = () => {
+    try {
+      ctx.display?.invalidate(["*"]);
+    } catch (_) {}
+  };
+  const removeLocalRenderHold = (idValue) => {
+    const id = String(idValue || "");
+    const hold = localRenderHolds.get(id);
+    if (!hold)
+      return null;
+    localRenderHolds.delete(id);
+    if (hold.messageId) {
+      const key = renderTargetKey(hold.chatId, hold.messageId);
+      if (localRenderTargets.get(key) === id)
+        localRenderTargets.delete(key);
+    }
+    return hold;
+  };
+  const setLocalRenderHold = (spec) => {
+    const id = String(spec?.id || "").trim();
+    const chatId = String(spec?.chatId || "").trim();
+    const messageId = spec?.messageId == null ? "" : String(spec.messageId).trim();
+    if (!id)
+      throw new Error("Message render hold id is required.");
+    if (!chatId)
+      throw new Error("Message render chatId is required.");
+    removeLocalRenderHold(id);
+    const hold = {
+      id,
+      chatId,
+      messageId: messageId || null,
+      overrideContent: String(spec?.content ?? "")
+    };
+    localRenderHolds.set(id, hold);
+    if (hold.messageId)
+      localRenderTargets.set(renderTargetKey(chatId, hold.messageId), id);
+    invalidateDisplay();
+    return hold;
+  };
+  const bindLocalRenderHold = (holdIdValue, messageIdValue) => {
+    const holdId = String(holdIdValue || "").trim();
+    const messageId = String(messageIdValue || "").trim();
+    const hold = localRenderHolds.get(holdId);
+    if (!hold)
+      throw new Error("Message render hold is not active.");
+    if (!messageId)
+      throw new Error("Message render messageId is required.");
+    if (hold.messageId) {
+      const oldKey = renderTargetKey(hold.chatId, hold.messageId);
+      if (localRenderTargets.get(oldKey) === hold.id)
+        localRenderTargets.delete(oldKey);
+    }
+    hold.messageId = messageId;
+    localRenderTargets.set(renderTargetKey(hold.chatId, messageId), hold.id);
+    invalidateDisplay();
+    return hold;
+  };
+  const localRenderHoldFor = (chatIdValue, messageIdValue) => {
+    const chatId = String(chatIdValue || "");
+    const messageId = String(messageIdValue || "");
+    if (!chatId || !messageId)
+      return null;
+    const id = localRenderTargets.get(renderTargetKey(chatId, messageId));
+    return id ? localRenderHolds.get(id) ?? null : null;
+  };
+  const postJson = async (url, body) => {
+    const response = await fetch(url, {
+      method: "POST",
+      credentials: "include",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify(body)
+    });
+    if (!response.ok) {
+      let detail = "";
+      try {
+        detail = String(await response.text()).slice(0, 300);
+      } catch (_) {}
+      throw new Error(`Display resolver request failed: HTTP ${response.status}${detail ? ` · ${detail}` : ""}`);
+    }
+    return await response.json();
+  };
+  const readChatDisplayOwner = async (chatId) => {
+    const response = await fetch(`/api/v1/chats/${encodeURIComponent(chatId)}?messages=false`, {
+      credentials: "include",
+      headers: { accept: "application/json" }
+    });
+    if (!response.ok)
+      throw new Error(`Chat display-owner lookup failed: HTTP ${response.status}`);
+    const body = await response.json();
+    return typeof body.character_display_owner === "string" && body.character_display_owner ? body.character_display_owner : null;
+  };
+  const prepareDisplayOwnership = async (options = {}) => {
+    if (!ctx.display)
+      return { ready: false, reason: "display-resolver-unavailable" };
+    const active = ctx.getActiveChat();
+    const chatId = String(options.chatId || active.chatId || "").trim();
+    const characterId = String(options.characterId || active.characterId || "").trim();
+    if (!chatId || !characterId)
+      return { ready: false, reason: "chat-or-character-unavailable" };
+    const currentOwner = await readChatDisplayOwner(chatId);
+    if (currentOwner && currentOwner !== DISPLAY_OWNER_IDENTIFIER) {
+      return { ready: false, conflict: true, owner: currentOwner, chatId, characterId };
+    }
+    if (currentOwner === DISPLAY_OWNER_IDENTIFIER && !displayOwnerReloadRequired) {
+      return { ready: true, owner: currentOwner, chatId, characterId, reloadRequired: false };
+    }
+    const result = await callNativeResource("message_render", "ensureOwner", [characterId]);
+    if (result?.changed === true)
+      displayOwnerReloadRequired = true;
+    const owner = await readChatDisplayOwner(chatId);
+    return {
+      ready: owner === DISPLAY_OWNER_IDENTIFIER && !displayOwnerReloadRequired,
+      owner,
+      chatId,
+      characterId,
+      reloadRequired: displayOwnerReloadRequired,
+      changed: result?.changed === true
+    };
+  };
+  const unregisterDisplayResolver = ctx.display?.registerResolver({
+    ready: (_chatId) => true,
+    finalizeWithoutScripts: true,
+    resolveBody: async ({ content, context }) => {
+      const hold = !context?.isUser ? localRenderHoldFor(context?.chatId, context?.messageId) : null;
+      if (hold) {
+        const raw = String(content ?? "");
+        if (hold.allowedContent !== undefined && raw === hold.allowedContent) {
+          return {
+            content: raw,
+            processingState: `vsh-allow:${hold.id}`,
+            cacheable: false
+          };
+        }
+        return {
+          content: hold.overrideContent,
+          processingState: `vsh-hold:${hold.id}`,
+          cacheable: false
+        };
+      }
+      const chatId = String(context?.chatId || "");
+      if (!chatId)
+        return { content: String(content ?? ""), cacheable: false };
+      const body = await postJson(`/api/v1/chats/${encodeURIComponent(chatId)}/display-preprocess`, {
+        rawContent: String(content ?? ""),
+        ...context?.messageId ? { messageId: String(context.messageId) } : {},
+        ...typeof context?.messageIndex === "number" ? { messageIndex: context.messageIndex } : {},
+        ...context?.role ? { role: String(context.role) } : {}
+      });
+      return {
+        content: typeof body?.content === "string" ? body.content : String(content ?? ""),
+        cacheable: false
+      };
+    },
+    resolveTemplates: async ({ templates, context }) => {
+      const body = await postJson("/api/v1/macros/resolve-batch", {
+        templates: templates && typeof templates === "object" ? templates : {},
+        ...context?.chatId ? { chat_id: String(context.chatId) } : {},
+        ...context?.characterId ? { character_id: String(context.characterId) } : {},
+        ...context?.personaId ? { persona_id: String(context.personaId) } : {}
+      });
+      return {
+        resolved: body?.resolved && typeof body.resolved === "object" ? body.resolved : { ...templates || {} },
+        ...body?.touched_vars && typeof body.touched_vars === "object" ? { touchedVars: body.touched_vars } : {},
+        ...body?.cacheable && typeof body.cacheable === "object" ? { cacheable: body.cacheable } : {}
+      };
+    },
+    applyScripts: async (args) => {
+      const processingState = String(args?.processingState || "");
+      if (processingState.startsWith("vsh-hold:") || processingState.startsWith("vsh-allow:")) {
+        return {
+          content: String(args?.content ?? ""),
+          processingState,
+          cacheable: false
+        };
+      }
+      const context = args?.context || {};
+      const body = await postJson("/api/v1/regex-scripts/apply", {
+        content: String(args?.content ?? ""),
+        scripts: Array.isArray(args?.scripts) ? args.scripts : [],
+        resolved_find_patterns: args?.resolvedFindPatterns || undefined,
+        resolved_replacements: args?.resolvedReplacements || undefined,
+        dynamic_macros: context?.dynamicMacros || undefined,
+        context: {
+          chat_id: context?.chatId,
+          character_id: context?.characterId,
+          persona_id: context?.personaId,
+          is_user: context?.isUser === true,
+          depth: Number(context?.depth || 0),
+          ...context?.messageId ? { message_id: String(context.messageId) } : {},
+          ...typeof context?.messageIndex === "number" ? { message_index: context.messageIndex } : {},
+          ...context?.role ? { role: String(context.role) } : {}
+        }
+      });
+      return {
+        content: typeof body?.result === "string" ? body.result : String(args?.content ?? ""),
+        ...Array.isArray(body?.touched_vars) ? { touchedVars: body.touched_vars } : {},
+        ...typeof body?.cacheable === "boolean" ? { cacheable: body.cacheable } : {}
+      };
+    }
+  }) ?? null;
   const personaBridge = Object.freeze({
     list: (options = {}) => callNativeResource("personas", "list", [options]),
     get: (personaId) => callNativeResource("personas", "get", [personaId]),
@@ -5668,8 +5932,82 @@ function setup(ctx) {
     deactivateGlobal: (worldBookId) => callNativeResource("world_books", "deactivateGlobal", [worldBookId]),
     entries: worldBookEntriesBridge
   });
+  const chatBridge = Object.freeze({
+    getMessages: (chatId) => callNativeResource("chat", "getMessages", [chatId]),
+    updateMessage: (chatId, messageId, patch) => callNativeResource("chat", "updateMessage", [chatId, messageId, patch])
+  });
+  const eventBridge = Object.freeze({
+    on(eventName, handler) {
+      if (typeof eventName !== "string" || !eventName.trim()) {
+        throw new TypeError("Event name must be a non-empty string");
+      }
+      if (typeof handler !== "function") {
+        throw new TypeError("Event handler must be a function");
+      }
+      return ctx.events.on(eventName, handler);
+    }
+  });
+  const messageRenderBridge = Object.freeze({
+    prepare(options = {}) {
+      return prepareDisplayOwnership(options);
+    },
+    async hold(spec) {
+      const local = setLocalRenderHold(spec);
+      try {
+        return await callNativeResource("message_render", "hold", [spec]);
+      } catch (error) {
+        removeLocalRenderHold(local.id);
+        invalidateDisplay();
+        throw error;
+      }
+    },
+    async bind(holdId, messageId) {
+      bindLocalRenderHold(holdId, messageId);
+      try {
+        return await callNativeResource("message_render", "bind", [holdId, messageId]);
+      } catch (error) {
+        removeLocalRenderHold(holdId);
+        invalidateDisplay();
+        throw error;
+      }
+    },
+    async allow(holdId, content) {
+      const hold = localRenderHolds.get(String(holdId || ""));
+      if (hold) {
+        hold.allowedContent = String(content ?? "");
+        invalidateDisplay();
+      }
+      try {
+        return await callNativeResource("message_render", "allow", [holdId, content]);
+      } catch (error) {
+        if (hold) {
+          delete hold.allowedContent;
+          invalidateDisplay();
+        }
+        throw error;
+      }
+    },
+    async release(holdId, options = {}) {
+      const result = await callNativeResource("message_render", "release", [holdId, options]);
+      removeLocalRenderHold(holdId);
+      invalidateDisplay();
+      return result;
+    },
+    status(holdId) {
+      return callNativeResource("message_render", "status", holdId ? [holdId] : []);
+    }
+  });
+  const tokensBridge = Object.freeze({
+    countText(text, options = {}) {
+      return callNativeResource("tokens", "countText", [text, options]);
+    }
+  });
   window.__vishrunPersonas = personaBridge;
   window.__vishrunWorldBooks = worldBooksBridge;
+  window.__vishrunChat = chatBridge;
+  window.__vishrunEvents = eventBridge;
+  window.__vishrunMessageRender = messageRenderBridge;
+  window.__vishrunTokens = tokensBridge;
   const syncPreGenerationSubscription = () => {
     ctx.sendToBackend({
       type: "vsh_pre_generation_subscription",
@@ -6153,9 +6491,18 @@ function setup(ctx) {
       pending.reject(new Error("Vishrun disposed"));
     }
     pendingNativeResources.clear();
+    try {
+      unregisterDisplayResolver?.();
+    } catch (_) {}
+    localRenderHolds.clear();
+    localRenderTargets.clear();
     unsubBackendMsg();
     delete window.__vishrunPersonas;
     delete window.__vishrunWorldBooks;
+    delete window.__vishrunChat;
+    delete window.__vishrunEvents;
+    delete window.__vishrunMessageRender;
+    delete window.__vishrunTokens;
     delete window.__vishrunRegisterPreGeneration;
     delete window.__vishrunRegisterUserMessageProcessor;
     delete window.__vishrunGenerate;

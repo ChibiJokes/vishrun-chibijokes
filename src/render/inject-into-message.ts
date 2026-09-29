@@ -917,13 +917,21 @@ function frontendCodeBlockHost(pre: HTMLPreElement): HTMLElement {
   //     <div class=codeHeader>...<button data-code-copy>...</button></div>
   //     <pre>...</pre>
   //   </div>
-  // Replace that whole shell so the language/copy header does not remain
-  // floating above the Vishrun iframe. The data attribute is stable even
-  // though the CSS-module class name is not.
+  // Treat the wrapper as the visual source host so the language/copy header
+  // disappears with the code block. Crucially, we KEEP this React-owned host
+  // in the DOM (hidden) instead of replacing it. That lets React update the
+  // code block in-place when a Lumiverse regex is edited/toggled.
   if (parent.querySelector('[data-code-copy]') && Array.from(parent.children).includes(pre)) {
     return parent;
   }
   return pre;
+}
+
+function restoreJslrSourceHosts(target: HTMLElement): void {
+  for (const host of Array.from(target.querySelectorAll<HTMLElement>('[data-vishrun-jslr-source-host="true"]'))) {
+    host.style.display = '';
+    host.removeAttribute('data-vishrun-jslr-source-host');
+  }
 }
 
 async function renderJslrFrontendCodeBlocks(
@@ -932,7 +940,15 @@ async function renderJslrFrontendCodeBlocks(
   ctx: SpindleFrontendContext,
 ): Promise<number> {
   const target = findContentRoot(root);
+
+  // Every pass starts by making previously-hidden source blocks visible again.
+  // Qualifying frontends are hidden again below. This means a regex edit/toggle
+  // that turns frontend output back into ordinary text/code immediately restores
+  // the host instead of leaving a permanently hidden stale block.
+  restoreJslrSourceHosts(target);
+
   const pres = Array.from(target.querySelectorAll('pre'));
+  const liveOrdinals = new Set<string>();
   let frontendOrdinal = 0;
   let rendered = 0;
 
@@ -944,14 +960,32 @@ async function renderJslrFrontendCodeBlocks(
     if (!isJslrFrontendSource(source)) continue;
 
     const ordinal = frontendOrdinal++;
+    const ordinalKey = String(ordinal);
+    const sourceHash = frontendSourceHash(source);
     const host = frontendCodeBlockHost(pre as HTMLPreElement);
     if (!host.isConnected || !host.parentNode) continue;
 
+    liveOrdinals.add(ordinalKey);
+    host.setAttribute('data-vishrun-jslr-source-host', 'true');
+    host.style.display = 'none';
+
+    const existing = target.querySelector<HTMLIFrameElement>(
+      `iframe[data-vishrun-jslr-frontend="true"][data-vishrun-jslr-ordinal="${ordinalKey}"]`,
+    );
+    if (existing?.getAttribute('data-vishrun-jslr-source-hash') === sourceHash) {
+      // Same rendered frontend, same message/code-block slot: keep the existing
+      // runtime. This makes observer rescans cheap and idempotent.
+      continue;
+    }
+    if (existing) {
+      destroyWidgetIframe(existing, 'jslr-codeblock-source-changed');
+    }
+
     // Stable for a given message/code-block identity, distinct for repeated
-    // identical frontends in the same message. The iframe registry accepts
-    // multiple frames per script id, but keeping the ids distinct makes
-    // diagnostics and targeted cleanup much easier to read.
-    const scriptId = `jslr-frontend-${ordinal}-${frontendSourceHash(source)}`;
+    // identical frontends in the same message. The source hash intentionally
+    // changes when Lumiverse re-applies an edited regex replacement, forcing
+    // Vishrun to rebuild the iframe with the new frontend immediately.
+    const scriptId = `jslr-frontend-${ordinal}-${sourceHash}`;
     const scriptName = `JS Slash Runner Frontend ${ordinal + 1}`;
     let iframe: HTMLIFrameElement;
     try {
@@ -961,16 +995,37 @@ async function renderJslrFrontendCodeBlocks(
       continue;
     }
 
+    iframe.setAttribute('data-vishrun-jslr-frontend', 'true');
+    iframe.setAttribute('data-vishrun-jslr-ordinal', ordinalKey);
+    iframe.setAttribute('data-vishrun-jslr-source-hash', sourceHash);
+
     // React may have replaced the message subtree while buildWidgetIframe was
-    // awaiting snapshots/assets. Never attach into stale DOM, and release the
+    // awaiting snapshots/assets. Never attach beside stale DOM, and release the
     // host sandbox record immediately if that happened.
     if (!host.isConnected || !host.parentNode) {
       destroyWidgetIframe(iframe, 'jslr-codeblock-stale-host');
       continue;
     }
 
-    host.replaceWith(iframe);
+    // JS Slash Runner keeps the <pre> in the live DOM and mounts its iframe
+    // alongside it. Do the same. Replacing the React-owned code block breaks
+    // reconciliation: Lumiverse can update its virtual tree after a regex edit
+    // while the visible iframe remains stale. Keeping the source host hidden
+    // gives React something real to reconcile, and the MutationObserver sees
+    // the changed code text and rebuilds this sibling iframe.
+    host.insertAdjacentElement('afterend', iframe);
     rendered++;
+  }
+
+  // Remove runtimes whose source code block disappeared or stopped qualifying
+  // (regex disabled, replacement changed away from frontend, etc.).
+  for (const iframe of Array.from(
+    target.querySelectorAll<HTMLIFrameElement>('iframe[data-vishrun-jslr-frontend="true"]'),
+  )) {
+    const ordinal = iframe.getAttribute('data-vishrun-jslr-ordinal') ?? '';
+    if (!liveOrdinals.has(ordinal)) {
+      destroyWidgetIframe(iframe, 'jslr-codeblock-no-longer-active');
+    }
   }
 
   return rendered;
