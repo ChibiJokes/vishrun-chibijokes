@@ -356,18 +356,60 @@ export async function handleSetChatMessage(
     return;
   }
 
-  const target = messages[idx] as ChatMessageDTO;
+  const target = messages[idx] as ChatMessageDTO & { extra?: Record<string, unknown> };
   const content = typeof fieldValues.message === 'string' ? fieldValues.message : undefined;
-  if (typeof content !== 'string') {
-    log.warn('setChatMessage: no message string in fieldValues, ignoring');
+
+  const hasData = fieldValues.data !== undefined;
+  const hasExtra = fieldValues.extra !== undefined;
+  const hasHidden = fieldValues.is_hidden !== undefined;
+  if (hasData && (!fieldValues.data || typeof fieldValues.data !== 'object' || Array.isArray(fieldValues.data))) {
+    throw new TypeError('setChatMessage fieldValues.data must be an object');
+  }
+  if (hasExtra && (!fieldValues.extra || typeof fieldValues.extra !== 'object' || Array.isArray(fieldValues.extra))) {
+    throw new TypeError('setChatMessage fieldValues.extra must be an object');
+  }
+  if (hasHidden && typeof fieldValues.is_hidden !== 'boolean') {
+    throw new TypeError('setChatMessage fieldValues.is_hidden must be a boolean');
+  }
+  if (typeof content !== 'string' && !hasData && !hasExtra && !hasHidden) {
+    log.warn('setChatMessage: no supported fields in fieldValues, ignoring');
     return;
   }
 
-  // Send { content } only and ignore opts.swipe_id. The native greeting
-  // selector also writes { content } without swipe_id, so the host
-  // overwrites swipes[existing.swipe_id]. Keeping swipe_id at 0 lets
-  // both writers cooperate on slot 0 without corrupting other slots.
-  await chat.updateMessage(chatId, target.id, { content });
+  const patch: Record<string, unknown> = {};
+  if (typeof content === 'string') patch.content = content;
+
+  // Vishrun exposes JSLR-style message.data separately from Lumiverse's public
+  // message.extra object. Persist data under a private extra key so existing
+  // messages can carry invisible extension state without touching visible text.
+  // Both data and extra are MERGED with the latest stored values to avoid one
+  // extension clobbering another extension's metadata. The private data key may
+  // only be written through fieldValues.data, never fieldValues.extra.
+  if (hasData || hasExtra || hasHidden) {
+    const currentExtra = target.extra && typeof target.extra === 'object' && !Array.isArray(target.extra)
+      ? { ...target.extra }
+      : {};
+    const currentStoredData = currentExtra[JSLR_DATA_EXTRA_KEY];
+    const storedData = currentStoredData && typeof currentStoredData === 'object' && !Array.isArray(currentStoredData)
+      ? { ...(currentStoredData as Record<string, unknown>) }
+      : {};
+
+    if (hasExtra) {
+      const publicExtra = { ...(fieldValues.extra as Record<string, unknown>) };
+      delete publicExtra[JSLR_DATA_EXTRA_KEY];
+      Object.assign(currentExtra, publicExtra);
+    }
+    if (hasData) {
+      Object.assign(storedData, fieldValues.data as Record<string, unknown>);
+      currentExtra[JSLR_DATA_EXTRA_KEY] = storedData;
+    }
+    if (hasHidden) currentExtra.hidden = fieldValues.is_hidden === true;
+    patch.extra = currentExtra;
+  }
+
+  // opts.swipe_id remains intentionally ignored. A content write follows the
+  // native greeting selector semantics and updates the currently active swipe.
+  await chat.updateMessage(chatId, target.id, patch as any);
 }
 
 export async function handleSetVariable(
