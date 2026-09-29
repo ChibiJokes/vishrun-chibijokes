@@ -697,8 +697,17 @@ function applyPreGenerationMessagePatches(messages, patches) {
     });
     if (index < 0)
       continue;
-    const current = String(result[index].content ?? "");
-    const nextContent = patch.mode === "replace" ? patch.content : patch.mode === "prepend" ? patch.content + current : current + patch.content;
+    const current = result[index].content;
+    let nextContent;
+    if (patch.mode === "replace") {
+      nextContent = patch.content;
+    } else if (Array.isArray(current)) {
+      const patchPart = { type: "text", text: patch.content };
+      nextContent = patch.mode === "prepend" ? [patchPart, ...current] : [...current, patchPart];
+    } else {
+      const text = typeof current === "string" ? current : "";
+      nextContent = patch.mode === "prepend" ? patch.content + text : text + patch.content;
+    }
     result[index] = { ...result[index], content: nextContent };
     breakdown.push({ messageIndex: index, name: "Message patch" });
   }
