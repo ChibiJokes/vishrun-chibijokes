@@ -6119,6 +6119,23 @@ function setup(ctx) {
       }
     }
   };
+  const normalizePreGenerationMessagePatches = (value) => {
+    if (!Array.isArray(value))
+      return [];
+    const out = [];
+    for (const item of value) {
+      if (!item || typeof item !== "object")
+        continue;
+      const raw = item;
+      const sourceMessageId = typeof raw.sourceMessageId === "string" ? raw.sourceMessageId.trim() : "";
+      const content = typeof raw.content === "string" ? raw.content : null;
+      if (!sourceMessageId || content === null)
+        continue;
+      const mode = raw.mode === "prepend" || raw.mode === "replace" ? raw.mode : "append";
+      out.push({ sourceMessageId, content, mode });
+    }
+    return out;
+  };
   const runPreGenerationHandlers = async (requestId, chatId, generationType, activatedWorldInfo = []) => {
     const controller = new AbortController;
     preGenerationControllers.set(requestId, { controller, chatId });
@@ -6129,6 +6146,7 @@ function setup(ctx) {
       return worldInfoPromise;
     };
     let error;
+    let messagePatches = [];
     try {
       const handlers = Array.from(preGenerationHandlers);
       if (handlers.length > 0) {
@@ -6144,6 +6162,7 @@ function setup(ctx) {
         if (failures.length > 0) {
           error = failures.map((failure) => failure.reason instanceof Error ? failure.reason.message : String(failure.reason)).join("; ");
         }
+        messagePatches = results.flatMap((result) => result.status === "fulfilled" && result.value ? normalizePreGenerationMessagePatches(result.value.messagePatches) : []);
       }
     } finally {
       preGenerationControllers.delete(requestId);
@@ -6155,6 +6174,7 @@ function setup(ctx) {
       ctx.sendToBackend({
         type: "vsh_pre_generation_complete",
         requestId,
+        ...messagePatches.length > 0 ? { messagePatches } : {},
         ...error ? { error } : {}
       });
     }

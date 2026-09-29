@@ -416,6 +416,23 @@ function normalizeActivatedWorldInfo(value) {
   }
   return out;
 }
+function normalizeMessagePatches(value) {
+  if (!Array.isArray(value))
+    return [];
+  const out = [];
+  for (const item of value) {
+    if (!item || typeof item !== "object")
+      continue;
+    const raw = item;
+    const sourceMessageId = typeof raw.sourceMessageId === "string" ? raw.sourceMessageId.trim() : "";
+    const content = typeof raw.content === "string" ? raw.content : null;
+    if (!sourceMessageId || content === null)
+      continue;
+    const mode = raw.mode === "prepend" || raw.mode === "replace" ? raw.mode : "append";
+    out.push({ sourceMessageId, content, mode });
+  }
+  return out;
+}
 function clearPending(requestId) {
   const pending = pendingRequests.get(requestId);
   if (!pending)
@@ -431,7 +448,7 @@ function releasePendingForUser(userId) {
   for (const [requestId, pending] of pendingRequests) {
     if (pending.userId !== userId)
       continue;
-    clearPending(requestId)?.resolve();
+    clearPending(requestId)?.resolve([]);
   }
 }
 async function sendWorldInfoBodies(requestId, userId, pending) {
@@ -496,7 +513,8 @@ function installPreGenerationBridgeHandler() {
     const pending = pendingRequests.get(payload.requestId);
     if (!pending || pending.userId !== userId)
       return;
-    clearPending(payload.requestId)?.resolve();
+    const messagePatches = normalizeMessagePatches(payload.messagePatches);
+    clearPending(payload.requestId)?.resolve(messagePatches);
     if (payload.error) {
       console.warn(LOG_PREFIX, "frontend handler reported an error:", payload.error);
     }
@@ -506,19 +524,19 @@ async function waitForPreGeneration(context) {
   const { chatId, userId, generationType, signal } = context;
   const activatedWorldInfo = normalizeActivatedWorldInfo(context.activatedWorldInfo);
   if (!chatId || !userId || !subscribedUsers.has(userId))
-    return;
+    return [];
   if (signal?.aborted) {
     throw signal.reason ?? new DOMException("Aborted", "AbortError");
   }
   const requestId = crypto.randomUUID();
-  await new Promise((resolve, reject) => {
+  return await new Promise((resolve, reject) => {
     const timer = setTimeout(() => {
       const pending = clearPending(requestId);
       if (!pending)
         return;
       api.sendToFrontend({ type: "vsh_pre_generation_cancel", requestId }, userId);
       console.warn(LOG_PREFIX, `frontend handler timed out after ${PRE_GENERATION_TIMEOUT_MS}ms`);
-      pending.resolve();
+      pending.resolve([]);
     }, PRE_GENERATION_TIMEOUT_MS);
     const pending = {
       userId,
@@ -667,15 +685,36 @@ async function processMessageContent(ctx, deps = {}) {
   const stripped = content.trim();
   return { content: stripped.length > 0 ? stripped : EMPTY_REPLACEMENT };
 }
+function applyPreGenerationMessagePatches(messages, patches) {
+  if (patches.length === 0)
+    return { messages, breakdown: [] };
+  const result = [...messages];
+  const breakdown = [];
+  for (const patch of patches) {
+    const index = result.findIndex((message) => {
+      const source = message;
+      return source.__isChatHistory === true && source.sourceMessageId === patch.sourceMessageId;
+    });
+    if (index < 0)
+      continue;
+    const current = String(result[index].content ?? "");
+    const nextContent = patch.mode === "replace" ? patch.content : patch.mode === "prepend" ? patch.content + current : current + patch.content;
+    result[index] = { ...result[index], content: nextContent };
+    breakdown.push({ messageIndex: index, name: "Message patch" });
+  }
+  return { messages: result, breakdown };
+}
 function installInjectInterceptor() {
   api.registerInterceptor(async (messages, context) => {
     const ctx = context;
     if (!ctx.chatId)
       return { messages };
-    await waitForPreGeneration(ctx);
+    const messagePatches = await waitForPreGeneration(ctx);
     const injects = await readInjects(ctx.chatId);
-    if (injects.length === 0)
-      return { messages };
+    if (injects.length === 0) {
+      const patched = applyPreGenerationMessagePatches(messages, messagePatches);
+      return patched.breakdown.length > 0 ? { messages: patched.messages, breakdown: patched.breakdown } : { messages: patched.messages };
+    }
     const result = [...messages];
     const surviving = [];
     const breakdown = [];
@@ -727,7 +766,8 @@ function installInjectInterceptor() {
     if (surviving.length !== injects.length) {
       await writeInjects(ctx.chatId, surviving);
     }
-    return { messages: result, breakdown };
+    const patched = applyPreGenerationMessagePatches(result, messagePatches);
+    return { messages: patched.messages, breakdown: [...breakdown, ...patched.breakdown] };
   });
 }
 function installMessageContentProcessor() {
