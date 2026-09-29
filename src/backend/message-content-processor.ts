@@ -8,7 +8,7 @@ import { api, varsLog } from './common';
 import { parseSetvarChain } from './parsers/setvar';
 import { applySetvarOp as applySetvarOpDefault } from './setvar-ops';
 import { resolveMacroText, resolveDynamicVarMacros, resolveLocalDynamicMacros, DYNAMIC_VAR_MACRO_NAMES, LOCAL_DYNAMIC_MACRO_NAMES } from './macro-resolve';
-import { waitForPreGeneration } from './pre-generation-bridge';
+import { waitForPreGeneration, type PreGenerationMessagePatch } from './pre-generation-bridge';
 
 const EMPTY_REPLACEMENT = '_(variables updated)_';
 
@@ -191,6 +191,37 @@ export async function processMessageContent(
 }
 
 // ─── Prompt interceptor ───────────────────────────────────────────────────────
+
+function applyPreGenerationMessagePatches(
+  messages: LlmMessageDTO[],
+  patches: PreGenerationMessagePatch[],
+): { messages: LlmMessageDTO[]; breakdown: Array<{ messageIndex: number; name: string }> } {
+  if (patches.length === 0) return { messages, breakdown: [] };
+
+  const result = [...messages];
+  const breakdown: Array<{ messageIndex: number; name: string }> = [];
+
+  for (const patch of patches) {
+    const index = result.findIndex((message) => {
+      const source = message as LlmMessageDTO & { __isChatHistory?: boolean; sourceMessageId?: string };
+      return source.__isChatHistory === true && source.sourceMessageId === patch.sourceMessageId;
+    });
+    if (index < 0) continue;
+
+    const current = String(result[index].content ?? '');
+    const nextContent = patch.mode === 'replace'
+      ? patch.content
+      : patch.mode === 'prepend'
+        ? patch.content + current
+        : current + patch.content;
+
+    result[index] = { ...result[index], content: nextContent };
+    breakdown.push({ messageIndex: index, name: 'Message patch' });
+  }
+
+  return { messages: result, breakdown };
+}
+
 // Reads inject specs from extension storage on every generation and splices
 // each active entry into the assembled message array at the right depth.
 // Turn-counted entries are decremented and removed when they expire.
@@ -200,10 +231,15 @@ function installInjectInterceptor(): void {
     const ctx = context as { chatId?: string; characterId?: string; userId?: string; generationType?: string; signal?: AbortSignal };
     if (!ctx.chatId) return { messages };
 
-    await waitForPreGeneration(ctx);
+    const messagePatches = await waitForPreGeneration(ctx);
 
     const injects = await readInjects(ctx.chatId);
-    if (injects.length === 0) return { messages };
+    if (injects.length === 0) {
+      const patched = applyPreGenerationMessagePatches(messages, messagePatches);
+      return patched.breakdown.length > 0
+        ? { messages: patched.messages, breakdown: patched.breakdown }
+        : { messages: patched.messages };
+    }
 
     const result: LlmMessageDTO[] = [...messages];
     const surviving: InjectSpec[] = [];
@@ -278,7 +314,8 @@ function installInjectInterceptor(): void {
       await writeInjects(ctx.chatId, surviving);
     }
 
-    return { messages: result, breakdown };
+    const patched = applyPreGenerationMessagePatches(result, messagePatches);
+    return { messages: patched.messages, breakdown: [...breakdown, ...patched.breakdown] };
   });
 }
 

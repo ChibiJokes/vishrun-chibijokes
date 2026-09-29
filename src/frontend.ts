@@ -44,7 +44,21 @@ interface PreGenerationRequest {
   signal: AbortSignal;
 }
 
-type PreGenerationHandler = (request: PreGenerationRequest) => void | Promise<void>;
+type PreGenerationMessagePatchMode = 'append' | 'prepend' | 'replace';
+
+interface PreGenerationMessagePatch {
+  sourceMessageId: string;
+  content: string;
+  mode?: PreGenerationMessagePatchMode;
+}
+
+interface PreGenerationResult {
+  messagePatches?: PreGenerationMessagePatch[];
+}
+
+type PreGenerationHandler = (
+  request: PreGenerationRequest,
+) => void | PreGenerationResult | Promise<void | PreGenerationResult>;
 
 
 interface UserMessageProcessRequest {
@@ -604,6 +618,22 @@ export function setup(ctx: SpindleFrontendContext) {
     }
   };
 
+  const normalizePreGenerationMessagePatches = (value: unknown): PreGenerationMessagePatch[] => {
+    if (!Array.isArray(value)) return [];
+    const out: PreGenerationMessagePatch[] = [];
+    for (const item of value) {
+      if (!item || typeof item !== 'object') continue;
+      const raw = item as Record<string, unknown>;
+      const sourceMessageId = typeof raw.sourceMessageId === 'string' ? raw.sourceMessageId.trim() : '';
+      const content = typeof raw.content === 'string' ? raw.content : null;
+      if (!sourceMessageId || content === null) continue;
+      const mode: PreGenerationMessagePatchMode =
+        raw.mode === 'prepend' || raw.mode === 'replace' ? raw.mode : 'append';
+      out.push({ sourceMessageId, content, mode });
+    }
+    return out;
+  };
+
   const runPreGenerationHandlers = async (
     requestId: string,
     chatId: string,
@@ -619,6 +649,7 @@ export function setup(ctx: SpindleFrontendContext) {
     };
 
     let error: string | undefined;
+    let messagePatches: PreGenerationMessagePatch[] = [];
     try {
       const handlers = Array.from(preGenerationHandlers);
       if (handlers.length > 0) {
@@ -634,6 +665,11 @@ export function setup(ctx: SpindleFrontendContext) {
         if (failures.length > 0) {
           error = failures.map((failure) => failure.reason instanceof Error ? failure.reason.message : String(failure.reason)).join('; ');
         }
+        messagePatches = results.flatMap((result) =>
+          result.status === 'fulfilled' && result.value
+            ? normalizePreGenerationMessagePatches(result.value.messagePatches)
+            : [],
+        );
       }
     } finally {
       preGenerationControllers.delete(requestId);
@@ -645,6 +681,7 @@ export function setup(ctx: SpindleFrontendContext) {
       ctx.sendToBackend({
         type: 'vsh_pre_generation_complete',
         requestId,
+        ...(messagePatches.length > 0 ? { messagePatches } : {}),
         ...(error ? { error } : {}),
       });
     }
