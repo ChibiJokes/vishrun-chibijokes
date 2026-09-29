@@ -216,14 +216,36 @@ function applyPreGenerationMessagePatches(
       // multipart media parts. Append/prepend below preserve multipart content.
       nextContent = patch.content;
     } else if (Array.isArray(current)) {
-      // Lumiverse represents turns with attachments as multipart content. Keep
-      // every existing text/media/tool part intact and add the patch as another
-      // text part inside this exact message block instead of stringifying the
-      // array (which would produce "[object Object]").
-      const patchPart = { type: 'text' as const, text: patch.content };
-      nextContent = patch.mode === 'prepend'
-        ? [patchPart, ...current]
-        : [...current, patchPart];
+      // Lumiverse represents turns with attachments as multipart content. A
+      // message-level append/prepend should mutate the message's textual payload,
+      // not create a second text part after its media. This keeps the original
+      // part ordering intact and matches how a normal text message is patched.
+      const parts = current.map((part) =>
+        part && typeof part === 'object' ? { ...part } : part
+      );
+      const textIndex = parts.findIndex((part) =>
+        !!part
+        && typeof part === 'object'
+        && (part as { type?: unknown }).type === 'text'
+        && typeof (part as { text?: unknown }).text === 'string'
+      );
+
+      if (textIndex >= 0) {
+        const textPart = parts[textIndex] as { type: 'text'; text: string; [key: string]: unknown };
+        parts[textIndex] = {
+          ...textPart,
+          text: patch.mode === 'prepend'
+            ? patch.content + textPart.text
+            : textPart.text + patch.content,
+        };
+        nextContent = parts as LlmMessageDTO['content'];
+      } else {
+        // A media-only turn still needs a textual anchor. Put it before the
+        // existing media so the provider sees one coherent message beginning
+        // with the patched text rather than a trailing caption after the image.
+        const patchPart = { type: 'text' as const, text: patch.content };
+        nextContent = [patchPart, ...parts] as LlmMessageDTO['content'];
+      }
     } else {
       const text = typeof current === 'string' ? current : '';
       nextContent = patch.mode === 'prepend'
