@@ -208,12 +208,28 @@ function applyPreGenerationMessagePatches(
     });
     if (index < 0) continue;
 
-    const current = String(result[index].content ?? '');
-    const nextContent = patch.mode === 'replace'
-      ? patch.content
-      : patch.mode === 'prepend'
-        ? patch.content + current
-        : current + patch.content;
+    const current = result[index].content;
+    let nextContent: LlmMessageDTO['content'];
+
+    if (patch.mode === 'replace') {
+      // Replace intentionally replaces the whole message payload, including any
+      // multipart media parts. Append/prepend below preserve multipart content.
+      nextContent = patch.content;
+    } else if (Array.isArray(current)) {
+      // Lumiverse represents turns with attachments as multipart content. Keep
+      // every existing text/media/tool part intact and add the patch as another
+      // text part inside this exact message block instead of stringifying the
+      // array (which would produce "[object Object]").
+      const patchPart = { type: 'text' as const, text: patch.content };
+      nextContent = patch.mode === 'prepend'
+        ? [patchPart, ...current]
+        : [...current, patchPart];
+    } else {
+      const text = typeof current === 'string' ? current : '';
+      nextContent = patch.mode === 'prepend'
+        ? patch.content + text
+        : text + patch.content;
+    }
 
     result[index] = { ...result[index], content: nextContent };
     breakdown.push({ messageIndex: index, name: 'Message patch' });
