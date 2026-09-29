@@ -702,8 +702,19 @@ function applyPreGenerationMessagePatches(messages, patches) {
     if (patch.mode === "replace") {
       nextContent = patch.content;
     } else if (Array.isArray(current)) {
-      const patchPart = { type: "text", text: patch.content };
-      nextContent = patch.mode === "prepend" ? [patchPart, ...current] : [...current, patchPart];
+      const parts = current.map((part) => part && typeof part === "object" ? { ...part } : part);
+      const textIndex = parts.findIndex((part) => !!part && typeof part === "object" && part.type === "text" && typeof part.text === "string");
+      if (textIndex >= 0) {
+        const textPart = parts[textIndex];
+        parts[textIndex] = {
+          ...textPart,
+          text: patch.mode === "prepend" ? patch.content + textPart.text : textPart.text + patch.content
+        };
+        nextContent = parts;
+      } else {
+        const patchPart = { type: "text", text: patch.content };
+        nextContent = [patchPart, ...parts];
+      }
     } else {
       const text = typeof current === "string" ? current : "";
       nextContent = patch.mode === "prepend" ? patch.content + text : text + patch.content;
