@@ -1470,11 +1470,43 @@ async function handleSetChatMessage(body, chatId, currentMessageIndex, chat = ap
   }
   const target = messages[idx];
   const content = typeof fieldValues.message === "string" ? fieldValues.message : undefined;
-  if (typeof content !== "string") {
-    log.warn("setChatMessage: no message string in fieldValues, ignoring");
+  const hasData = fieldValues.data !== undefined;
+  const hasExtra = fieldValues.extra !== undefined;
+  const hasHidden = fieldValues.is_hidden !== undefined;
+  if (hasData && (!fieldValues.data || typeof fieldValues.data !== "object" || Array.isArray(fieldValues.data))) {
+    throw new TypeError("setChatMessage fieldValues.data must be an object");
+  }
+  if (hasExtra && (!fieldValues.extra || typeof fieldValues.extra !== "object" || Array.isArray(fieldValues.extra))) {
+    throw new TypeError("setChatMessage fieldValues.extra must be an object");
+  }
+  if (hasHidden && typeof fieldValues.is_hidden !== "boolean") {
+    throw new TypeError("setChatMessage fieldValues.is_hidden must be a boolean");
+  }
+  if (typeof content !== "string" && !hasData && !hasExtra && !hasHidden) {
+    log.warn("setChatMessage: no supported fields in fieldValues, ignoring");
     return;
   }
-  await chat.updateMessage(chatId, target.id, { content });
+  const patch = {};
+  if (typeof content === "string")
+    patch.content = content;
+  if (hasData || hasExtra || hasHidden) {
+    const currentExtra = target.extra && typeof target.extra === "object" && !Array.isArray(target.extra) ? { ...target.extra } : {};
+    const currentStoredData = currentExtra[JSLR_DATA_EXTRA_KEY];
+    const storedData = currentStoredData && typeof currentStoredData === "object" && !Array.isArray(currentStoredData) ? { ...currentStoredData } : {};
+    if (hasExtra) {
+      const publicExtra = { ...fieldValues.extra };
+      delete publicExtra[JSLR_DATA_EXTRA_KEY];
+      Object.assign(currentExtra, publicExtra);
+    }
+    if (hasData) {
+      Object.assign(storedData, fieldValues.data);
+      currentExtra[JSLR_DATA_EXTRA_KEY] = storedData;
+    }
+    if (hasHidden)
+      currentExtra.hidden = fieldValues.is_hidden === true;
+    patch.extra = currentExtra;
+  }
+  await chat.updateMessage(chatId, target.id, patch);
 }
 async function handleSetVariable(body, chatId, chat = api.chat) {
   const key = body.key;
