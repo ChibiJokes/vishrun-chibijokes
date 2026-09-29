@@ -6,9 +6,18 @@ import { installThHelpersHandler } from './th-helpers';
 import { installGenerateRelayHandler } from './generate-relay';
 import { installPreGenerationBridgeHandler } from './pre-generation-bridge';
 import { installUserMessageBridgeHandler } from './user-message-bridge';
+import {
+  allowMessageRender,
+  bindMessageRender,
+  holdMessageRender,
+  installMessageRenderBridge,
+  ensureMessageRenderDisplayOwner,
+  messageRenderStatus,
+  releaseMessageRender,
+} from './message-render-bridge';
 import { api } from './common';
 
-type NativeResourceName = 'personas' | 'world_books';
+type NativeResourceName = 'personas' | 'world_books' | 'chat' | 'message_render' | 'tokens';
 
 interface NativeResourceRequest {
   type: 'vsh_native_resource';
@@ -24,7 +33,7 @@ function isNativeResourceRequest(payload: unknown): payload is NativeResourceReq
   return (
     value.type === 'vsh_native_resource' &&
     typeof value.requestId === 'string' &&
-    (value.resource === 'personas' || value.resource === 'world_books') &&
+    (value.resource === 'personas' || value.resource === 'world_books' || value.resource === 'chat' || value.resource === 'message_render' || value.resource === 'tokens') &&
     typeof value.operation === 'string' &&
     (value.args === undefined || Array.isArray(value.args))
   );
@@ -58,6 +67,50 @@ async function dispatchNativeResource(
         return api.personas.getWorldBook(String(args[0] ?? ''), userId);
       default:
         throw new Error(`Unsupported personas operation: ${request.operation}`);
+    }
+  }
+
+  if (request.resource === 'chat') {
+    switch (request.operation) {
+      case 'getMessages':
+        return api.chat.getMessages(String(args[0] ?? ''));
+      case 'updateMessage':
+        return api.chat.updateMessage(
+          String(args[0] ?? ''),
+          String(args[1] ?? ''),
+          (args[2] ?? {}) as any,
+        );
+      default:
+        throw new Error(`Unsupported chat operation: ${request.operation}`);
+    }
+  }
+
+  if (request.resource === 'message_render') {
+    switch (request.operation) {
+      case 'hold':
+        return holdMessageRender((args[0] ?? {}) as any);
+      case 'bind':
+        return bindMessageRender(String(args[0] ?? ''), String(args[1] ?? ''));
+      case 'allow':
+        return allowMessageRender(String(args[0] ?? ''), String(args[1] ?? ''));
+      case 'release':
+        return releaseMessageRender(String(args[0] ?? ''), (args[1] ?? {}) as any);
+      case 'status':
+        return messageRenderStatus(args[0] == null ? undefined : String(args[0]));
+      case 'ensureOwner':
+        return ensureMessageRenderDisplayOwner(String(args[0] ?? ''), userId);
+      default:
+        throw new Error(`Unsupported message_render operation: ${request.operation}`);
+    }
+  }
+
+
+  if (request.resource === 'tokens') {
+    switch (request.operation) {
+      case 'countText':
+        return api.tokens.countText(String(args[0] ?? ''), (args[1] ?? {}) as any);
+      default:
+        throw new Error(`Unsupported tokens operation: ${request.operation}`);
     }
   }
 
@@ -144,6 +197,7 @@ installThHelpersHandler();
 installGenerateRelayHandler();
 installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
+installMessageRenderBridge();
 installNativeResourceBridge();
 
 export function setup(): void {
