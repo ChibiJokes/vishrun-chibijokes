@@ -11,7 +11,16 @@ interface PreGenerationSubscriptionMessage {
 interface PreGenerationCompleteMessage {
   type: 'vsh_pre_generation_complete';
   requestId: string;
+  messagePatches?: unknown;
   error?: string;
+}
+
+export type PreGenerationMessagePatchMode = 'append' | 'prepend' | 'replace';
+
+export interface PreGenerationMessagePatch {
+  sourceMessageId: string;
+  content: string;
+  mode: PreGenerationMessagePatchMode;
 }
 
 interface PreGenerationWorldInfoRequestMessage {
@@ -31,7 +40,7 @@ interface ActivatedWorldInfoSummary {
 
 interface PendingRequest {
   userId: string;
-  resolve: () => void;
+  resolve: (messagePatches: PreGenerationMessagePatch[]) => void;
   reject: (error: unknown) => void;
   timer: ReturnType<typeof setTimeout>;
   signal?: AbortSignal;
@@ -93,6 +102,22 @@ function normalizeActivatedWorldInfo(value: unknown): ActivatedWorldInfoSummary[
   return out;
 }
 
+function normalizeMessagePatches(value: unknown): PreGenerationMessagePatch[] {
+  if (!Array.isArray(value)) return [];
+  const out: PreGenerationMessagePatch[] = [];
+  for (const item of value) {
+    if (!item || typeof item !== 'object') continue;
+    const raw = item as Record<string, unknown>;
+    const sourceMessageId = typeof raw.sourceMessageId === 'string' ? raw.sourceMessageId.trim() : '';
+    const content = typeof raw.content === 'string' ? raw.content : null;
+    if (!sourceMessageId || content === null) continue;
+    const mode: PreGenerationMessagePatchMode =
+      raw.mode === 'prepend' || raw.mode === 'replace' ? raw.mode : 'append';
+    out.push({ sourceMessageId, content, mode });
+  }
+  return out;
+}
+
 function clearPending(requestId: string): PendingRequest | null {
   const pending = pendingRequests.get(requestId);
   if (!pending) return null;
@@ -107,7 +132,7 @@ function clearPending(requestId: string): PendingRequest | null {
 function releasePendingForUser(userId: string): void {
   for (const [requestId, pending] of pendingRequests) {
     if (pending.userId !== userId) continue;
-    clearPending(requestId)?.resolve();
+    clearPending(requestId)?.resolve([]);
   }
 }
 
@@ -181,7 +206,8 @@ export function installPreGenerationBridgeHandler(): void {
     const pending = pendingRequests.get(payload.requestId);
     if (!pending || pending.userId !== userId) return;
 
-    clearPending(payload.requestId)?.resolve();
+    const messagePatches = normalizeMessagePatches(payload.messagePatches);
+    clearPending(payload.requestId)?.resolve(messagePatches);
 
     if (payload.error) {
       console.warn(LOG_PREFIX, 'frontend handler reported an error:', payload.error);
@@ -189,10 +215,10 @@ export function installPreGenerationBridgeHandler(): void {
   });
 }
 
-export async function waitForPreGeneration(context: PreGenerationContext): Promise<void> {
+export async function waitForPreGeneration(context: PreGenerationContext): Promise<PreGenerationMessagePatch[]> {
   const { chatId, userId, generationType, signal } = context;
   const activatedWorldInfo = normalizeActivatedWorldInfo(context.activatedWorldInfo);
-  if (!chatId || !userId || !subscribedUsers.has(userId)) return;
+  if (!chatId || !userId || !subscribedUsers.has(userId)) return [];
 
   if (signal?.aborted) {
     throw signal.reason ?? new DOMException('Aborted', 'AbortError');
@@ -200,13 +226,13 @@ export async function waitForPreGeneration(context: PreGenerationContext): Promi
 
   const requestId = crypto.randomUUID();
 
-  await new Promise<void>((resolve, reject) => {
+  return await new Promise<PreGenerationMessagePatch[]>((resolve, reject) => {
     const timer = setTimeout(() => {
       const pending = clearPending(requestId);
       if (!pending) return;
       api.sendToFrontend({ type: 'vsh_pre_generation_cancel', requestId }, userId);
       console.warn(LOG_PREFIX, `frontend handler timed out after ${PRE_GENERATION_TIMEOUT_MS}ms`);
-      pending.resolve();
+      pending.resolve([]);
     }, PRE_GENERATION_TIMEOUT_MS);
 
     const pending: PendingRequest = {
