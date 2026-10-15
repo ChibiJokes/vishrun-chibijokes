@@ -16,7 +16,9 @@
     "interceptor",
     "generation",
     "world_books",
-    "personas"
+    "personas",
+    "regex_scripts",
+    "regex_scripts_unrestricted"
   ],
   "interceptorTimeoutMs": 300000,
   "entry_frontend": "dist/frontend.js",

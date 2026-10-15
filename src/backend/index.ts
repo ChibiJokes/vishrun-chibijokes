@@ -177,6 +177,7 @@ function installNativeResourceBridge(): void {
     );
   });
 }
+import { installRegexTakeoverHandler } from './regex-takeover';
 
 /**
  * Backend worker module. Vishrun is logically frontend-only, but the worker
@@ -199,6 +200,7 @@ installPreGenerationBridgeHandler();
 installUserMessageBridgeHandler();
 installMessageRenderBridge();
 installNativeResourceBridge();
+installRegexTakeoverHandler();
 
 export function setup(): void {
   // intentionally empty — registration happens at module top level (above).

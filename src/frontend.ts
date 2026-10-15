@@ -10,6 +10,7 @@ import { shouldRescanForChangedFields } from './core/chat-changed-filter';
 import { createScriptsPanel, type ScriptsPanel, type OnReloadScript } from './settings/scripts-panel';
 import { ScriptRunner } from './settings/script-runner';
 import { loadEnabledScripts, initScriptStorage, getActiveLoomPresetId } from './settings/script-storage';
+import { requestRegexTakeover } from './core/regex-takeover-client';
 
 interface ChatChangedPayload {
   chatId?: string | null;
@@ -864,7 +865,7 @@ export function setup(ctx: SpindleFrontendContext) {
       console.warn('[vishrun:diag] loadFor: same character, re-using cached card');
       hooks.rescanAll();
       const chatId = ctx.getActiveChat().chatId ?? null;
-      const enabledScripts = await loadEnabledScripts(characterId);
+      const enabledScripts = await loadEnabledScripts(characterId, await getActiveLoomPresetId());
       console.log('[vishrun:diag] loadFor(cache-hit) reconciling', enabledScripts.length, 'scripts, chatId:', chatId);
       await runner.run(enabledScripts, chatId);
       return;
@@ -901,10 +902,33 @@ export function setup(ctx: SpindleFrontendContext) {
       await runner.run(enabledScripts, chatId);
 
       hooks.rescanAll();
+      void requestRegexTakeover(ctx, characterId, scripts).then((disabled) => {
+        if (disabled === 0) return;
+        (ctx as { display?: { invalidate?: (vars: string[]) => void } }).display?.invalidate?.(['*']);
+        hooks.rescanAll();
+      });
     } catch (err) {
       console.error('[vishrun:diag] loadFor FAILED:', err);
     } finally {
       if (inflightCharacterId === characterId) inflightCharacterId = null;
+    }
+  }
+
+  // The host sets activeChatId before activeCharacterId when a chat is opened
+  // without a navigation snapshot, so SETTINGS_UPDATED can arrive while the
+  // character is still unknown. Resolve it from the chat record in that case.
+  async function resolveActiveCharacterId(): Promise<string | null> {
+    const active = ctx.getActiveChat();
+    if (active.characterId || !active.chatId) return active.characterId ?? null;
+    try {
+      const r = await fetch(`/api/v1/chats/${encodeURIComponent(active.chatId)}?messages=false`, { credentials: 'same-origin' });
+      if (!r.ok) return null;
+      const chat = (await r.json()) as { character_id?: string | null };
+      const now = ctx.getActiveChat();
+      if (now.chatId !== active.chatId) return now.characterId ?? null;
+      return now.characterId ?? chat.character_id ?? null;
+    } catch {
+      return null;
     }
   }
 
@@ -979,7 +1003,8 @@ export function setup(ctx: SpindleFrontendContext) {
       // Timeout — load with whatever we have (may be null).
       if (!cancelled) {
         cancelPendingNavLoad = null;
-        void loadFor(ctx.getActiveChat().characterId ?? null);
+        const fallbackCharacterId = await resolveActiveCharacterId();
+        if (!cancelled && ctx.getActiveChat().chatId === expectedChatId) void loadFor(fallbackCharacterId);
       }
     })();
   }
@@ -1034,6 +1059,9 @@ export function setup(ctx: SpindleFrontendContext) {
   if (active.characterId) {
     void loadFor(active.characterId);
   } else {
+    if (active.chatId) {
+      void resolveActiveCharacterId().then((id) => { if (id && ctx.getActiveChat().chatId === active.chatId) void loadFor(id); });
+    }
     void (async () => {
       const presetId = await getActiveLoomPresetId();
       lastPresetId = presetId;
