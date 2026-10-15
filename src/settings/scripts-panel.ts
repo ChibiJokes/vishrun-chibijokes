@@ -23,6 +23,7 @@ import {
   type ScriptTree,
   isFolder,
   makeScript,
+  normalizeScriptTrees,
 } from './script-types';
 import { getActiveCard } from '../state/active-card';
 

@@ -17,6 +17,11 @@ import { hasMacros } from '../core/macro-detection';
 import { resolveMacrosBatch } from '../core/macro-resolver';
 import { getLinearizedBubble, invalidateLinearizedBubble, type OffsetMapEntry } from './linearize-bubble';
 import { VSH_VISHRUN_DIAG } from '../core/diagnostics';
+import { deepContains, deepQuerySelector, deepQuerySelectorAll, hasShadowHost, isNonTextElement, renderedChildNodes } from './shadow-dom';
+import { computePairedAnchor, placeAtAnchor, type PairedAnchor } from './paired-anchor';
+import { fetchMessageContent } from '../lumiverse/fetch-message';
+import { clearPending, hideRange, literalPrefix, literalSuffix, unterminatedRanges } from './pending-hide';
+import { isGenerating, isLatestMessage } from '../state/generation';
 
 // Expanded widget HTML → macro-resolved HTML, for one processNode pass.
 type ResolvedMap = Map<string, string>;
@@ -196,6 +201,7 @@ export async function processNode(
     // an iframe but didn't unmount the host's sandboxFrames record.
     const target = findContentRoot(root);
     cleanupOrphansForMessage(messageId, target);
+    clearPending(target);
 
     // Repair any already-mounted widgets that were left inside Lumiverse's
     // temporary render wrappers by an earlier pass. This is the same DOM
@@ -414,7 +420,17 @@ async function replaceMultiLineMatches(
     matches.push({ start: m.index, end: m.index + m[0].length, match: m });
     if (m[0].length === 0) script.findRe.lastIndex++;
   }
+
+  // A block still being streamed has its opener but not its closer yet.
+  if (isGenerating() && isLatestMessage(messageId)) {
+    const open = literalPrefix(script.findRe.source);
+    const close = literalSuffix(script.findRe.source);
+    for (const [s, e] of unterminatedRanges(linear.text, open, close)) {
+      hideRange(bubble, linear.offsetMap, s, e);
+    }
+  }
   if (matches.length === 0) return 0;
+  for (const { start, end } of matches) hideRange(bubble, linear.offsetMap, start, end);
 
   if (hasRegisteredWidgetsFor(messageId, script.id)) {
     destroyRegisteredWidgetsFor(messageId, script.id);
@@ -443,6 +459,8 @@ async function replaceMultiLineMatches(
       if (widget.tagName === 'IFRAME') {
         destroyWidgetIframe(widget as HTMLIFrameElement);
       }
+      // Never leave raw content hidden when its widget could not be placed.
+      clearPending(bubble);
     }
   }
 
@@ -464,7 +482,7 @@ export function replaceLinearRange(
     if (e.sourceStart < end && end <= e.sourceEnd) endEntry = e;
   }
   if (!startEntry || !endEntry) return false;
-  if (!bubble.contains(startEntry.node) || !bubble.contains(endEntry.node)) return false;
+  if (!deepContains(bubble, startEntry.node) || !deepContains(bubble, endEntry.node)) return false;
 
   const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
   const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
@@ -542,6 +560,7 @@ function normalizeExistingWidgetContainers(target: HTMLElement): void {
     if (widget.isConnected) cleanupEmptyAroundWidget(widget, target);
   }
 }
+const INLINE_RESIDUE_TAGS = new Set(['A', 'SPAN', 'EM', 'STRONG', 'B', 'I', 'U', 'S', 'CODE']);
 
 function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
   let current: Element = widget;
@@ -621,6 +640,11 @@ function isEmptyResidue(node: Node): boolean {
   if (node.nodeType === Node.ELEMENT_NODE) {
     const el = node as HTMLElement;
     if (el.tagName === 'BR') return true;
+    // Range.deleteContents leaves empty shells of partially selected inline
+    // ancestors (e.g. a markdown autolink around a URL capture).
+    if (INLINE_RESIDUE_TAGS.has(el.tagName)) {
+      return (el.textContent ?? '').length === 0 && !el.querySelector('img,svg,video,audio,iframe');
+    }
     if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
     return !(el.textContent ?? '').replace(EMPTY_RESIDUE_RE, '');
   }
@@ -780,7 +804,8 @@ async function renderPairedTagCaptures(
   // fullmatch presence so we don't touch placeholder widgets — those
   // live inside the React-owned markdown subtree and React handles
   // unmount on content change.
-  const existingPaired = target.querySelectorAll<HTMLElement>(
+  const existingPaired = deepQuerySelectorAll<HTMLElement>(
+    target,
     '[data-vishrun-widget][data-vishrun-paired-fullmatch]',
   );
   existingPaired.forEach((el) => {
@@ -808,7 +833,7 @@ async function renderPairedTagCaptures(
   // scan doesn't double-insert).
   for (const cap of captures) {
     const sel = `[data-vishrun-widget][data-vishrun-script-id="${cssEscape(cap.scriptId)}"][data-vishrun-paired-fullmatch="${cssEscape(hashKey(cap.fullMatch))}"]`;
-    if (target.querySelector(sel)) continue;
+    if (deepQuerySelector(target, sel)) continue;
 
     // Re-run findRe on fullMatch to recover the real capture groups.
     // payload.content (which the interceptor delivers) is a single inner
@@ -856,13 +881,29 @@ async function renderPairedTagCaptures(
     // Paired-tag widgets always go through the iframe path (some cards
     // ship <script>). await: buildWidgetIframe may fetch the Tailwind
     // bundle on first use (cached thereafter).
+    if (finalHtml.trim() === '') {
+      // Strip-only scripts (e.g. hiding <UpdateVariable>): the host interceptor
+      // already removed the tag; keep an inert marker for idempotency only.
+      const marker = ctx.dom.createElement('span', {
+        'data-vishrun-widget': cap.scriptName,
+        'data-vishrun-script-id': cap.scriptId,
+        'data-vishrun-paired-fullmatch': hashKey(cap.fullMatch),
+        hidden: '',
+      }) as HTMLElement;
+      if (target.isConnected && !deepQuerySelector(target, sel)) {
+        target.appendChild(marker);
+        added++;
+      }
+      continue;
+    }
+    const anchor = await resolvePairedAnchor(target, messageId, cap.fullMatch, ctx);
     const iframe = await buildWidgetIframe(finalHtml, cap.scriptName, cap.scriptId, messageId, ctx);
     iframe.setAttribute('data-vishrun-paired-fullmatch', hashKey(cap.fullMatch));
     // Re-validate after the await: another scan may have inserted this
     // capture's widget, or a React rebuild may have detached `target`. In
     // either case drop the just-built iframe (releasing its host record) and
     // skip — a later scan re-renders into the current DOM.
-    if (!target.isConnected || target.querySelector(sel)) {
+    if (!target.isConnected || deepQuerySelector(target, sel)) {
       if (VSH_VISHRUN_DIAG) {
         console.log('[vishrun:render] placeholder-skipped', JSON.stringify({
           messageId, scriptId: cap.scriptId,
@@ -872,12 +913,40 @@ async function renderPairedTagCaptures(
       destroyWidgetIframe(iframe);
       continue;
     }
-    target.appendChild(iframe);
+    if (!anchor || !placeAtAnchor(target, anchor, iframe)) target.appendChild(iframe);
     added++;
   }
 
   return added;
 }
+
+// Anchors are only needed when the message renders authored HTML islands;
+// plain markdown messages keep the append-at-end placement.
+const anchorCache = new Map<string, PairedAnchor | null>();
+
+async function resolvePairedAnchor(
+  target: HTMLElement,
+  messageId: string,
+  fullMatch: string,
+  ctx: SpindleFrontendContext,
+): Promise<PairedAnchor | null> {
+  if (!hasShadowHost(target)) return null;
+  const key = messageId + '\u0001' + hashKey(fullMatch);
+  if (anchorCache.has(key)) return anchorCache.get(key) ?? null;
+  const chatId = ctx.getActiveChat().chatId;
+  if (!chatId) return null;
+  let anchor: PairedAnchor | null = null;
+  try {
+    const raw = await fetchMessageContent(chatId, messageId);
+    anchor = raw ? computePairedAnchor(raw, fullMatch) : null;
+  } catch {
+    anchor = null;
+  }
+  if (anchorCache.size > 256) anchorCache.clear();
+  anchorCache.set(key, anchor);
+  return anchor;
+}
+
 
 function findContentRoot(messageNode: HTMLElement): HTMLElement {
   // Prefer MessageContent's own div — keeps widgets visually inside the
@@ -1057,20 +1126,18 @@ async function buildWidget(
 
 function collectTextNodes(root: HTMLElement): Text[] {
   const out: Text[] = [];
-  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
-    acceptNode(node) {
-      let p = node.parentElement;
-      while (p && p !== root) {
-        if (p.hasAttribute('data-vishrun-widget')) return NodeFilter.FILTER_REJECT;
-        p = p.parentElement;
+  const walk = (node: Node): void => {
+    for (const child of renderedChildNodes(node)) {
+      if (child.nodeType === 3) {
+        out.push(child as Text);
+      } else if (child.nodeType === 1) {
+        const el = child as Element;
+        if (el.hasAttribute('data-vishrun-widget') || isNonTextElement(el)) continue;
+        walk(el);
       }
-      return NodeFilter.FILTER_ACCEPT;
-    },
-  });
-  let n: Node | null;
-  while ((n = walker.nextNode()) !== null) {
-    out.push(n as Text);
-  }
+    }
+  };
+  walk(root);
   return out;
 }
 

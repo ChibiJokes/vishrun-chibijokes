@@ -7,6 +7,7 @@ import { fetchMessageContentById } from '../lumiverse/fetch-message';
 import { shouldRescanForChangedFields } from '../core/chat-changed-filter';
 import { allSelf } from '../render/self-mutation';
 import { hasRegisteredWidgetsForMessage } from '../render/widget-iframe';
+import { setGenerating } from '../state/generation';
 
 const MAX_RAF_RETRIES = 3;
 const MESSAGE_LIST_SELECTOR = '[data-component="MessageList"]';
@@ -160,6 +161,15 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
   async function scanAllNow(compiled: CompiledScript[]): Promise<void> {
     const wasObserving = observer !== null && observedTarget !== null;
     if (wasObserving) observer!.disconnect();
+    // While paused, host re-renders (e.g. the final message swap after
+    // streaming) would otherwise go unnoticed until a reload. Record them and
+    // replay after the scan; self mutations are filtered as usual.
+    const missed: MutationRecord[] = [];
+    const watchTarget = wasObserving ? observedTarget : null;
+    const pausedWatcher = watchTarget
+      ? new MutationObserver((records) => { missed.push(...records); })
+      : null;
+    pausedWatcher?.observe(watchTarget!, OBSERVE_OPTS);
     try {
       const nodes = Array.from(document.querySelectorAll('[data-message-id]'));
       const total = nodes.length;
@@ -185,8 +195,13 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       });
       await Promise.all(tasks);
     } finally {
+      if (pausedWatcher) {
+        missed.push(...pausedWatcher.takeRecords());
+        pausedWatcher.disconnect();
+      }
       if (wasObserving && observedTarget && document.contains(observedTarget)) {
         observer!.observe(observedTarget, OBSERVE_OPTS);
+        if (missed.length > 0 && !allSelf(missed)) handleMutations(missed);
       }
     }
   }
@@ -316,7 +331,13 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
     }));
   }
 
+  const unsubGenStarted = ctx.events.on('GENERATION_STARTED', () => { setGenerating(true); });
+  const unsubGenStopped = ctx.events.on('GENERATION_STOPPED', () => {
+    setGenerating(false);
+    rescanAll();
+  });
   const unsubGenEnded = ctx.events.on('GENERATION_ENDED', (payload: unknown) => {
+    setGenerating(false);
     const p = (payload || {}) as GenerationEndedPayload;
     if (p.error) return;
     if (!isActiveChat(p.chatId)) return;
@@ -350,6 +371,8 @@ function processMessageById(messageId: string, retriesLeft: number = MAX_RAF_RET
       teardownTagInterceptors();
       clearEditingMessageIds();
       unsubGenEnded();
+      unsubGenStarted();
+      unsubGenStopped();
       unsubChatChanged();
     },
   };
