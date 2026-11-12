@@ -3,7 +3,7 @@ name: Build Vishrun
 on:
   push:
     branches:
-      - staging
+      - lumi-test
     paths-ignore:
       - "dist/**"
 
