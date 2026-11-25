@@ -22,12 +22,8 @@ function isResolveMacrosResponse(p: unknown, requestId: string): p is ResolveMac
   );
 }
 
-let requestCounter = 0;
-function nextRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `vishrun-rm-${Date.now()}-${++requestCounter}`;
+function nextRequestId(ctx: SpindleFrontendContext): string {
+  return ctx.uuid.v4();
 }
 
 const RESOLVE_TIMEOUT_MS = 5000;
@@ -42,7 +38,7 @@ export function resolveMacrosBatch(
   if (templates.length === 0) return Promise.resolve([]);
 
   return new Promise<string[]>((resolve, reject) => {
-    const requestId = nextRequestId();
+    const requestId = nextRequestId(ctx);
     let settled = false;
     let unsub: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;

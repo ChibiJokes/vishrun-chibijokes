@@ -194,13 +194,13 @@ export class ScriptRunner {
 
   /** Force-restart a single script frame even if its content hasn't changed. */
   reload(scriptId: string): void {
-    this.reloadMemos.set(scriptId, crypto.randomUUID());
+    this.reloadMemos.set(scriptId, this.ctx.uuid.v4());
   }
 
   /** Force-restart all running script frames. */
   reloadAll(): void {
     for (const frame of this.frames.values()) {
-      this.reloadMemos.set(frame.scriptId, crypto.randomUUID());
+      this.reloadMemos.set(frame.scriptId, this.ctx.uuid.v4());
     }
   }
 

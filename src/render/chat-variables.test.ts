@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { test, expect } from 'bun:test';
 import { createContext, runInContext } from 'node:vm';
 import { thHelpersShim } from './th-helpers-shim';
@@ -194,7 +195,7 @@ test('live frames receive direct saves and native metadata events; cleanup remov
 
 test('two iframe writes with identical local request IDs get distinct backend IDs', () => {
   const sent: any[] = [], handlers = new Set<(p: any) => void>();
-  const ctx: any = { sendToBackend: (p: any) => sent.push(p), onBackendMessage: (fn: any) => { handlers.add(fn); return () => handlers.delete(fn); } };
+  const ctx: any = { uuid: { v4: randomUUID }, sendToBackend: (p: any) => sent.push(p), onBackendMessage: (fn: any) => { handlers.add(fn); return () => handlers.delete(fn); } };
   const replies: any[][] = [[], []];
   for (let i = 0; i < 2; ++i) dispatchThRequest({ postMessage: (p: any) => replies[i].push(p) } as any,
     { kind: 'th-request', requestId: 'same', op: 'th-replace-chat-variables', body: { chatId: 'a' } },
@@ -212,6 +213,7 @@ test('real ScriptRunner forwards direct writes, updates sibling scripts and foll
   const frames: any[] = [];
   let active = 'a';
   const ctx: any = {
+    uuid: { v4: randomUUID },
     getActiveChat: () => ({ chatId: active }),
     events: { on: (name: string, fn: any) => {
       if (!events.has(name)) events.set(name, new Set());
@@ -250,7 +252,7 @@ test('real ScriptRunner forwards direct writes, updates sibling scripts and foll
   const runner = new ScriptRunner(ctx);
   let widget: HTMLIFrameElement | undefined;
   try {
-    await runner.run([makeScript({ id: 'one' }), makeScript({ id: 'two' })], 'a');
+    await runner.run([makeScript(randomUUID, { id: 'one' }), makeScript(randomUUID, { id: 'two' })], 'a');
     expect(frames).toHaveLength(2);
     frames.forEach(f => f.load());
     widget = await buildWidgetIframe('<script>window.initialHP = getVariables().hp;</script>', 'test', 'test-widget', 'message', ctx);

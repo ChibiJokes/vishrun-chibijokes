@@ -38,12 +38,8 @@ export function isThRequest(p: unknown): p is ThRequestFromIframe {
   );
 }
 
-let backendRequestCounter = 0;
-function nextBackendRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
+function nextBackendRequestId(ctx: SpindleFrontendContext): string {
+  return ctx.uuid.v4();
 }
 
 export function dispatchThRequest(
@@ -57,7 +53,7 @@ export function dispatchThRequest(
   ctx: SpindleFrontendContext,
 ): void {
   const { requestId, op, body } = request;
-  const backendRequestId = op === 'th-replace-chat-variables' ? nextBackendRequestId() : requestId;
+  const backendRequestId = op === 'th-replace-chat-variables' ? nextBackendRequestId(ctx) : requestId;
   let settled = false;
   let unsub: (() => void) | null = null;
   let timer: ReturnType<typeof setTimeout> | null = null;
@@ -130,7 +126,7 @@ export function fetchMessagesSnapshot(
   timeoutMs: number = TH_TIMEOUT_MS,
 ): Promise<SnapshotMessage[]> {
   return new Promise((resolve) => {
-    const requestId = nextBackendRequestId();
+    const requestId = nextBackendRequestId(ctx);
     let settled = false;
     let unsub: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -205,7 +201,7 @@ export function fetchVariablesSnapshot(
   timeoutMs: number = TH_TIMEOUT_MS,
 ): Promise<MvuData> {
   return new Promise((resolve) => {
-    const requestId = nextBackendRequestId();
+    const requestId = nextBackendRequestId(ctx);
     let settled = false;
     let unsub: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;

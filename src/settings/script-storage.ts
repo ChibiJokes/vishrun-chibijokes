@@ -13,6 +13,7 @@
  * then writes the full merged blob back.
  */
 
+import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import { normalizeScriptTrees, isFolder, type Script, type ScriptTree } from './script-types';
 
 const BASE = '/api/v1';
@@ -37,11 +38,13 @@ async function putJson(url: string, body: unknown): Promise<void> {
 }
 
 export class ScriptStorageClient {
+  constructor(private readonly ctx: SpindleFrontendContext) {}
+
   // ── Global ──────────────────────────────────────────────────────────
 
   async loadGlobal(): Promise<ScriptTree[]> {
     const row = await getJson(`${BASE}/settings/${GLOBAL_KEY}`) as { value?: { scripts?: unknown[] } } | null;
-    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!) : [];
+    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!, () => this.ctx.uuid.v4()) : [];
   }
 
   async saveGlobal(scripts: ScriptTree[]): Promise<void> {
@@ -53,7 +56,7 @@ export class ScriptStorageClient {
   async loadPreset(presetId: string | null): Promise<ScriptTree[]> {
     if (!presetId) return [];
     const row = await getJson(`${BASE}/settings/${presetKey(presetId)}`) as { value?: { scripts?: unknown[] } } | null;
-    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!) : [];
+    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row!.value!.scripts!, () => this.ctx.uuid.v4()) : [];
   }
 
   async savePreset(presetId: string | null, scripts: ScriptTree[]): Promise<void> {
@@ -68,7 +71,7 @@ export class ScriptStorageClient {
       extensions?: { tavern_helper?: { scripts?: unknown[] } };
     } | null;
     const scripts = char?.extensions?.tavern_helper?.scripts;
-    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
+    return Array.isArray(scripts) ? normalizeScriptTrees(scripts, () => this.ctx.uuid.v4()) : [];
   }
 
   /**
@@ -124,6 +127,7 @@ function flattenEnabled(trees: ScriptTree[]): Script[] {
 }
 
 export async function loadEnabledScripts(
+  ctx: SpindleFrontendContext,
   characterId: string | null,
   presetId: string | null,
 ): Promise<Script[]> {
@@ -134,7 +138,7 @@ export async function loadEnabledScripts(
       ? localStorage.getItem(`vsh_section_enabled_${t}`) !== 'false'
       : true;
 
-  const storage = new ScriptStorageClient();
+  const storage = new ScriptStorageClient(ctx);
   const [global, preset, char] = await Promise.all([
     secOn('global')    ? storage.loadGlobal()                    : Promise.resolve([] as ScriptTree[]),
     secOn('preset')    ? storage.loadPreset(presetId)             : Promise.resolve([] as ScriptTree[]),
@@ -154,8 +158,8 @@ export async function loadEnabledScripts(
 // 200 + empty arrays instead of 404. Call once during extension setup.
 // Uses PUT-if-missing: fetches first; only writes if the key isn't there yet.
 
-export async function initScriptStorage(): Promise<void> {
-  const storage = new ScriptStorageClient();
+export async function initScriptStorage(ctx: SpindleFrontendContext): Promise<void> {
+  const storage = new ScriptStorageClient(ctx);
 
   const globalResp = await fetch(`${BASE}/settings/${GLOBAL_KEY}`, { credentials: 'same-origin' });
   if (!globalResp.ok) await storage.saveGlobal([]);

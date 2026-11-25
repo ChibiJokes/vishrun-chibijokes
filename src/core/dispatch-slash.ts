@@ -32,12 +32,8 @@ function isDispatchSlashResponse(p: unknown, requestId: string): p is DispatchSl
   );
 }
 
-let requestCounter = 0;
-function nextRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `vishrun-ds-${Date.now()}-${++requestCounter}`;
+function nextRequestId(ctx: SpindleFrontendContext): string {
+  return ctx.uuid.v4();
 }
 
 const DISPATCH_TIMEOUT_MS = 5000;
@@ -49,7 +45,7 @@ export function dispatchSlashViaBackend(
   timeoutMs = DISPATCH_TIMEOUT_MS,
 ): Promise<DispatchSlashResult> {
   return new Promise<DispatchSlashResult>((resolve, reject) => {
-    const requestId = nextRequestId();
+    const requestId = nextRequestId(ctx);
     let settled = false;
     let unsub: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;
