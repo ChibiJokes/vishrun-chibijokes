@@ -379,7 +379,7 @@ export function createScriptsPanel(
   onScriptsSaved?: () => void,
   onReloadScript?: OnReloadScript,
 ): ScriptsPanel {
-  const storage = new ScriptStorageClient();
+  const storage = new ScriptStorageClient(ctx);
   const removeStyle = ctx.dom.addStyle(CSS);
 
   // ── State ──────────────────────────────────────────────────────────
@@ -466,7 +466,8 @@ export function createScriptsPanel(
         const text = await file.text();
         const parsed = JSON.parse(text);
         const trees: ScriptTree[] = normalizeScriptTrees(
-          Array.isArray(parsed) ? parsed : (parsed.scripts ?? [])
+          Array.isArray(parsed) ? parsed : (parsed.scripts ?? []),
+          () => ctx.uuid.v4()
         );
         // ID conflict resolution — matching JSLR's useResolveIdConflict
         const allIds = new Set([
@@ -474,7 +475,7 @@ export function createScriptsPanel(
         ].map(t => t.id));
         const deduped = trees.map(tree => {
           if (allIds.has(tree.id)) {
-            return { ...tree, id: crypto.randomUUID() };
+            return { ...tree, id: ctx.uuid.v4() };
           }
           return tree;
         });
@@ -976,7 +977,7 @@ export function createScriptsPanel(
   // ── Add / save / refresh ───────────────────────────────────────────
   function addScript(target: Target) {
     if (target === 'character' && !currentCharId) return;
-    getList(target).push(makeScript({ name: 'New Script' }));
+    getList(target).push(makeScript(() => ctx.uuid.v4(), { name: 'New Script' }));
     saveTarget(target);
     refreshTarget(target);
   }
@@ -987,7 +988,7 @@ export function createScriptsPanel(
       type: 'folder',
       enabled: true,
       name: 'New Folder',
-      id: crypto.randomUUID(),
+      id: ctx.uuid.v4(),
       icon: 'fa-solid fa-folder',
       color: '#888888',
       scripts: [],

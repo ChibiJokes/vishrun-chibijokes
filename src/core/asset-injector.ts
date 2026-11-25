@@ -43,12 +43,8 @@ function isFetchExternalResponse(p: unknown, requestId: string): p is FetchExter
   );
 }
 
-let requestCounter = 0;
-function nextRequestId(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
-  }
-  return `vishrun-fx-${Date.now()}-${++requestCounter}`;
+function nextRequestId(ctx: SpindleFrontendContext): string {
+  return ctx.uuid.v4();
 }
 
 /**
@@ -64,7 +60,7 @@ export function fetchViaBackend(
   timeoutMs = 30000,
 ): Promise<string> {
   return new Promise<string>((resolve, reject) => {
-    const requestId = nextRequestId();
+    const requestId = nextRequestId(ctx);
     let settled = false;
     let unsub: (() => void) | null = null;
     let timer: ReturnType<typeof setTimeout> | null = null;

@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { test, expect, beforeEach } from 'bun:test';
 import type { SpindleFrontendContext } from 'lumiverse-spindle-types';
 import {
@@ -23,6 +24,7 @@ function makeFakeBackend(): FakeBackend {
   const listeners = new Set<(p: unknown) => void>();
 
   const ctx = {
+    uuid: { v4: randomUUID },
     getActiveChat: () => ({ chatId: 'chatX', characterId: null }),
     sendToBackend: (payload: unknown) => {
       const p = payload as { type?: string; requestId?: string; url?: string };

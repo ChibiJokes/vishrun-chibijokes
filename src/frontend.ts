@@ -118,7 +118,7 @@ export function setup(ctx: SpindleFrontendContext) {
     operation: string,
     args: unknown[] = [],
   ): Promise<unknown> => {
-    const requestId = crypto.randomUUID();
+    const requestId = ctx.uuid.v4();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!pendingNativeResources.has(requestId)) return;
@@ -765,7 +765,7 @@ export function setup(ctx: SpindleFrontendContext) {
   });
 
   (window as any).__vishrunGenerate = (opts: unknown, signalArg?: AbortSignal) => {
-    const requestId = crypto.randomUUID();
+    const requestId = ctx.uuid.v4();
     const raw = (opts && typeof opts === 'object') ? (opts as Record<string, unknown>) : {};
     const embeddedSignal = raw.signal as AbortSignal | undefined;
     const signal = signalArg || embeddedSignal;
@@ -814,7 +814,7 @@ export function setup(ctx: SpindleFrontendContext) {
   async function reloadRunner(): Promise<void> {
     const active = ctx.getActiveChat();
     const presetId = await getActiveLoomPresetId();
-    const enabledScripts = await loadEnabledScripts(active.characterId ?? null, presetId);
+    const enabledScripts = await loadEnabledScripts(ctx, active.characterId ?? null, presetId);
     await runner.run(enabledScripts, active.chatId ?? null);
   }
 
@@ -830,7 +830,7 @@ export function setup(ctx: SpindleFrontendContext) {
   }, onReloadScript);
 
   // Pre-create settings keys so subsequent GETs return 200 instead of 404.
-  void initScriptStorage();
+  void initScriptStorage(ctx);
 
   let inflightCharacterId: string | null = null;
   let lastLoadedCharacterId: string | null = null;
@@ -849,7 +849,7 @@ export function setup(ctx: SpindleFrontendContext) {
       // Pass an empty list — runner.run() will tear down character frames
       // (no longer in the incoming list) while leaving globals/presets untouched
       // since they aren't in the frame map under any characterId key.
-      const enabledScripts = await loadEnabledScripts(null, presetId);
+      const enabledScripts = await loadEnabledScripts(ctx, null, presetId);
       await runner.run(enabledScripts, null);
       hooks.rescanAll();
       return;
@@ -865,7 +865,7 @@ export function setup(ctx: SpindleFrontendContext) {
       console.warn('[vishrun:diag] loadFor: same character, re-using cached card');
       hooks.rescanAll();
       const chatId = ctx.getActiveChat().chatId ?? null;
-      const enabledScripts = await loadEnabledScripts(characterId, await getActiveLoomPresetId());
+      const enabledScripts = await loadEnabledScripts(ctx, characterId, await getActiveLoomPresetId());
       console.log('[vishrun:diag] loadFor(cache-hit) reconciling', enabledScripts.length, 'scripts, chatId:', chatId);
       await runner.run(enabledScripts, chatId);
       return;
@@ -875,7 +875,7 @@ export function setup(ctx: SpindleFrontendContext) {
       const presetId = await getActiveLoomPresetId();
       const [char, enabledScripts] = await Promise.all([
         fetchCharacter(characterId),
-        loadEnabledScripts(characterId, presetId),
+        loadEnabledScripts(ctx, characterId, presetId),
       ]);
       console.log('[vishrun:diag] loadEnabledScripts returned', enabledScripts.length, 'scripts:', enabledScripts.map(s => s.name));
       const scripts = extractRegexScripts(char);
@@ -1047,7 +1047,7 @@ export function setup(ctx: SpindleFrontendContext) {
           lastPresetId = newPresetId;
           scriptsPanel?.onPresetChanged(newPresetId);
           const active = ctx.getActiveChat();
-          const enabledScripts = await loadEnabledScripts(active.characterId ?? null, newPresetId);
+          const enabledScripts = await loadEnabledScripts(ctx, active.characterId ?? null, newPresetId);
           await runner.run(enabledScripts, active.chatId ?? null);
         }
       })();

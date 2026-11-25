@@ -57,12 +57,12 @@ export function isFolder(tree: ScriptTree): tree is ScriptFolder {
 }
 
 /** Create a new Script with safe defaults. */
-export function makeScript(partial: Partial<Script> = {}): Script {
+export function makeScript(newId: () => string, partial: Partial<Script> = {}): Script {
   return {
     type: 'script',
     enabled: partial.enabled ?? true,
     name: partial.name ?? 'New Script',
-    id: partial.id ?? crypto.randomUUID(),
+    id: partial.id ?? newId(),
     content: partial.content ?? '',
     info: partial.info ?? '',
     button: partial.button ?? { enabled: true, buttons: [] },
@@ -75,7 +75,7 @@ export function makeScript(partial: Partial<Script> = {}): Script {
  * Parse an unknown value (typically from tavern_helper.scripts) into a
  * ScriptTree. Returns null for unrecognisable input rather than throwing.
  */
-export function normalizeScriptTree(raw: unknown): ScriptTree | null {
+export function normalizeScriptTree(raw: unknown, newId: () => string): ScriptTree | null {
   if (!raw || typeof raw !== 'object') return null;
   const r = raw as Record<string, unknown>;
 
@@ -84,19 +84,19 @@ export function normalizeScriptTree(raw: unknown): ScriptTree | null {
       type: 'folder',
       enabled: typeof r.enabled === 'boolean' ? r.enabled : true,
       name: typeof r.name === 'string' ? r.name : '',
-      id: typeof r.id === 'string' ? r.id : crypto.randomUUID(),
+      id: typeof r.id === 'string' ? r.id : newId(),
       icon: typeof r.icon === 'string' ? r.icon : 'fa-solid fa-folder',
       color: typeof r.color === 'string' ? r.color : '#888888',
       scripts: Array.isArray(r.scripts)
         ? (r.scripts
-            .map(normalizeScriptTree)
+            .map(item => normalizeScriptTree(item, newId))
             .filter((s): s is Script => s !== null && s.type === 'script'))
         : [],
     };
   }
 
   // Handles both type:'script' and legacy bare objects from older JSLR exports.
-  return makeScript({
+  return makeScript(newId, {
     enabled: typeof r.enabled === 'boolean' ? r.enabled : true,
     name:
       typeof r.name === 'string'
@@ -104,7 +104,7 @@ export function normalizeScriptTree(raw: unknown): ScriptTree | null {
         : typeof r.scriptName === 'string'
           ? r.scriptName
           : '',
-    id: typeof r.id === 'string' ? r.id : crypto.randomUUID(),
+    id: typeof r.id === 'string' ? r.id : newId(),
     content: typeof r.content === 'string' ? r.content : '',
     info: typeof r.info === 'string' ? r.info : '',
     button:
@@ -122,6 +122,6 @@ export function normalizeScriptTree(raw: unknown): ScriptTree | null {
   });
 }
 
-export function normalizeScriptTrees(raw: unknown[]): ScriptTree[] {
-  return raw.map(normalizeScriptTree).filter((s): s is ScriptTree => s !== null);
+export function normalizeScriptTrees(raw: unknown[], newId: () => string): ScriptTree[] {
+  return raw.map(item => normalizeScriptTree(item, newId)).filter((s): s is ScriptTree => s !== null);
 }

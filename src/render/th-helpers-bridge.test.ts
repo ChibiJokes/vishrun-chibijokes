@@ -1,3 +1,4 @@
+import { randomUUID } from 'node:crypto';
 import { test, expect, beforeEach, mock } from 'bun:test';
 import {
   computeMessageIndexInChat,
@@ -46,6 +47,7 @@ interface FakeFrame {
 }
 
 interface FakeCtx {
+  uuid: { v4: () => string };
   sent: unknown[];
   listeners: Array<(p: unknown) => void>;
   sendToBackend(p: unknown): void;
@@ -62,6 +64,7 @@ function makeFakeFrame(): FakeFrame {
 function makeFakeCtx(): FakeCtx {
   const listeners: Array<(p: unknown) => void> = [];
   return {
+    uuid: { v4: randomUUID },
     sent: [],
     listeners,
     sendToBackend(p: unknown) { this.sent.push(p); },
@@ -186,6 +189,7 @@ test('fetchMessagesSnapshot falls back to [] when sendToBackend throws', async (
   try {
     const listeners: Array<(p: unknown) => void> = [];
     const ctx = {
+      uuid: { v4: randomUUID },
       sendToBackend: () => { throw new Error('worker dead'); },
       onBackendMessage(h: (p: unknown) => void) {
         listeners.push(h);
