@@ -22,6 +22,7 @@ import { computePairedAnchor, placeAtAnchor, type PairedAnchor } from './paired-
 import { fetchMessageContent } from '../lumiverse/fetch-message';
 import { clearPending, hideRange, literalPrefix, literalSuffix, unterminatedRanges } from './pending-hide';
 import { isGenerating, isLatestMessage } from '../state/generation';
+import { isReactManagedNode, deleteRangePreservingReactHosts } from './react-host-boundary';
 
 // Expanded widget HTML → macro-resolved HTML, for one processNode pass.
 type ResolvedMap = Map<string, string>;
@@ -483,6 +484,7 @@ export function replaceLinearRange(
   }
   if (!startEntry || !endEntry) return false;
   if (!deepContains(bubble, startEntry.node) || !deepContains(bubble, endEntry.node)) return false;
+  if (startEntry.node.getRootNode() !== endEntry.node.getRootNode()) return false;
 
   const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
   const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
@@ -494,8 +496,8 @@ export function replaceLinearRange(
   } catch {
     return false;
   }
-  range.deleteContents();
-  range.insertNode(widget);
+  const insertion = deleteRangePreservingReactHosts(range);
+  insertion.insertNode(widget);
   cleanupEmptyAroundWidget(widget, bubble);
   return true;
 }
@@ -562,7 +564,7 @@ function normalizeExistingWidgetContainers(target: HTMLElement): void {
 }
 const INLINE_RESIDUE_TAGS = new Set(['A', 'SPAN', 'EM', 'STRONG', 'B', 'I', 'U', 'S', 'CODE']);
 
-function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
+export function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): void {
   let current: Element = widget;
   for (;;) {
     const parent = current.parentElement;
@@ -574,19 +576,21 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
     let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
-      if (isEmptyResidue(prev) || isTransparentEmptyResidue(prev)) prev.parentNode?.removeChild(prev);
+      if (isEmptyResidue(prev)) prev.parentNode?.removeChild(prev);
       else break;
       prev = next;
     }
     let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
-      if (isEmptyResidue(nxt) || isTransparentEmptyResidue(nxt)) nxt.parentNode?.removeChild(nxt);
+      if (isEmptyResidue(nxt)) nxt.parentNode?.removeChild(nxt);
       else break;
       nxt = next;
     }
 
-    if (parent === stopAt) break;
+    // Never hoist through a JSX host. React will later remove this very node
+    // from its original parent. We still physically prune its raw HTML children.
+    if (parent === stopAt || isReactManagedNode(parent)) break;
 
     const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
     const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
@@ -599,7 +603,7 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
       // the host DOM and an extension sandbox come from different JS realms.
       while (parent.firstChild) {
         const child = parent.firstChild;
-        if (isEmptyResidue(child) || isTransparentEmptyResidue(child)) {
+        if (isEmptyResidue(child)) {
           parent.removeChild(child);
         } else {
           grandparent.insertBefore(child, parent);
@@ -615,7 +619,7 @@ function cleanupEmptyAroundWidget(widget: HTMLElement, stopAt: HTMLElement): voi
 
 function containsOnlyWidgetsAndResidue(container: Element): boolean {
   return Array.from(container.childNodes).every((node) =>
-    isWidgetNode(node) || isEmptyResidue(node) || isTransparentEmptyResidue(node),
+    (isWidgetNode(node) && !isReactManagedNode(node)) || isEmptyResidue(node),
   );
 }
 
@@ -624,31 +628,21 @@ function isWidgetNode(node: Node): boolean {
     && (node as Element).hasAttribute('data-vishrun-widget');
 }
 
-function isTransparentEmptyResidue(node: Node): boolean {
-  if (node.nodeType !== Node.ELEMENT_NODE) return false;
-  const el = node as HTMLElement;
-  if (!TRANSPARENT_WIDGET_WRAPPER_TAGS.has(el.tagName)) return false;
-  return Array.from(el.childNodes).every((child) =>
-    isEmptyResidue(child) || isTransparentEmptyResidue(child),
-  );
-}
-
 function isEmptyResidue(node: Node): boolean {
+  // A protected host or a widget is never empty, even if it has no text.
+  // Recurse through known residue tags instead of using textContent: an iframe,
+  // image, shadow island, or nested protected host may have zero text.
+  if (isReactManagedNode(node) || isWidgetNode(node)) return false;
   if (node.nodeType === Node.TEXT_NODE) {
     return !(node.nodeValue ?? '').replace(EMPTY_RESIDUE_RE, '');
   }
-  if (node.nodeType === Node.ELEMENT_NODE) {
-    const el = node as HTMLElement;
-    if (el.tagName === 'BR') return true;
-    // Range.deleteContents leaves empty shells of partially selected inline
-    // ancestors (e.g. a markdown autolink around a URL capture).
-    if (INLINE_RESIDUE_TAGS.has(el.tagName)) {
-      return (el.textContent ?? '').length === 0 && !el.querySelector('img,svg,video,audio,iframe');
-    }
-    if (!MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
-    return !(el.textContent ?? '').replace(EMPTY_RESIDUE_RE, '');
-  }
-  return false;
+  if (node.nodeType !== Node.ELEMENT_NODE) return false;
+  const el = node as HTMLElement;
+  if (el.shadowRoot || el.hasAttribute('data-lumiverse-html-island') ||
+      el.hasAttribute('data-vishrun-jslr-source-host')) return false;
+  if (el.tagName === 'BR') return true;
+  if (!INLINE_RESIDUE_TAGS.has(el.tagName) && !MULTILINE_BLOCK_TAGS.has(el.tagName)) return false;
+  return Array.from(el.childNodes).every(isEmptyResidue);
 }
 
 // ─── Placeholder pipeline ──────────────────────────────────────────────
@@ -704,6 +698,7 @@ async function replacePlaceholderMatches(
     }
     if (ranges.length === 0) continue;
 
+    if (isReactManagedNode(tn)) continue;
     const parent = tn.parentNode;
     // Stale text node: a React subtree rebuild during an earlier iteration's
     // await detached `tn` (or its parent). Skip — a later scan re-collects.
