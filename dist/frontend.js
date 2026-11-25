@@ -3323,6 +3323,61 @@ async function fetchMessageContent(chatId, messageId) {
   return m ? m.content : null;
 }
 
+// src/render/react-host-boundary.ts
+function isReactManagedNode(node) {
+  if (Object.getOwnPropertyNames(node).some((key) => key.startsWith("__reactFiber$") || key.startsWith("__reactInternalInstance$") || key.startsWith("__reactProps$") || key.startsWith("__reactContainer$")))
+    return true;
+  if (node.nodeType !== 1)
+    return false;
+  const el = node;
+  return el.getAttribute("data-component") === "MessageContent" || el.tagName === "DIV" && Array.from(el.classList).some((name) => /^(?:_?(?:prose|longMessageBody))(?:_|$)/.test(name));
+}
+function partitionRange(range) {
+  const hosts = [];
+  const walk = (parent) => {
+    Array.from(parent.childNodes).forEach((child, index) => {
+      if (!range.intersectsNode(child))
+        return;
+      if (isReactManagedNode(child) && range.comparePoint(parent, index) === 0 && range.comparePoint(parent, index + 1) === 0) {
+        hosts.push(child);
+        return;
+      }
+      walk(child);
+    });
+  };
+  walk(range.commonAncestorContainer);
+  if (!hosts.length)
+    return [range];
+  const parts = [];
+  let tail = range.cloneRange();
+  for (const host of hosts) {
+    const before = tail.cloneRange();
+    before.setEndBefore(host);
+    if (!before.collapsed)
+      parts.push(before);
+    const inside = range.cloneRange();
+    inside.selectNodeContents(host);
+    if (!inside.collapsed)
+      parts.push(...partitionRange(inside));
+    tail.setStartAfter(host);
+  }
+  if (!tail.collapsed)
+    parts.push(tail);
+  return parts;
+}
+function deleteRangePreservingReactHosts(range) {
+  const parts = partitionRange(range);
+  if (parts.length === 1 && parts[0] === range) {
+    range.deleteContents();
+    return range;
+  }
+  const insertion = range.cloneRange();
+  insertion.collapse(true);
+  for (let i = parts.length - 1;i >= 0; i--)
+    parts[i].deleteContents();
+  return insertion;
+}
+
 // src/render/pending-hide.ts
 var PENDING_ATTR = "data-vishrun-pending";
 var META = new Set(["\\", "^", "$", ".", "|", "?", "*", "+", "(", ")", "[", "]", "{", "}"]);
@@ -3425,7 +3480,7 @@ function hideRange(bubble, offsetMap, start, end) {
       continue;
     let el = e.node.parentElement;
     let best = null;
-    while (el && el !== bubble) {
+    while (el && el !== bubble && !isReactManagedNode(el)) {
       const s = span(el);
       if (!s || s[0] < start || s[1] > end)
         break;
@@ -3692,6 +3747,8 @@ function replaceLinearRange(bubble, offsetMap, start, end, widget) {
     return false;
   if (!deepContains(bubble, startEntry.node) || !deepContains(bubble, endEntry.node))
     return false;
+  if (startEntry.node.getRootNode() !== endEntry.node.getRootNode())
+    return false;
   const startNodeOffset = start - startEntry.sourceStart + startEntry.nodeStart;
   const endNodeOffset = end - endEntry.sourceStart + endEntry.nodeStart;
   let range;
@@ -3702,8 +3759,8 @@ function replaceLinearRange(bubble, offsetMap, start, end, widget) {
   } catch {
     return false;
   }
-  range.deleteContents();
-  range.insertNode(widget);
+  const insertion = deleteRangePreservingReactHosts(range);
+  insertion.insertNode(widget);
   cleanupEmptyAroundWidget(widget, bubble);
   return true;
 }
@@ -3772,7 +3829,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     let prev = current.previousSibling;
     while (prev) {
       const next = prev.previousSibling;
-      if (isEmptyResidue(prev) || isTransparentEmptyResidue(prev))
+      if (isEmptyResidue(prev))
         prev.parentNode?.removeChild(prev);
       else
         break;
@@ -3781,13 +3838,13 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
     let nxt = current.nextSibling;
     while (nxt) {
       const next = nxt.nextSibling;
-      if (isEmptyResidue(nxt) || isTransparentEmptyResidue(nxt))
+      if (isEmptyResidue(nxt))
         nxt.parentNode?.removeChild(nxt);
       else
         break;
       nxt = next;
     }
-    if (parent === stopAt)
+    if (parent === stopAt || isReactManagedNode(parent))
       break;
     const transparentInline = TRANSPARENT_WIDGET_WRAPPER_TAGS.has(parent.tagName);
     const knownBlock = MULTILINE_BLOCK_TAGS.has(parent.tagName);
@@ -3797,7 +3854,7 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
         break;
       while (parent.firstChild) {
         const child = parent.firstChild;
-        if (isEmptyResidue(child) || isTransparentEmptyResidue(child)) {
+        if (isEmptyResidue(child)) {
           parent.removeChild(child);
         } else {
           grandparent.insertBefore(child, parent);
@@ -3810,35 +3867,27 @@ function cleanupEmptyAroundWidget(widget, stopAt) {
   }
 }
 function containsOnlyWidgetsAndResidue(container) {
-  return Array.from(container.childNodes).every((node) => isWidgetNode(node) || isEmptyResidue(node) || isTransparentEmptyResidue(node));
+  return Array.from(container.childNodes).every((node) => isWidgetNode(node) && !isReactManagedNode(node) || isEmptyResidue(node));
 }
 function isWidgetNode(node) {
   return node.nodeType === Node.ELEMENT_NODE && node.hasAttribute("data-vishrun-widget");
 }
-function isTransparentEmptyResidue(node) {
-  if (node.nodeType !== Node.ELEMENT_NODE)
-    return false;
-  const el = node;
-  if (!TRANSPARENT_WIDGET_WRAPPER_TAGS.has(el.tagName))
-    return false;
-  return Array.from(el.childNodes).every((child) => isEmptyResidue(child) || isTransparentEmptyResidue(child));
-}
 function isEmptyResidue(node) {
+  if (isReactManagedNode(node) || isWidgetNode(node))
+    return false;
   if (node.nodeType === Node.TEXT_NODE) {
     return !(node.nodeValue ?? "").replace(EMPTY_RESIDUE_RE, "");
   }
-  if (node.nodeType === Node.ELEMENT_NODE) {
-    const el = node;
-    if (el.tagName === "BR")
-      return true;
-    if (INLINE_RESIDUE_TAGS.has(el.tagName)) {
-      return (el.textContent ?? "").length === 0 && !el.querySelector("img,svg,video,audio,iframe");
-    }
-    if (!MULTILINE_BLOCK_TAGS.has(el.tagName))
-      return false;
-    return !(el.textContent ?? "").replace(EMPTY_RESIDUE_RE, "");
-  }
-  return false;
+  if (node.nodeType !== Node.ELEMENT_NODE)
+    return false;
+  const el = node;
+  if (el.shadowRoot || el.hasAttribute("data-lumiverse-html-island") || el.hasAttribute("data-vishrun-jslr-source-host"))
+    return false;
+  if (el.tagName === "BR")
+    return true;
+  if (!INLINE_RESIDUE_TAGS.has(el.tagName) && !MULTILINE_BLOCK_TAGS.has(el.tagName))
+    return false;
+  return Array.from(el.childNodes).every(isEmptyResidue);
 }
 async function replacePlaceholderMatches(root, script, allScripts, messageId, ctx, resolvedMap) {
   const textNodes = collectTextNodes(root);
@@ -3870,6 +3919,8 @@ async function replacePlaceholderMatches(root, script, allScripts, messageId, ct
         script.findRe.lastIndex++;
     }
     if (ranges.length === 0)
+      continue;
+    if (isReactManagedNode(tn))
       continue;
     const parent = tn.parentNode;
     if (!parent || !parent.isConnected) {
