@@ -565,17 +565,13 @@ function isDispatchSlashResponse(p, requestId) {
   const r = p;
   return r.type === "dispatch_slash_text_response" && r.requestId === requestId && typeof r.handled === "boolean" && typeof r.kind === "string";
 }
-var requestCounter = 0;
-function nextRequestId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `vishrun-ds-${Date.now()}-${++requestCounter}`;
+function nextRequestId(ctx) {
+  return ctx.uuid.v4();
 }
 var DISPATCH_TIMEOUT_MS = 5000;
 function dispatchSlashViaBackend(ctx, chatId, text, timeoutMs = DISPATCH_TIMEOUT_MS) {
   return new Promise((resolve, reject) => {
-    const requestId = nextRequestId();
+    const requestId = nextRequestId(ctx);
     let settled = false;
     let unsub = null;
     let timer = null;
@@ -733,16 +729,12 @@ var VSH_VISHRUN_DIAG = false;
 function isFetchExternalResponse(p, requestId) {
   return !!p && typeof p === "object" && p.type === "fetch_external_response" && p.requestId === requestId;
 }
-var requestCounter2 = 0;
-function nextRequestId2() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `vishrun-fx-${Date.now()}-${++requestCounter2}`;
+function nextRequestId2(ctx) {
+  return ctx.uuid.v4();
 }
 function fetchViaBackend(url, ctx, timeoutMs = 30000) {
   return new Promise((resolve, reject) => {
-    const requestId = nextRequestId2();
+    const requestId = nextRequestId2(ctx);
     let settled = false;
     let unsub = null;
     let timer = null;
@@ -1656,16 +1648,12 @@ function isThRequest(p) {
   const r = p;
   return r.kind === "th-request" && typeof r.requestId === "string" && typeof r.op === "string" && !!r.body && typeof r.body === "object";
 }
-var backendRequestCounter = 0;
-function nextBackendRequestId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `vishrun-th-${Date.now()}-${++backendRequestCounter}`;
+function nextBackendRequestId(ctx) {
+  return ctx.uuid.v4();
 }
 function dispatchThRequest(frame, request, context, ctx) {
   const { requestId, op, body } = request;
-  const backendRequestId = op === "th-replace-chat-variables" ? nextBackendRequestId() : requestId;
+  const backendRequestId = op === "th-replace-chat-variables" ? nextBackendRequestId(ctx) : requestId;
   let settled = false;
   let unsub = null;
   let timer = null;
@@ -1718,7 +1706,7 @@ function dispatchThRequest(frame, request, context, ctx) {
 }
 function fetchMessagesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const requestId = nextBackendRequestId();
+    const requestId = nextBackendRequestId(ctx);
     let settled = false;
     let unsub = null;
     let timer = null;
@@ -1770,7 +1758,7 @@ function fetchMessagesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
 }
 function fetchVariablesSnapshot(context, ctx, timeoutMs = TH_TIMEOUT_MS) {
   return new Promise((resolve) => {
-    const requestId = nextBackendRequestId();
+    const requestId = nextBackendRequestId(ctx);
     let settled = false;
     let unsub = null;
     let timer = null;
@@ -3091,19 +3079,15 @@ function hasMacros(html) {
 function isResolveMacrosResponse(p, requestId) {
   return !!p && typeof p === "object" && p.type === "resolve_macros_response" && p.requestId === requestId && Array.isArray(p.results);
 }
-var requestCounter3 = 0;
-function nextRequestId3() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
-  }
-  return `vishrun-rm-${Date.now()}-${++requestCounter3}`;
+function nextRequestId3(ctx) {
+  return ctx.uuid.v4();
 }
 var RESOLVE_TIMEOUT_MS = 5000;
 function resolveMacrosBatch(ctx, chatId, characterId, templates, timeoutMs = RESOLVE_TIMEOUT_MS) {
   if (templates.length === 0)
     return Promise.resolve([]);
   return new Promise((resolve, reject) => {
-    const requestId = nextRequestId3();
+    const requestId = nextRequestId3(ctx);
     let settled = false;
     let unsub = null;
     let timer = null;
@@ -4592,12 +4576,12 @@ function installStatusBarInjectHook(ctx, io = defaultIO()) {
 function isFolder(tree) {
   return tree.type === "folder";
 }
-function makeScript(partial = {}) {
+function makeScript(newId, partial = {}) {
   return {
     type: "script",
     enabled: partial.enabled ?? true,
     name: partial.name ?? "New Script",
-    id: partial.id ?? crypto.randomUUID(),
+    id: partial.id ?? newId(),
     content: partial.content ?? "",
     info: partial.info ?? "",
     button: partial.button ?? { enabled: true, buttons: [] },
@@ -4605,7 +4589,7 @@ function makeScript(partial = {}) {
     export_with: partial.export_with ?? { data: true, button: true }
   };
 }
-function normalizeScriptTree(raw) {
+function normalizeScriptTree(raw, newId) {
   if (!raw || typeof raw !== "object")
     return null;
   const r = raw;
@@ -4614,16 +4598,16 @@ function normalizeScriptTree(raw) {
       type: "folder",
       enabled: typeof r.enabled === "boolean" ? r.enabled : true,
       name: typeof r.name === "string" ? r.name : "",
-      id: typeof r.id === "string" ? r.id : crypto.randomUUID(),
+      id: typeof r.id === "string" ? r.id : newId(),
       icon: typeof r.icon === "string" ? r.icon : "fa-solid fa-folder",
       color: typeof r.color === "string" ? r.color : "#888888",
-      scripts: Array.isArray(r.scripts) ? r.scripts.map(normalizeScriptTree).filter((s) => s !== null && s.type === "script") : []
+      scripts: Array.isArray(r.scripts) ? r.scripts.map((item) => normalizeScriptTree(item, newId)).filter((s) => s !== null && s.type === "script") : []
     };
   }
-  return makeScript({
+  return makeScript(newId, {
     enabled: typeof r.enabled === "boolean" ? r.enabled : true,
     name: typeof r.name === "string" ? r.name : typeof r.scriptName === "string" ? r.scriptName : "",
-    id: typeof r.id === "string" ? r.id : crypto.randomUUID(),
+    id: typeof r.id === "string" ? r.id : newId(),
     content: typeof r.content === "string" ? r.content : "",
     info: typeof r.info === "string" ? r.info : "",
     button: r.button && typeof r.button === "object" ? r.button : { enabled: true, buttons: [] },
@@ -4631,8 +4615,8 @@ function normalizeScriptTree(raw) {
     export_with: r.export_with && typeof r.export_with === "object" ? r.export_with : { data: true, button: true }
   });
 }
-function normalizeScriptTrees(raw) {
-  return raw.map(normalizeScriptTree).filter((s) => s !== null);
+function normalizeScriptTrees(raw, newId) {
+  return raw.map((item) => normalizeScriptTree(item, newId)).filter((s) => s !== null);
 }
 
 // src/settings/script-storage.ts
@@ -4657,9 +4641,13 @@ async function putJson(url, body) {
 }
 
 class ScriptStorageClient {
+  ctx;
+  constructor(ctx) {
+    this.ctx = ctx;
+  }
   async loadGlobal() {
     const row = await getJson(`${BASE}/settings/${GLOBAL_KEY}`);
-    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row.value.scripts) : [];
+    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row.value.scripts, () => this.ctx.uuid.v4()) : [];
   }
   async saveGlobal(scripts) {
     await putJson(`${BASE}/settings/${GLOBAL_KEY}`, { value: { scripts } });
@@ -4668,7 +4656,7 @@ class ScriptStorageClient {
     if (!presetId)
       return [];
     const row = await getJson(`${BASE}/settings/${presetKey(presetId)}`);
-    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row.value.scripts) : [];
+    return Array.isArray(row?.value?.scripts) ? normalizeScriptTrees(row.value.scripts, () => this.ctx.uuid.v4()) : [];
   }
   async savePreset(presetId, scripts) {
     if (!presetId)
@@ -4678,7 +4666,7 @@ class ScriptStorageClient {
   async loadCharacter(characterId) {
     const char = await getJson(`${BASE}/characters/${encodeURIComponent(characterId)}`);
     const scripts = char?.extensions?.tavern_helper?.scripts;
-    return Array.isArray(scripts) ? normalizeScriptTrees(scripts) : [];
+    return Array.isArray(scripts) ? normalizeScriptTrees(scripts, () => this.ctx.uuid.v4()) : [];
   }
   async saveCharacter(characterId, scripts) {
     const url = `${BASE}/characters/${encodeURIComponent(characterId)}`;
@@ -4713,9 +4701,9 @@ function flattenEnabled(trees) {
   }
   return out;
 }
-async function loadEnabledScripts(characterId, presetId) {
+async function loadEnabledScripts(ctx, characterId, presetId) {
   const secOn = (t) => typeof localStorage !== "undefined" ? localStorage.getItem(`vsh_section_enabled_${t}`) !== "false" : true;
-  const storage = new ScriptStorageClient;
+  const storage = new ScriptStorageClient(ctx);
   const [global, preset, char] = await Promise.all([
     secOn("global") ? storage.loadGlobal() : Promise.resolve([]),
     secOn("preset") ? storage.loadPreset(presetId) : Promise.resolve([]),
@@ -4727,8 +4715,8 @@ async function loadEnabledScripts(characterId, presetId) {
     ...flattenEnabled(preset).map((s) => ({ ...s, scope: "preset" }))
   ];
 }
-async function initScriptStorage() {
-  const storage = new ScriptStorageClient;
+async function initScriptStorage(ctx) {
+  const storage = new ScriptStorageClient(ctx);
   const globalResp = await fetch(`${BASE}/settings/${GLOBAL_KEY}`, { credentials: "same-origin" });
   if (!globalResp.ok)
     await storage.saveGlobal([]);
@@ -5075,7 +5063,7 @@ var CSS2 = `
 [draggable=true].vsh-dragging { opacity: 0.4; }
 `;
 function createScriptsPanel(root, ctx, onScriptsSaved, onReloadScript) {
-  const storage = new ScriptStorageClient;
+  const storage = new ScriptStorageClient(ctx);
   const removeStyle = ctx.dom.addStyle(CSS2);
   let globalScripts = [];
   let charScripts = [];
@@ -5144,7 +5132,7 @@ function createScriptsPanel(root, ctx, onScriptsSaved, onReloadScript) {
       try {
         const text = await file.text();
         const parsed = JSON.parse(text);
-        const trees = normalizeScriptTrees(Array.isArray(parsed) ? parsed : parsed.scripts ?? []);
+        const trees = normalizeScriptTrees(Array.isArray(parsed) ? parsed : parsed.scripts ?? [], () => ctx.uuid.v4());
         const allIds = new Set([
           ...globalScripts,
           ...charScripts,
@@ -5152,7 +5140,7 @@ function createScriptsPanel(root, ctx, onScriptsSaved, onReloadScript) {
         ].map((t) => t.id));
         const deduped = trees.map((tree) => {
           if (allIds.has(tree.id)) {
-            return { ...tree, id: crypto.randomUUID() };
+            return { ...tree, id: ctx.uuid.v4() };
           }
           return tree;
         });
@@ -5589,7 +5577,7 @@ function createScriptsPanel(root, ctx, onScriptsSaved, onReloadScript) {
   function addScript(target) {
     if (target === "character" && !currentCharId)
       return;
-    getList(target).push(makeScript({ name: "New Script" }));
+    getList(target).push(makeScript(() => ctx.uuid.v4(), { name: "New Script" }));
     saveTarget(target);
     refreshTarget(target);
   }
@@ -5600,7 +5588,7 @@ function createScriptsPanel(root, ctx, onScriptsSaved, onReloadScript) {
       type: "folder",
       enabled: true,
       name: "New Folder",
-      id: crypto.randomUUID(),
+      id: ctx.uuid.v4(),
       icon: "fa-solid fa-folder",
       color: "#888888",
       scripts: []
@@ -5840,11 +5828,11 @@ class ScriptRunner {
     }
   }
   reload(scriptId) {
-    this.reloadMemos.set(scriptId, crypto.randomUUID());
+    this.reloadMemos.set(scriptId, this.ctx.uuid.v4());
   }
   reloadAll() {
     for (const frame of this.frames.values()) {
-      this.reloadMemos.set(frame.scriptId, crypto.randomUUID());
+      this.reloadMemos.set(frame.scriptId, this.ctx.uuid.v4());
     }
   }
   destroy() {
@@ -6153,7 +6141,7 @@ function setup(ctx) {
   const userMessageHandlers = new Set;
   const userMessageControllers = new Map;
   const callNativeResource = (resource, operation, args = []) => {
-    const requestId = crypto.randomUUID();
+    const requestId = ctx.uuid.v4();
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         if (!pendingNativeResources.has(requestId))
@@ -6735,7 +6723,7 @@ function setup(ctx) {
     }
   });
   window.__vishrunGenerate = (opts, signalArg) => {
-    const requestId = crypto.randomUUID();
+    const requestId = ctx.uuid.v4();
     const raw = opts && typeof opts === "object" ? opts : {};
     const embeddedSignal = raw.signal;
     const signal = signalArg || embeddedSignal;
@@ -6777,7 +6765,7 @@ function setup(ctx) {
   async function reloadRunner() {
     const active = ctx.getActiveChat();
     const presetId = await getActiveLoomPresetId();
-    const enabledScripts = await loadEnabledScripts(active.characterId ?? null, presetId);
+    const enabledScripts = await loadEnabledScripts(ctx, active.characterId ?? null, presetId);
     await runner.run(enabledScripts, active.chatId ?? null);
   }
   const settingsMount = ctx.ui.mount("settings_extensions");
@@ -6788,7 +6776,7 @@ function setup(ctx) {
   let scriptsPanel = createScriptsPanel(settingsMount, ctx, () => {
     reloadRunner();
   }, onReloadScript);
-  initScriptStorage();
+  initScriptStorage(ctx);
   let inflightCharacterId = null;
   let lastLoadedCharacterId = null;
   async function loadFor(characterId) {
@@ -6799,7 +6787,7 @@ function setup(ctx) {
       scriptsPanel?.onCharacterChanged(null);
       const presetId = await getActiveLoomPresetId();
       scriptsPanel?.onPresetChanged(presetId);
-      const enabledScripts = await loadEnabledScripts(null, presetId);
+      const enabledScripts = await loadEnabledScripts(ctx, null, presetId);
       await runner.run(enabledScripts, null);
       hooks.rescanAll();
       return;
@@ -6812,7 +6800,7 @@ function setup(ctx) {
       console.warn("[vishrun:diag] loadFor: same character, re-using cached card");
       hooks.rescanAll();
       const chatId = ctx.getActiveChat().chatId ?? null;
-      const enabledScripts = await loadEnabledScripts(characterId, await getActiveLoomPresetId());
+      const enabledScripts = await loadEnabledScripts(ctx, characterId, await getActiveLoomPresetId());
       console.log("[vishrun:diag] loadFor(cache-hit) reconciling", enabledScripts.length, "scripts, chatId:", chatId);
       await runner.run(enabledScripts, chatId);
       return;
@@ -6822,7 +6810,7 @@ function setup(ctx) {
       const presetId = await getActiveLoomPresetId();
       const [char, enabledScripts] = await Promise.all([
         fetchCharacter(characterId),
-        loadEnabledScripts(characterId, presetId)
+        loadEnabledScripts(ctx, characterId, presetId)
       ]);
       console.log("[vishrun:diag] loadEnabledScripts returned", enabledScripts.length, "scripts:", enabledScripts.map((s) => s.name));
       const scripts = extractRegexScripts(char);
@@ -6962,7 +6950,7 @@ function setup(ctx) {
           lastPresetId = newPresetId;
           scriptsPanel?.onPresetChanged(newPresetId);
           const active = ctx.getActiveChat();
-          const enabledScripts = await loadEnabledScripts(active.characterId ?? null, newPresetId);
+          const enabledScripts = await loadEnabledScripts(ctx, active.characterId ?? null, newPresetId);
           await runner.run(enabledScripts, active.chatId ?? null);
         }
       })();
