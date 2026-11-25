@@ -1,5 +1,6 @@
 import type { OffsetMapEntry } from './linearize-bubble';
 import { renderedChildNodes, deepQuerySelectorAll } from './shadow-dom';
+import { isReactManagedNode } from './react-host-boundary';
 
 // Hides the raw text of a block trigger (e.g. `[ST_START]…[ST_END]`) while the
 // model is still streaming it and while its widget is being built, the way
@@ -106,7 +107,7 @@ export function hideRange(bubble: HTMLElement, offsetMap: OffsetMapEntry[], star
     if (e.sourceEnd <= start || e.sourceStart >= end) continue;
     let el: Element | null = e.node.parentElement;
     let best: Element | null = null;
-    while (el && el !== bubble) {
+    while (el && el !== bubble && !isReactManagedNode(el)) {
       const s = span(el);
       if (!s || s[0] < start || s[1] > end) break;
       best = el;
