@@ -20,7 +20,7 @@
     "regex_scripts",
     "regex_scripts_unrestricted"
   ],
-  "interceptorTimeoutMs": 300000,
+  "interceptorTimeoutMs": 1800000,
   "entry_frontend": "dist/frontend.js",
   "entry_backend": "dist/backend.js",
   "minimum_lumiverse_version": "0.1.0"
